@@ -13,8 +13,9 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
+import math
 
-SERVICE = "https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer"
+import argparse
 
 def largest_valid_rectangle(valid):
     rows, cols = valid.shape
@@ -154,7 +155,6 @@ def query_sources(xmin, ymin, xmax, ymax, bbox_sr=4326):
     r.raise_for_status()
     return r.json()
 
-import math
 
 def export_dem_meterish(
     xmin, ymin, xmax, ymax, out_file, target_m=30.0, lat_ref=None
@@ -182,12 +182,19 @@ def export_dem_meterish(
     )
 
 
-DOMAIN_MASK_PATH = '../local_data/outline.kml'
+parser = argparse.ArgumentParser()
+parser.add_argument("--domain-path", type=str, default=None)
+args = parser.parse_args()
+DOMAIN_PATH = args.domain_path
 
+OUTPUT_PATH = f'{DOMAIN_PATH}/model_inputs/gridded_dem.nc'
+
+SERVICE = "https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer"
 OPENTOPOGRAPHY_API_KEY = 'dc10c5a9ed81a06019b050fbf754d1b1'
-GLACIER_MASK_PATH = '../../../common_data/area/rgi/rgi_ak/RGI2000-v7.0-C-01_alaska.shp'
 
-OUTPUT_PATH = 'model_inputs/gridded_dem.nc'
+
+DOMAIN_MASK_PATH = f'{DOMAIN_PATH}/local_data/outline.kml'
+GLACIER_MASK_PATH = '../common_data/area/rgi/rgi_ak/RGI2000-v7.0-C-01_alaska.shp'
 
 domain_mask = geopandas.read_file(DOMAIN_MASK_PATH)
 domain_polygon = domain_mask['geometry'][0]
@@ -214,14 +221,14 @@ if topo_array.rio.crs is None:
 # Example 1: download at roughly 1 arc-second
 export_dem_meterish(
     domain_bounds[0], domain_bounds[1], domain_bounds[2], domain_bounds[3],
-    out_file="../local_data/noaa_global_mosaic.tif",
+    out_file=f"{DOMAIN_PATH}/local_data/noaa_global_mosaic.tif",
     target_m=90.0,
 )
 
-bathy_array = xr.load_dataset('../local_data/noaa_global_mosaic.tif')
+bathy_array = xr.load_dataset(f'{DOMAIN_PATH}/local_data/noaa_global_mosaic.tif')
 bathy_array = bathy_array.interp_like(topo_array).band_data[0].astype(np.float32)
 
-noaa_bag_directory = Path('../../../common_data/dem/bathy/bags')
+noaa_bag_directory = Path('../common_data/dem/bathy/bags')
 for file in noaa_bag_directory.iterdir():
 
     da_bag = rioxarray.open_rasterio(file).astype(np.float32)
