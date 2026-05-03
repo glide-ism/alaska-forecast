@@ -1,81 +1,71 @@
-import xarray as xr
-import rioxarray
-import numpy as np
-import shapely
-import geopandas
+"""Build the gridded DEM for a domain.
 
-from bmi_topography import Topography
-from projection_dictionary import crs
+Combines a topographic DEM (Copernicus 90m via OpenTopography) with NOAA
+bathymetry, then reprojects onto an explicit project-CRS grid that spans
+the bounding box of the domain outline in projected coordinates.
 
+Pipeline:
+    1. Project the outline polygon into the project CRS, take its bbox, and
+       snap the bbox outward to multiples of the grid resolution. This bbox
+       is the *target* output grid extent.
+    2. Inverse-project a dense sample of that bbox boundary back to lat/lon
+       to determine the geographic fetch extent. Fetching this slightly
+       larger lat/lon area guarantees the rotated DEM, after reprojection,
+       fully covers the target bbox with no NaN corners to crop away.
+    3. Fetch topography (OpenTopography) and bathymetry (NOAA mosaic + BAGs)
+       over the lat/lon fetch extent, splice them, then reproject onto the
+       explicit target grid using a fixed destination transform.
+    4. Rasterize domain and RGI glacier masks.
+
+Output: {domain_path}/model_inputs/gridded_dem.nc
+"""
+import argparse
 import math
-import os
 from pathlib import Path
 from urllib.parse import urlencode
 
+import geopandas
+import numpy as np
+import pyproj
+import rasterio.transform
 import requests
-import math
+import rioxarray
+import xarray as xr
+from bmi_topography import Topography
 
-import argparse
+from projection_dictionary import crs
 
-def largest_valid_rectangle(valid):
-    rows, cols = valid.shape
-    heights = np.zeros(cols, dtype=int)
-    best = (0, 0, 0, 0, 0)  # area, y_start, x_start, y_end, x_end
 
-    for i in range(rows):
-        heights = np.where(valid[i], heights + 1, 0)
+# TODO: move secret to env var / config
+OPENTOPOGRAPHY_API_KEY = 'dc10c5a9ed81a06019b050fbf754d1b1'
+NOAA_DEM_SERVICE = (
+    "https://gis.ngdc.noaa.gov/arcgis/rest/services/"
+    "DEM_mosaics/DEM_global_mosaic/ImageServer"
+)
+GLACIER_MASK_PATH = '../common_data/area/rgi/rgi_ak/RGI2000-v7.0-C-01_alaska.shp'
+NOAA_BAG_DIRECTORY = Path('../common_data/dem/bathy/bags')
 
-        # Largest rectangle in this histogram row
-        stack = []
-        for j in range(cols + 1):
-            h = heights[j] if j < cols else 0
-            while stack and heights[stack[-1]] > h:
-                height = heights[stack.pop()]
-                x_start = 0 if not stack else stack[-1] + 1
-                width = j - x_start
-                area = height * width
-                if area > best[0]:
-                    best = (area, i - height + 1, x_start, i, x_start + width - 1)
-            stack.append(j)
+GRID_RESOLUTION_M = 90.0
+DEM_TYPE = 'COP90'
 
-    _, y_start, x_start, y_end, x_end = best
-    return y_start, y_end, x_start, x_end
+# Number of points sampled along each edge of the projected bbox when
+# back-projecting to lat/lon. 100 is plenty for Alaska Albers, where the
+# bbox edges are nearly straight in lat/lon space.
+BBOX_BOUNDARY_SAMPLES = 100
+
+# Small lat/lon padding on the fetch extent to absorb numerical roundoff
+# between forward/inverse projection at the very edges of the target grid.
+FETCH_PAD_DEG = 0.01
 
 
 def export_dem(
-    xmin,
-    ymin,
-    xmax,
-    ymax,
-    out_file,
-    resolution_deg=None,
-    width=None,
-    height=None,
-    bbox_sr=4326,
-    image_sr=4326,
+    xmin, ymin, xmax, ymax, out_file,
+    resolution_deg=None, width=None, height=None,
+    bbox_sr=4326, image_sr=4326,
     interpolation="RSP_BilinearInterpolation",
     fmt="tiff",
 ):
-    """
-    Download a DEM subset from NOAA DEM Global Mosaic using ArcGIS exportImage.
-
-    Parameters
-    ----------
-    xmin, ymin, xmax, ymax : float
-        Bounding box in degrees lon/lat (EPSG:4326 by default).
-    out_file : str or Path
-        Output GeoTIFF path.
-    resolution_deg : float, optional
-        Output pixel size in degrees. If supplied, width/height are computed.
-    width, height : int, optional
-        Output raster dimensions. Use either resolution_deg or width/height.
-    bbox_sr, image_sr : int
-        Spatial references for bbox and output image.
-    interpolation : str
-        ArcGIS interpolation enum.
-    fmt : str
-        "tiff" is what you want for numeric elevation values.
-    """
+    """Download a DEM subset from NOAA DEM Global Mosaic via ArcGIS exportImage."""
     out_file = Path(out_file)
 
     if resolution_deg is not None:
@@ -101,21 +91,18 @@ def export_dem(
         "interpolation": interpolation,
     }
 
-    url = f"{SERVICE}/exportImage?{urlencode(params)}"
+    url = f"{NOAA_DEM_SERVICE}/exportImage?{urlencode(params)}"
     print("GET", url)
 
-    r = requests.get(url, timeout=300)
-    r.raise_for_status()
+    response = requests.get(url, timeout=300)
+    response.raise_for_status()
 
-    out_file.write_bytes(r.content)
+    out_file.write_bytes(response.content)
     print(f"Wrote {out_file}")
 
 
 def query_sources(xmin, ymin, xmax, ymax, bbox_sr=4326):
-    """
-    Query source rasters contributing within a bbox.
-    Returns ArcGIS feature JSON.
-    """
+    """Query source rasters contributing within a bbox. Returns ArcGIS feature JSON."""
     geom = {
         "xmin": xmin,
         "ymin": ymin,
@@ -133,136 +120,200 @@ def query_sources(xmin, ymin, xmax, ymax, bbox_sr=4326):
         "returnGeometry": "false",
         "outFields": ",".join(
             [
-                "OBJECTID",
-                "Name",
-                "DemName",
-                "DateCompleted",
-                "CellsizeArcseconds",
-                "VerticalDatum",
-                "MetadataURL",
-                "DEM_ID",
-                "ZOrder",
+                "OBJECTID", "Name", "DemName", "DateCompleted",
+                "CellsizeArcseconds", "VerticalDatum", "MetadataURL",
+                "DEM_ID", "ZOrder",
             ]
         ),
         "resultRecordCount": 1000,
     }
 
-    # Build manually because geometry is JSON-like text
     query_string = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"{SERVICE}/query?{query_string}"
+    url = f"{NOAA_DEM_SERVICE}/query?{query_string}"
 
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(url, timeout=120)
+    response.raise_for_status()
+    return response.json()
 
 
-def export_dem_meterish(
-    xmin, ymin, xmax, ymax, out_file, target_m=30.0, lat_ref=None
-):
-    """
-    Approximate a target metric resolution while requesting in geographic coords.
-    """
+def export_dem_meterish(xmin, ymin, xmax, ymax, out_file, target_m=30.0, lat_ref=None):
+    """Approximate a target metric resolution while requesting in geographic coords."""
     if lat_ref is None:
         lat_ref = 0.5 * (ymin + ymax)
 
     meters_per_deg_lat = 111320.0
     meters_per_deg_lon = 111320.0 * math.cos(math.radians(lat_ref))
 
-    dx_deg = target_m / meters_per_deg_lon
-    dy_deg = target_m / meters_per_deg_lat
+    width = math.ceil((xmax - xmin) / (target_m / meters_per_deg_lon))
+    height = math.ceil((ymax - ymin) / (target_m / meters_per_deg_lat))
 
-    width = math.ceil((xmax - xmin) / dx_deg)
-    height = math.ceil((ymax - ymin) / dy_deg)
+    export_dem(xmin, ymin, xmax, ymax, out_file=out_file, width=width, height=height)
 
-    export_dem(
-        xmin, ymin, xmax, ymax,
-        out_file=out_file,
-        width=width,
-        height=height,
+
+def _project_polygon_bbox(polygon, dst_crs, src_crs="EPSG:4326"):
+    """Project the exterior coords of `polygon` from src_crs to dst_crs and
+    return its (xmin, ymin, xmax, ymax) bbox in dst_crs.
+
+    Tolerates 3D coords (KML often carries an altitude in the z slot).
+    """
+    transformer = pyproj.Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    coords = np.asarray(polygon.exterior.coords)
+    lons, lats = coords[:, 0], coords[:, 1]
+    xs, ys = transformer.transform(lons, lats)
+    return float(np.min(xs)), float(np.min(ys)), float(np.max(xs)), float(np.max(ys))
+
+
+def _snap_bbox_outward(bbox, resolution):
+    """Snap (xmin, ymin, xmax, ymax) outward to multiples of `resolution`.
+    The result is the smallest grid-aligned bbox containing the input."""
+    xmin, ymin, xmax, ymax = bbox
+    return (
+        math.floor(xmin / resolution) * resolution,
+        math.floor(ymin / resolution) * resolution,
+        math.ceil(xmax / resolution) * resolution,
+        math.ceil(ymax / resolution) * resolution,
     )
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--domain-path", type=str, default=None)
-args = parser.parse_args()
-DOMAIN_PATH = args.domain_path
+def _projected_bbox_to_latlon_extent(bbox, src_crs, n_samples=BBOX_BOUNDARY_SAMPLES,
+                                     pad_deg=FETCH_PAD_DEG):
+    """Return the (lon_min, lat_min, lon_max, lat_max) extent that, when
+    fetched in EPSG:4326 and reprojected to src_crs, fully covers `bbox`.
 
-OUTPUT_PATH = f'{DOMAIN_PATH}/model_inputs/gridded_dem.nc'
+    Densely samples the boundary of the projected bbox and inverse-projects
+    each sample, taking the lat/lon envelope. A small pad absorbs any
+    numerical drift at the corners.
+    """
+    xmin, ymin, xmax, ymax = bbox
+    transformer = pyproj.Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
 
-SERVICE = "https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer"
-OPENTOPOGRAPHY_API_KEY = 'dc10c5a9ed81a06019b050fbf754d1b1'
+    edge = np.linspace(0.0, 1.0, n_samples)
+    xs = np.concatenate([
+        xmin + edge * (xmax - xmin),    # bottom
+        np.full(n_samples, xmax),        # right
+        xmax - edge * (xmax - xmin),    # top
+        np.full(n_samples, xmin),        # left
+    ])
+    ys = np.concatenate([
+        np.full(n_samples, ymin),
+        ymin + edge * (ymax - ymin),
+        np.full(n_samples, ymax),
+        ymax - edge * (ymax - ymin),
+    ])
+    lons, lats = transformer.transform(xs, ys)
+    return (
+        float(np.min(lons)) - pad_deg,
+        float(np.min(lats)) - pad_deg,
+        float(np.max(lons)) + pad_deg,
+        float(np.max(lats)) + pad_deg,
+    )
 
 
-DOMAIN_MASK_PATH = f'{DOMAIN_PATH}/local_data/outline.kml'
-GLACIER_MASK_PATH = '../common_data/area/rgi/rgi_ak/RGI2000-v7.0-C-01_alaska.shp'
+def build_dem(domain_path: str) -> xr.Dataset:
+    """Build the gridded DEM dataset for `domain_path` and write it to disk.
 
-domain_mask = geopandas.read_file(DOMAIN_MASK_PATH)
-domain_polygon = domain_mask['geometry'][0]
-domain_bounds = domain_polygon.bounds
+    Returns the in-memory Dataset (also written to
+    {domain_path}/model_inputs/gridded_dem.nc).
+    """
+    domain_path = Path(domain_path)
+    output_path = domain_path / 'model_inputs' / 'gridded_dem.nc'
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-MASK_BUFFER = 0.1
-params = Topography.DEFAULT.copy()
-params['api_key'] = OPENTOPOGRAPHY_API_KEY
-params['dem_type'] = 'COP90'
-params['south'] = domain_bounds[1]
-params['north'] = domain_bounds[3]
-params['west'] = domain_bounds[0]
-params['east'] = domain_bounds[2]
+    domain_outline = geopandas.read_file(domain_path / 'local_data' / 'outline.kml')
+    domain_polygon = domain_outline['geometry'][0]
 
-topo = Topography(**params)
-topo.fetch()
+    # Define the target output grid in projected coordinates: bbox of the
+    # outline in project CRS, snapped outward to grid resolution.
+    target_bbox = _snap_bbox_outward(
+        _project_polygon_bbox(domain_polygon, crs),
+        GRID_RESOLUTION_M,
+    )
+    target_xmin, target_ymin, target_xmax, target_ymax = target_bbox
+    target_width = int(round((target_xmax - target_xmin) / GRID_RESOLUTION_M))
+    target_height = int(round((target_ymax - target_ymin) / GRID_RESOLUTION_M))
+    dst_transform = rasterio.transform.from_origin(
+        target_xmin, target_ymax, GRID_RESOLUTION_M, GRID_RESOLUTION_M,
+    )
 
-topo_array = topo.load().rename('elevation')
-topo_array = topo_array.isel(band=0).drop_vars('band')
+    # Lat/lon extent that, after reprojection back to project CRS,
+    # fully covers the target grid (no NaN corners after rotation).
+    lon_min, lat_min, lon_max, lat_max = _projected_bbox_to_latlon_extent(
+        target_bbox, crs,
+    )
 
-if topo_array.rio.crs is None:
-    topo_array.rio.write_crs("EPSG:4326", inplace=True)
+    # Fetch topography over the lat/lon fetch extent
+    topography_params = Topography.DEFAULT.copy()
+    topography_params['api_key'] = OPENTOPOGRAPHY_API_KEY
+    topography_params['dem_type'] = DEM_TYPE
+    topography_params['south'] = lat_min
+    topography_params['north'] = lat_max
+    topography_params['west'] = lon_min
+    topography_params['east'] = lon_max
 
-# Example 1: download at roughly 1 arc-second
-export_dem_meterish(
-    domain_bounds[0], domain_bounds[1], domain_bounds[2], domain_bounds[3],
-    out_file=f"{DOMAIN_PATH}/local_data/noaa_global_mosaic.tif",
-    target_m=90.0,
-)
+    topography = Topography(**topography_params)
+    topography.fetch()
 
-bathy_array = xr.load_dataset(f'{DOMAIN_PATH}/local_data/noaa_global_mosaic.tif')
-bathy_array = bathy_array.interp_like(topo_array).band_data[0].astype(np.float32)
+    topography_array = topography.load().rename('elevation').isel(band=0).drop_vars('band')
+    if topography_array.rio.crs is None:
+        topography_array.rio.write_crs("EPSG:4326", inplace=True)
 
-noaa_bag_directory = Path('../common_data/dem/bathy/bags')
-for file in noaa_bag_directory.iterdir():
+    # Fetch bathymetry over the same lat/lon fetch extent at ~grid resolution
+    bathymetry_tif_path = domain_path / 'local_data' / 'noaa_global_mosaic.tif'
+    export_dem_meterish(
+        lon_min, lat_min, lon_max, lat_max,
+        out_file=bathymetry_tif_path,
+        target_m=GRID_RESOLUTION_M,
+    )
+    bathymetry_array = xr.load_dataset(bathymetry_tif_path)
+    bathymetry_array = bathymetry_array.interp_like(topography_array).band_data[0].astype(np.float32)
 
-    da_bag = rioxarray.open_rasterio(file).astype(np.float32)
-    dq = da_bag.rio.reproject_match(bathy_array)[0]
-    bathy_array = xr.where(dq==1e6, bathy_array,dq)
+    # Splice in higher-resolution NOAA BAG bathymetry where available.
+    # The mosaic uses 1e6 as a no-data sentinel; keep mosaic values there.
+    for bag_path in NOAA_BAG_DIRECTORY.iterdir():
+        bag_raster = rioxarray.open_rasterio(bag_path).astype(np.float32)
+        bag_resampled = bag_raster.rio.reproject_match(bathymetry_array)[0]
+        bathymetry_array = xr.where(bag_resampled == 1e6, bathymetry_array, bag_resampled)
 
-topo_array.name = 'topography'
-bathy_array.name= 'bathymetry'
-comb = xr.merge([topo_array,bathy_array])
+    topography_array.name = 'topography'
+    bathymetry_array.name = 'bathymetry'
+    dem_ds = xr.merge([topography_array, bathymetry_array])
 
-comb = comb.rio.reproject(crs,resolution=90)
-comb['elevation'] = xr.where((comb.topography > 0) | (comb.bathymetry>0), comb.topography, comb.bathymetry)
-comb['bathymetry_mask'] = xr.where(comb.topography > 0, False, True)
-comb['x'] = comb['x'].astype('float32')
-comb['y'] = comb['y'].astype('float32')
+    # Reproject onto the explicit target grid. The fetch extent was sized to
+    # guarantee the rotated DEM fully covers this grid.
+    dem_ds = dem_ds.rio.reproject(
+        crs, transform=dst_transform, shape=(target_height, target_width),
+    )
 
-# Get the elevation part of projected DEM
-valid = comb.elevation.notnull().values
+    # Prefer topography on land, bathymetry below sea level
+    dem_ds['elevation'] = xr.where(
+        (dem_ds.topography > 0) | (dem_ds.bathymetry > 0),
+        dem_ds.topography,
+        dem_ds.bathymetry,
+    )
+    dem_ds['bathymetry_mask'] = xr.where(dem_ds.topography > 0, False, True)
+    dem_ds['x'] = dem_ds['x'].astype('float32')
+    dem_ds['y'] = dem_ds['y'].astype('float32')
 
-# Get the largest bounding box that contains all valid pixels
-y_start, y_end, x_start, x_end = largest_valid_rectangle(valid)
-comb = comb.isel(y=slice(y_start, y_end + 1), x=slice(x_start, x_end + 1))
+    # Rasterize the domain outline and the RGI glacier polygons onto the grid
+    domain_mask = dem_ds.elevation.rio.clip(
+        [domain_polygon], crs="EPSG:4326", invert=False, drop=False,
+    ).notnull()
+    domain_mask.attrs['_FillValue'] = False
+    dem_ds['domain_mask'] = domain_mask.astype('bool')
 
-# Convert to a mask
-domain_mask_array = comb.elevation.rio.clip([domain_polygon],crs="EPSG:4326",invert=False,drop=False).notnull()
-domain_mask_array.attrs['_FillValue'] = False
-comb['domain_mask'] = domain_mask_array.astype('bool')
+    glacier_polygons = geopandas.read_file(GLACIER_MASK_PATH)
+    rgi_mask = dem_ds.elevation.rio.clip(
+        glacier_polygons.geometry.values, glacier_polygons.crs, drop=False,
+    ).notnull()
+    rgi_mask.attrs['_FillValue'] = False
+    dem_ds['rgi_mask'] = rgi_mask.astype('bool')
 
-glacier_mask = geopandas.read_file(GLACIER_MASK_PATH)
+    dem_ds.to_netcdf(output_path)
+    return dem_ds
 
-# Load RGI glaciers and convert to a raster mask
-glacier_mask_array = comb.elevation.rio.clip(glacier_mask.geometry.values,glacier_mask.crs,drop=False).notnull()
-glacier_mask_array.attrs['_FillValue'] = False
-comb['rgi_mask'] = glacier_mask_array.astype('bool')
 
-# Write combined DEM and masks to nc
-comb.to_netcdf(OUTPUT_PATH)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--domain-path", type=str, required=True)
+    args = parser.parse_args()
+    build_dem(args.domain_path)

@@ -1,74 +1,79 @@
-import xarray as xr
-import pyproj
-from projection_dictionary import crs
+"""Build the gridded monthly climatology (T2M, precip) for a domain.
+
+Regrids pan-Arctic CARRA2 reanalysis fields onto the project DEM grid using
+GLARE's PanCarraBase, applying a 3 K/km lapse rate to temperature.
+
+Output: {domain_path}/model_inputs/gridded_climate.nc
+"""
+import argparse
+from pathlib import Path
 
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.interpolate import RegularGridInterpolator
-from matplotlib.colors import LightSource
-from glare import PanCarraBase 
+import xarray as xr
+from glare import PanCarraBase
 
-import argparse
+from projection_dictionary import crs
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--domain-path", type=str, default=None)
-args = parser.parse_args()
-DOMAIN_PATH = args.domain_path
 
-OUTPUT_PATH = f'{DOMAIN_PATH}/model_inputs/gridded_climate.nc'
+PANCARRA_BASE = Path('../common_data/climate/pancarra')
+TEMPERATURE_LAPSE_RATE_K_PER_M = 0.003
+ICE_DENSITY = 917.0
+DAYS_PER_YEAR = 365
 
-GEOM_PATH = f'{DOMAIN_PATH}/model_inputs/gridded_dem.nc'
 
-YEAR = 2012
-PRECIP_PATH = f'../common_data/climate/pancarra/{YEAR}/precip/precip.nc'
-T2M_PATH = f'../common_data/climate/pancarra/{YEAR}/t2m/t2m.nc'
-OROG_PATH = '../common_data/climate/pancarra/topo/topo.grib'
+def build_climate(domain_path: str, year: int) -> xr.Dataset:
+    """Build the gridded climate dataset for `domain_path`, `year` and write to disk."""
+    domain_path = Path(domain_path)
+    dem_path = domain_path / 'model_inputs' / 'gridded_dem.nc'
+    output_path = domain_path / 'model_inputs' / 'gridded_climate.nc'
 
-# Load target grid
-dem = xr.load_dataset(GEOM_PATH)
+    precip_path = PANCARRA_BASE / str(year) / 'precip' / 'precip.nc'
+    t2m_path = PANCARRA_BASE / str(year) / 't2m' / 't2m.nc'
+    orog_path = PANCARRA_BASE / 'topo' / 'topo.grib'
 
-# Load pancarra base
-panc = PanCarraBase(PRECIP_PATH, T2M_PATH, OROG_PATH) 
+    dem = xr.load_dataset(dem_path)
 
-# Regrid temperature and precipitation fields
-_, t2m_fields, precip_fields = panc.regrid_carra2_fields(dem, crs, method='linear',t2m_lapse_rate=0.003)
-
-# Create t2m data array
-t2m_da = xr.DataArray(
-        t2m_fields,
-        dims=['t','y','x'],
-        coords={
-            't':np.arange(0,12,dtype=np.float32)/12.,
-            'y': dem.y,
-            'x': dem.x,
-        },
-        attrs = {
-            "units": "Deg C",
-            "long_name": "Monthly average temperatures derived from pan-arctic CARRA2",
-        }
+    pancarra = PanCarraBase(precip_path, t2m_path, orog_path)
+    _, t2m_fields, precip_fields = pancarra.regrid_carra2_fields(
+        dem, crs, method='linear', t2m_lapse_rate=TEMPERATURE_LAPSE_RATE_K_PER_M,
     )
 
-# Create precip data array
-precip_da = xr.DataArray(precip_fields/917*365,
-        dims = ['t','y','x'],
-        coords = {"t":np.arange(0,12,dtype=np.float32)/12,
-                  "y": dem.y,
-                  "x": dem.x},
-        attrs = {"units": "m ice equivalent / yr",
-                 "long_name": "Precipitation rate derived from pan-arctic CARRA2 at monthly time steps"}
-        )
+    months = np.arange(0, 12, dtype=np.float32) / 12
+    coords = {"t": months, "y": dem.y, "x": dem.x}
+    dims = ['t', 'y', 'x']
 
-out_ds = dem.copy()
+    t2m_da = xr.DataArray(
+        t2m_fields, dims=dims, coords=coords,
+        attrs={
+            "units": "Deg C",
+            "long_name": "Monthly average temperatures derived from pan-arctic CARRA2",
+        },
+    )
 
-out_ds["monthly_t2m"] = t2m_da
-out_ds["monthly_precip"] = precip_da
+    # Convert mean precipitation rate (kg/m^2/s as ice equivalent) to m/yr.
+    precip_da = xr.DataArray(
+        precip_fields / ICE_DENSITY * DAYS_PER_YEAR, dims=dims, coords=coords,
+        attrs={
+            "units": "m ice equivalent / yr",
+            "long_name": "Precipitation rate derived from pan-arctic CARRA2 at monthly time steps",
+        },
+    )
 
-del out_ds['elevation']
-del out_ds['domain_mask']
-del out_ds['rgi_mask']
-del out_ds['topography']
-del out_ds['bathymetry']
-del out_ds['bathymetry_mask']
+    climate_ds = dem.copy()
+    climate_ds["monthly_t2m"] = t2m_da
+    climate_ds["monthly_precip"] = precip_da
 
-out_ds.to_netcdf(OUTPUT_PATH)
+    for name in ('elevation', 'domain_mask', 'rgi_mask',
+                 'topography', 'bathymetry', 'bathymetry_mask'):
+        del climate_ds[name]
 
+    climate_ds.to_netcdf(output_path)
+    return climate_ds
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--domain-path", type=str, required=True)
+    parser.add_argument("--year", type=int, required=True)
+    args = parser.parse_args()
+    build_climate(args.domain_path, args.year)

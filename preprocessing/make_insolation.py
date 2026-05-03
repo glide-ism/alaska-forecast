@@ -1,137 +1,101 @@
+"""Build the gridded monthly solar potential field for a domain.
+
+Uses GLARE's SolarPotential to compute terrain-corrected insolation accounting
+for slope, aspect, and self-shadowing from the DEM, then decomposes the diurnal
+cycle into mean/cos/sin Fourier modes per month.
+
+Output: {domain_path}/model_inputs/gridded_insolation.nc
 """
-Compute monthly solar potential for Wrangell ice cap.
+import argparse
+from pathlib import Path
 
-Uses GLARE's SolarPotential class to compute terrain-corrected insolation
-accounting for slope, aspect, and self-shadowing from the DEM.
-Saves results to NetCDF in the style of make_pancarra_vars.py.
-"""
-
-import calendar
-import datetime
-
-import cupy as cp
+import geopandas
 import numpy as np
 import xarray as xr
-
 from glare import SolarPotential
 
-import argparse
 
-# Configuration
-VISUALIZE = False
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--domain-path", type=str, default=None)
-args = parser.parse_args()
-DOMAIN_PATH = args.domain_path
-
-GEOM_PATH = f'{DOMAIN_PATH}/model_inputs/gridded_dem.nc'
-OUTPUT_PATH = f'{DOMAIN_PATH}/model_inputs/gridded_insolation.nc'
-GRID_RESOLUTION = 90.0  # meters
-LATITUDE = 61.0
-LONGITUDE = -143.0
+GRID_RESOLUTION_M = 90.0
 TIMEZONE = "America/Anchorage"
-YEAR = 2011
 
-# Load DEM
-print(f"Loading DEM from {GEOM_PATH}")
-dem = xr.load_dataset(GEOM_PATH)
-print(f"DEM shape: {dem.elevation.shape}")
 
-# Initialize solar potential calculator
-print("Initializing SolarPotential calculator...")
-solar = SolarPotential(
-    dem=dem,
-    latitude=LATITUDE,
-    longitude=LONGITUDE,
-    grid_resolution=GRID_RESOLUTION,
-    timezone=TIMEZONE,
-)
+def _domain_centroid_latlon(domain_path: Path) -> tuple[float, float]:
+    """Return (latitude, longitude) of the centroid of the domain outline,
+    in EPSG:4326 degrees. Used to anchor solar geometry.
+    """
+    outline = geopandas.read_file(domain_path / 'local_data' / 'outline.kml')
+    if outline.crs is not None and outline.crs.to_epsg() != 4326:
+        outline = outline.to_crs(4326)
+    centroid = outline.geometry.unary_union.centroid
+    return float(centroid.y), float(centroid.x)
 
-solar_potential_mean, solar_potential_cos, solar_potential_sin = solar.compute_solar_potential_fourier_decomposition(YEAR)
 
-solar_potential_mean_da = xr.DataArray(
-    solar_potential_mean.get(),
-    dims=["t","y", "x"],
-    coords={
-        "t": np.arange(0, 12, dtype=np.float32)/12,
-        "y": dem.y,
-        "x": dem.x,
-    },
-    attrs={
-        "units": "dimensionless ( intensity relative to continuous orthogonal sunlight)",
-        "long_name": "Monthly average daily solar potential (incidence-weighted, shadow-masked)",
-    }
-)
+def build_insolation(domain_path: str, year: int) -> xr.Dataset:
+    """Build the gridded insolation dataset for `domain_path` and write to disk."""
+    domain_path = Path(domain_path)
+    dem_path = domain_path / 'model_inputs' / 'gridded_dem.nc'
+    output_path = domain_path / 'model_inputs' / 'gridded_insolation.nc'
 
-solar_potential_cos_da = xr.DataArray(
-    solar_potential_cos.get(),
-    dims=["t","y", "x"],
-    coords={
-        "t": np.arange(0, 12, dtype=np.float32)/12,
-        "y": dem.y,
-        "x": dem.x,
-    },
-    attrs={
-        "units": "dimensionless ( intensity relative to continuous orthogonal sunlight)",
-        "long_name": "cos mode of diurnal variability in insolation",
-    }
-)
-solar_potential_sin_da = xr.DataArray(
-    solar_potential_sin.get(),
-    dims=["t","y", "x"],
-    coords={
-        "t": np.arange(0, 12, dtype=np.float32)/12,
-        "y": dem.y,
-        "x": dem.x,
-    },
-    attrs={
-        "units": "dimensionless ( intensity relative to continuous orthogonal sunlight)",
-        "long_name": "sin mode of diurnal variability in insolation",
-    }
-)
+    dem = xr.load_dataset(dem_path)
+    latitude, longitude = _domain_centroid_latlon(domain_path)
 
-# Create output Dataset by copying DEM and adding new variables
-out_ds = dem.copy()
-out_ds["monthly_solar_potential_mean"] = solar_potential_mean_da
-out_ds["monthly_solar_potential_cos"] = solar_potential_cos_da
-out_ds["monthly_solar_potential_sin"] = solar_potential_sin_da
+    solar = SolarPotential(
+        dem=dem,
+        latitude=latitude,
+        longitude=longitude,
+        grid_resolution=GRID_RESOLUTION_M,
+        timezone=TIMEZONE,
+    )
+    mean, cos_mode, sin_mode = solar.compute_solar_potential_fourier_decomposition(year)
 
-# Add global attributes
-out_ds.attrs["source"] = f"GLARE SolarPotential calculator, {YEAR}"
-out_ds.attrs["location"] = f"Wrangell Ice Cap (lat={LATITUDE}, lon={LONGITUDE})"
-out_ds.attrs["grid_resolution"] = f"{GRID_RESOLUTION} m"
+    months = np.arange(0, 12, dtype=np.float32) / 12
+    coords = {"t": months, "y": dem.y, "x": dem.x}
+    dims = ["t", "y", "x"]
 
-del out_ds['elevation']
-del out_ds['domain_mask']
-del out_ds['rgi_mask']
-del out_ds['topography']
-del out_ds['bathymetry']
-del out_ds['bathymetry_mask']
+    mean_da = xr.DataArray(
+        mean.get(), dims=dims, coords=coords,
+        attrs={
+            "units": "dimensionless (intensity relative to continuous orthogonal sunlight)",
+            "long_name": "Monthly average daily solar potential (incidence-weighted, shadow-masked)",
+        },
+    )
+    cos_da = xr.DataArray(
+        cos_mode.get(), dims=dims, coords=coords,
+        attrs={
+            "units": "dimensionless (intensity relative to continuous orthogonal sunlight)",
+            "long_name": "cos mode of diurnal variability in insolation",
+        },
+    )
+    sin_da = xr.DataArray(
+        sin_mode.get(), dims=dims, coords=coords,
+        attrs={
+            "units": "dimensionless (intensity relative to continuous orthogonal sunlight)",
+            "long_name": "sin mode of diurnal variability in insolation",
+        },
+    )
 
-# Save to NetCDF
-print(f"\nSaving to {OUTPUT_PATH}...")
-out_ds.to_netcdf(OUTPUT_PATH)
-print(f"Saved {OUTPUT_PATH}")
+    # Carry only the projection metadata from the DEM; downstream merge
+    # provides the elevation and mask fields.
+    insolation_ds = dem.copy()
+    insolation_ds["monthly_solar_potential_mean"] = mean_da
+    insolation_ds["monthly_solar_potential_cos"] = cos_da
+    insolation_ds["monthly_solar_potential_sin"] = sin_da
+    insolation_ds.attrs["source"] = f"GLARE SolarPotential, year {year}"
+    insolation_ds.attrs["centroid_lat"] = latitude
+    insolation_ds.attrs["centroid_lon"] = longitude
+    insolation_ds.attrs["grid_resolution"] = f"{GRID_RESOLUTION_M} m"
 
-if VISUALIZE:
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import LightSource
-    # Visualization
-    print("\nCreating visualization...")
-    z_cpu = solar.z.get()
-    ls = LightSource(azdeg=315, altdeg=45)
-    dx = dem.x[1].item() - dem.x[0].item()  # Convert to float
-    hs = ls.hillshade(z_cpu, vert_exag=3, dx=dx, dy=dx)
+    for name in ('elevation', 'domain_mask', 'rgi_mask',
+                 'topography', 'bathymetry', 'bathymetry_mask'):
+        del insolation_ds[name]
 
-    # Plot April (month 3, 0-indexed) for visualization
-    april_idx = 3
+    insolation_ds.to_netcdf(output_path)
+    return insolation_ds
 
-    # Solar potential overlay
-    plt.imshow(hs, cmap=plt.cm.gray)
-    im1 = plt.imshow(solar_potential_mean[april_idx].get(), alpha=0.5, cmap=plt.cm.plasma)
-    plt.title('April: Daily Average Solar Potential')
-    plt.colorbar(im1, label='Incidence-weighted (dimensionless)')
 
-    plt.tight_layout()
-    plt.show()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--domain-path", type=str, required=True)
+    parser.add_argument("--year", type=int, required=True)
+    args = parser.parse_args()
+    build_insolation(args.domain_path, args.year)

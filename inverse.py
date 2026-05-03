@@ -34,7 +34,7 @@ import geopandas as gpd
 # Load data
 # =============================================================================
 
-BASE_DIR = './domains/chugach/'
+BASE_DIR = './domains/wrangell/'
 
 OUTPUT_PATH = f'{BASE_DIR}/inverse/'
 
@@ -133,21 +133,31 @@ model.adjoint_solver.fas_options.set(
 model.adjoint_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(1.0))
 
 bed_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-bed_model.mg.parameters.sigma.set(1000.0)
+bed_model.mg.parameters.sigma.set(500.0)
 bed_model.mg.parameters.l.set(500.0)
 bed_model.mg.parameters.nu.set(1)
+bed_model.forward_solver.fas_options.report_norms.set(False)
 bed_map = GGaPPMap.apply
+
+mean_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
+mean_model.mg.parameters.sigma.set(2000.0)
+mean_model.mg.parameters.l.set(20000.0)
+mean_model.mg.parameters.nu.set(1)
+mean_model.forward_solver.fas_options.report_norms.set(False)
+mean_map = GGaPPMap.apply
 
 log_beta_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
 log_beta_model.mg.parameters.sigma.set(5.0)
-log_beta_model.mg.parameters.l.set(300.0)
+log_beta_model.mg.parameters.l.set(500.0)
 log_beta_model.mg.parameters.nu.set(1)
+log_beta_model.forward_solver.fas_options.report_norms.set(False)
 log_beta_map = GGaPPMap.apply
 
 pbias_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
 pbias_model.mg.parameters.sigma.set(2.0)
 pbias_model.mg.parameters.l.set(10000.0)
 pbias_model.mg.parameters.nu.set(1)
+pbias_model.forward_solver.fas_options.report_norms.set(False)
 pbias_map = GGaPPMap.apply
 
 
@@ -161,6 +171,10 @@ H_prev = torch.tensor(mg[0].state.H_prev.data,
         device='cuda',requires_grad=False)
 bed = torch.tensor(mg[0].geometry.bed.data,
         device='cuda',requires_grad=True)
+
+bed_mean = torch.zeros(ny,nx, dtype=torch.float32,
+        device='cuda',requires_grad=True)
+
 t2m = torch.tensor(smb_model.grid.temperature.t2m.data,
         device='cuda',requires_grad=False)
 precip = torch.tensor(smb_model.grid.precipitation.precip.data,
@@ -249,6 +263,10 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
             dx=mg[level].dx,
             grid=mg[level])
 
+    bed_mean_field = Field(cp.zeros((mg[level].ny,mg[level].nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=mg[level].dx,
+            grid=mg[level])
     
     mask = torch.tensor(rgi_mask*domain_mask,
             dtype=torch.float32,device='cuda')
@@ -256,6 +274,10 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     def bed_grad_transform(bed,grad,state,group):
         grad[~(rgi_mask*domain_mask)] = 0.0
         grad[:,:] = GGaPPMap.apply(bed_model,GGaPPMap.apply(bed_model,grad))
+        return grad
+
+    def bed_mean_grad_transform(bed,grad,state,group):
+        grad[:,:] = GGaPPMap.apply(mean_model,GGaPPMap.apply(mean_model,grad))
         return grad
 
     def log_beta_grad_transform(param,grad,state,group):
@@ -267,17 +289,20 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         return grad
 
     optimizer_ngd = PSGD([{'params':bed,
-                           'lr':0.1,
+                           'lr':0.5,
                            'grad_transform': bed_grad_transform},
+                           {'params':bed_mean,
+                           'lr':0.2,
+                           'grad_transform': bed_mean_grad_transform},
                            {'params':log_beta,
                             'lr':1.0,
                             'grad_transform': log_beta_grad_transform},
                            {'params':precipitation_bias,
-                            'lr':0.002,
+                            'lr':0.005,
                             'grad_transform': pbias_grad_transform},
-                           {'params':log_mf,'lr':0.001},
-                           {'params':log_rf,'lr':0.001}],
-                           nesterov=True,
+                           {'params':log_mf,'lr':0.0005},
+                           {'params':log_rf,'lr':0.0005}],
+                           nesterov=False,
                            momentum=0.5
                            )
     
@@ -288,6 +313,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
                             'U':[mg[level].state.u,mg[level].state.v],
                             'srf':srf,
                             'delta':delta,
+                            'bed_mean':bed_mean_field,
                             'smb':mg[level].forcing.smb}
         )
 
@@ -316,6 +342,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         rf = torch.exp(log_rf)
 
         bed_ = differentiable_restriction(bed,level)
+        bed_mean_ = differentiable_restriction(bed_mean,level)
         H_prev_ = differentiable_restriction(H_prev,level)
         log_beta_ = differentiable_restriction(log_beta,level)
         S_obs_ = differentiable_restriction(S_obs,level)
@@ -372,11 +399,14 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
 
         # Extent loss
         p_extent = (2./(1+torch.exp(-H/100.0))-1).clip(min=0.001,max=0.999)
-        J_extent = -100.0*(mask*torch.log(p_extent)).mean()
+        J_extent = -100.0*(mask*torch.log(p_extent) + (1-mask)*(torch.log(1-p_extent))).mean()
          
         # Tikhonov Regularization - bed
-        z_bed = GGaPPWhiten.apply(bed_model,bed)
+        z_bed = GGaPPWhiten.apply(bed_model,bed - bed_mean)
         J_prior_bed = 1e-5*(z_bed**2).sum()
+
+        z_bed_mean = GGaPPWhiten.apply(mean_model,bed_mean)
+        J_prior_bed_mean = 1e-5*(z_bed_mean**2).sum()
 
         # Tikhonov Regularization - log_beta
         z_log_beta = GGaPPWhiten.apply(log_beta_model,log_beta)
@@ -389,13 +419,14 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         J_prior_smb = (log_rf - 2.9)**2 + (log_mf - .6016)**2
 
         bed_at_obs = grid_sample(bed[None,None,:,:],bed_normed_coords[None,None,:,:],mode='bilinear').squeeze()
-        J_bed = 0.0#0.01*(torch.sqrt((bed_at_obs - bed_obs)**2 + 100.0).mean() - 10.0)
+        J_bed = 0.01*(torch.sqrt((bed_at_obs - bed_obs)**2 + 100.0).mean() - 10.0)
 
-        J = J_srf + J_vel + J_extent + J_prior_bed + J_prior_beta + J_prior_pbias + J_prior_smb + J_bed
+        J = J_srf + J_vel + J_extent + J_prior_bed + J_prior_bed_mean + J_prior_beta + J_prior_pbias + J_prior_smb + J_bed
 
         if write_vti:
             delta.data[:,:] = cp.asarray(S_.detach() - S_obs_)
             srf.data[:,:] = cp.asarray(S_.detach())
+            bed_mean_field.data[:,:] = cp.asarray(bed_mean_.detach())
             vti_writer.append(mg[level],time=i)
             vti_writer.write_pvd()
         
