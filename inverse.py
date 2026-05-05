@@ -297,7 +297,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
                            'lr':0.5,
                            'grad_transform': bed_grad_transform},
                            {'params':bed_mean,
-                           'lr':0.1,
+                           'lr':0.02,
                            'grad_transform': bed_mean_grad_transform},
                            {'params':log_beta,
                             'lr':1.0,
@@ -441,38 +441,69 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         H = differentiable_prolongation(H,level,grid_entity='cell')
         S = differentiable_prolongation(S,level,grid_entity='cell')
 
-        J_srf = 2.0*(torch.sqrt((S - S_obs)**2 + 100.0).mean() - 10)
+        loss_scale = 1e-4
+
+        lambda_s = 1e-5
+        sigma_s = 10.0
+        nu_s = 1.0
+        r_s = (S-S_obs)/sigma_s
+        J_srf = loss_scale * lambda_s * dx**2 * nu_s**2 * (torch.sqrt(1 + (r_s / nu_s)**2) - 1).sum()
+
+        #J_srf = 2.0*(torch.sqrt((S - S_obs)**2 + 100.0).mean() - 10)
         
         u_pred = (u[:,1:] + u[:,:-1])/2.
-        v_pred = (v[1:,:] + v[:-1,:])/2.        
-        J_vel = 3.0*(torch.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2 + 100.0).mean() - 10.0)
+        v_pred = (v[1:,:] + v[:-1,:])/2.     
+
+        lambda_u = 1e-6
+        sigma_u = 25.0
+        nu_u = 1.0
+        r_u2 = (((u_pred - u_obs)**2 + (v_pred - v_obs))**2)/sigma_u**2
+
+        J_vel = loss_scale * lambda_u * dx**2 * nu_u**2 * (torch.sqrt(1 + r_u2/nu_u**2) - 1).sum()
+        
+        #J_vel = 3.0*(torch.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2 + 100.0).mean() - 10.0)
 
         # Extent loss
-        p_extent = (2./(1+torch.exp(-H/10.0))-1).clip(min=0.001,max=0.999)
-        #p_extent = (1./(1+torch.exp(-H/10.0))).clip(min=0.001,max=0.999)
-        J_extent = -100.0*(mask*torch.log(p_extent)).mean()# + (1-mask)*(torch.log(1-p_extent))).mean()
-         
+
+        lambda_e = 1e-4
+        s_H = 10.0
+
+        p_extent = (2./(1+torch.exp(-H/s_H))-1).clip(min=0.001,max=0.999)
+        J_extent = -loss_scale * lambda_e * dx**2 * (mask*torch.log(p_extent)).sum()
+
+        #J_extent = -100.0*(mask*torch.log(p_extent)).mean()# + (1-mask)*(torch.log(1-p_extent))).mean()
+
+        bed_pred = grid_sample(bed[None,None,:,:],bed_normed_coords[None,None,:,:],mode='bilinear').squeeze()
+        lambda_bed = 1e-5
+        sigma_bed = 10.0
+        nu_bed = 1.0
+        r_bed = (bed_pred - bed_obs)/sigma_bed 
+
+        J_bed = loss_scale * lambda_bed * dx**2 * nu_bed**2 * (torch.sqrt(1 + (r_bed / nu_bed)**2) - 1).sum()
+        #J_bed = torch.nan_to_num(0.01*(torch.sqrt((bed_pred - bed_obs)**2 + 100.0).mean() - 10.0))
+
         # Tikhonov Regularization - bed
         z_bed = GGaPPWhiten.apply(bed_model,bed - bed_mean)
-        J_prior_bed = 1e-4*(z_bed**2).sum()
+        J_prior_bed = loss_scale*(z_bed**2).sum()
 
         z_bed_mean = GGaPPWhiten.apply(mean_model,bed_mean)
-        J_prior_bed_mean = 1e-4*(z_bed_mean**2).sum()
+        J_prior_bed_mean = loss_scale*(z_bed_mean**2).sum()
 
         # Tikhonov Regularization - log_beta
         z_log_beta = GGaPPWhiten.apply(log_beta_model,log_beta)
-        J_prior_beta = 1e-4*(z_log_beta**2).sum()
+        J_prior_beta = loss_scale*(z_log_beta**2).sum()
 
         z_precipitation_bias = GGaPPWhiten.apply(pbias_model,precipitation_bias)
-        J_prior_pbias = 1e-4*(z_precipitation_bias**2).sum()
+        J_prior_pbias = loss_scale*(z_precipitation_bias**2).sum()
 
         # L2 Regularization - smb offset
         J_prior_smb = 0.0#(log_rf - 2.9)**2 + (log_mf - .6016)**2
 
-        bed_at_obs = grid_sample(bed[None,None,:,:],bed_normed_coords[None,None,:,:],mode='bilinear').squeeze()
-        J_bed = torch.nan_to_num(0.01*(torch.sqrt((bed_at_obs - bed_obs)**2 + 100.0).mean() - 10.0))
+        J_data = (J_srf + J_vel + J_extent + J_bed)
+        J_prior = (J_prior_bed + J_prior_bed_mean + J_prior_beta + J_prior_pbias + J_prior_smb)
 
-        J = J_srf + J_vel + J_extent + J_prior_bed + J_prior_bed_mean + J_prior_beta + J_prior_pbias + J_prior_smb + J_bed
+
+        J = J_data + J_prior
 
         if write_vti:
             delta.data[:,:] = cp.asarray(S_.detach() - S_obs_)
@@ -483,7 +514,11 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
             vti_writer.write_pvd()
         
 
-        print(f"{i}, {J.item():.2f}, {J_srf.item():.2f}, {J_vel.item():.2f}, {J_extent.item():.2f}, {J_prior_bed.item():.2f}, {J_prior_beta.item():.2f}, {J_prior_pbias.item():.2f}, {J_prior_smb:.2f}, {J_bed:.2f}")
+        print(f"="*60)
+        print(f"Iteration: {i}, Total Loss: {J.item():.2f}, Data Loss: {J_data.item():.2f}, Prior Loss: {J_prior.item():.2f}")
+        print(f"Srf Loss: {J_srf.item():.2f}, U Loss: {J_vel.item():.2f}, Ext Loss: {J_extent.item():.2f}, Bed Loss: {J_bed.item():.2f}")
+        print(f"Bed Prior: {J_prior_bed:.2f}, Bed Mean Prior: {J_prior_bed_mean:.2f}, Beta Prior: {J_prior_beta:.2f}, Pbias Prior: {J_prior_pbias:.2f}")
+        print(f"="*60)
         if compute_gradient:
             J.backward()
         return J
