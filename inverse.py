@@ -25,7 +25,7 @@ from glare.torch import GlareStep
 from glide.data import load_wrangell_preprocessed
 
 from ggapp.model import MaternPrior
-from ggapp.torch import GGaPPWhiten, GGaPPMap, PSGD
+from ggapp.torch import GGaPPWhiten, GGaPPMap, PSGD, PreconditionedAdam
 
 import xarray as xr
 import geopandas as gpd
@@ -86,7 +86,7 @@ mg.state.H_prev.set(0.1)
 mg.geometry.bed.set(gridded_data.elevation)
 mg.geometry.depth.set(np.maximum(-gridded_data.elevation,0))
 mg.geometry.sigmoid_c.set(0.1)
-mg.geometry.sigmoid_k.set(3.0)
+mg.geometry.sigmoid_k.set(4.0)
 
 ### Initialize rheology
 # Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
@@ -126,14 +126,14 @@ model.forward_solver.fas_options.set(
 model.adjoint_solver.fas_options.set(
         coarsest_steps=200, pre_steps=10,
         post_steps=50, finest_steps=50,
-        relative_tolerance=1e-2, absolute_tolerance=1e-6, # Note that adjoint var
+        relative_tolerance=1e-3, absolute_tolerance=1e-6, # Note that adjoint var
         report_norms=False)                               # adjoint var is small 
                                                           # in magnitude
 
 model.adjoint_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(1.0))
 
 bed_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-bed_model.mg.parameters.sigma.set(500.0)
+bed_model.mg.parameters.sigma.set(250.0)
 bed_model.mg.parameters.l.set(500.0)
 bed_model.mg.parameters.nu.set(1)
 bed_model.forward_solver.fas_options.report_norms.set(False)
@@ -147,14 +147,14 @@ mean_model.forward_solver.fas_options.report_norms.set(False)
 mean_map = GGaPPMap.apply
 
 log_beta_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-log_beta_model.mg.parameters.sigma.set(5.0)
+log_beta_model.mg.parameters.sigma.set(3.0)
 log_beta_model.mg.parameters.l.set(500.0)
 log_beta_model.mg.parameters.nu.set(1)
 log_beta_model.forward_solver.fas_options.report_norms.set(False)
 log_beta_map = GGaPPMap.apply
 
 pbias_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-pbias_model.mg.parameters.sigma.set(2.0)
+pbias_model.mg.parameters.sigma.set(0.5)
 pbias_model.mg.parameters.l.set(10000.0)
 pbias_model.mg.parameters.nu.set(1)
 pbias_model.forward_solver.fas_options.report_norms.set(False)
@@ -191,14 +191,14 @@ log_rf = torch.tensor(cp.log(smb_model.grid.insolation.rf.value),
 alpha_t2m = torch.tensor(2.2,
         device='cuda',requires_grad=False)
 
-WARM_START_PATH = None
-if WARM_START_PATH is not None:
-    d = torch.load(WARM_START_PATH)
-    log_beta = d['log_beta']
-    bed = d['bed']
-    precipitation_bias = d['precipitation_bias']
-    log_mf = d['log_mf']
-    log_rf = d['log_rf']
+#WARM_START_PATH = None
+#if WARM_START_PATH is not None:
+#    d = torch.load(WARM_START_PATH)
+#    log_beta = d['log_beta']
+#    bed = d['bed']
+#    precipitation_bias = d['precipitation_bias']
+#    log_mf = d['log_mf']
+#    log_rf = d['log_rf']
 
 rgi_mask = torch.tensor(gridded_data.rgi_mask.values,device='cuda')
 domain_mask = torch.tensor(gridded_data.domain_mask.values,device='cuda')
@@ -248,7 +248,7 @@ def differentiable_prolongation(field,n_times,grid_entity='cell',method='bilinea
 MAX_LEVEL = 2
 MIN_LEVEL = 0
 DT = 20.0
-max_iters = [20,50,200]
+max_iters = [20,50,500]
 for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     model.set_top_level(level)
 
@@ -267,10 +267,15 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
             grid_entity=GridEntity.CELL,
             dx=mg[level].dx,
             grid=mg[level])
+
+    p_bias_field = Field(cp.zeros((mg[level].ny,mg[level].nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=mg[level].dx,
+            grid=mg[level])
     
     mask = torch.tensor(rgi_mask*domain_mask,
             dtype=torch.float32,device='cuda')
-
+    
     def bed_grad_transform(bed,grad,state,group):
         grad[~(rgi_mask*domain_mask)] = 0.0
         grad[:,:] = GGaPPMap.apply(bed_model,GGaPPMap.apply(bed_model,grad))
@@ -284,26 +289,68 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         grad[:,:] = GGaPPMap.apply(log_beta_model,GGaPPMap.apply(log_beta_model,grad))
         return grad
 
-    def pbias_grad_transform(param,grad,state,group):
-        grad[:,:] = GGaPPMap.apply(pbias_model,GGaPPMap.apply(pbias_model,grad))
-        return grad
+    #def pbias_grad_transform(param,grad,state,group):
+    #    grad[:,:] = GGaPPMap.apply(pbias_model,GGaPPMap.apply(pbias_model,grad))
+    #    return grad
 
     optimizer_ngd = PSGD([{'params':bed,
                            'lr':0.5,
                            'grad_transform': bed_grad_transform},
                            {'params':bed_mean,
-                           'lr':0.2,
+                           'lr':0.1,
                            'grad_transform': bed_mean_grad_transform},
                            {'params':log_beta,
                             'lr':1.0,
                             'grad_transform': log_beta_grad_transform},
-                           {'params':precipitation_bias,
-                            'lr':0.005,
-                            'grad_transform': pbias_grad_transform},
-                           {'params':log_mf,'lr':0.0005},
-                           {'params':log_rf,'lr':0.0005}],
-                           nesterov=False,
+                           #{'params':precipitation_bias,
+                           # 'lr':0.005,
+                           # 'grad_transform': pbias_grad_transform}
+                          ],
                            momentum=0.5
+                           )
+    
+
+   # def bed_grad_transform(bed,grad,state,group):
+   #     grad[:,:] = GGaPPMap.apply(bed_model,grad)
+   #     return grad
+
+   # def bed_mean_grad_transform(bed,grad,state,group):
+   #     grad[:,:] = GGaPPMap.apply(mean_model,grad)
+   #     return grad
+
+   # def log_beta_grad_transform(param,grad,state,group):
+   #     grad[:,:] = GGaPPMap.apply(log_beta_model,grad)
+   #     return grad
+
+    def pbias_grad_transform(param,grad,state,group):
+        grad[:,:] = GGaPPMap.apply(pbias_model,grad)
+        return grad
+
+    optimizer_pca = PreconditionedAdam([
+                           #{'params':bed,
+                           # 'lr':0.01,
+                           # 'grad_to_latent': bed_grad_transform,
+                           # 'latent_to_param': bed_grad_transform},
+                           #{'params':bed_mean,
+                           # 'lr':0.002,
+                           # 'grad_to_latent': bed_mean_grad_transform,
+                           # 'latent_to_param': bed_mean_grad_transform},
+                           #{'params':log_beta,
+                           # 'lr':0.01,
+                           # 'grad_to_latent': log_beta_grad_transform,
+                           # 'latent_to_param': log_beta_grad_transform},
+                           {'params':precipitation_bias,
+                            'lr':0.0003,
+                            'grad_to_latent': pbias_grad_transform,
+                            'latent_to_param': pbias_grad_transform}
+                           ],
+                           betas=(0.5,0.99)
+                           )
+
+    optimizer_adam = torch.optim.Adam([
+                           {'params':log_mf,'lr':0.01},
+                           {'params':log_rf,'lr':0.01}],
+                           betas=(0.5,0.99)           
                            )
     
     vti_writer = VTIWriter(f'{OUTPUT_PATH}/level_{level}/vti', base='wrangell', dx=mg[level].dx,
@@ -313,6 +360,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
                             'U':[mg[level].state.u,mg[level].state.v],
                             'srf':srf,
                             'delta':delta,
+                            'p_bias':p_bias_field,
                             'bed_mean':bed_mean_field,
                             'smb':mg[level].forcing.smb}
         )
@@ -320,12 +368,13 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     vti_writer.initialize(mg[level])
     
     def evaluate_loss(i,compute_gradient=True,write_vti=True):
-        #optimizer_adam.zero_grad()
 
         depth = torch.maximum(-bed,torch.zeros_like(bed)).detach()
         mg.geometry.depth.set(0.1*cp.asarray(depth) + 0.9*mg[0].geometry.depth.data)
 
         optimizer_ngd.zero_grad()
+        optimizer_pca.zero_grad()
+        optimizer_adam.zero_grad()
         
         mg.state.u.set(0.0,start_level=level)
         mg.state.v.set(0.0,start_level=level)
@@ -343,6 +392,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
 
         bed_ = differentiable_restriction(bed,level)
         bed_mean_ = differentiable_restriction(bed_mean,level)
+        precipitation_bias_ = differentiable_restriction(precipitation_bias,level)
         H_prev_ = differentiable_restriction(H_prev,level)
         log_beta_ = differentiable_restriction(log_beta,level)
         S_obs_ = differentiable_restriction(S_obs,level)
@@ -398,28 +448,29 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         J_vel = 3.0*(torch.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2 + 100.0).mean() - 10.0)
 
         # Extent loss
-        p_extent = (2./(1+torch.exp(-H/100.0))-1).clip(min=0.001,max=0.999)
-        J_extent = -100.0*(mask*torch.log(p_extent) + (1-mask)*(torch.log(1-p_extent))).mean()
+        p_extent = (2./(1+torch.exp(-H/10.0))-1).clip(min=0.001,max=0.999)
+        #p_extent = (1./(1+torch.exp(-H/10.0))).clip(min=0.001,max=0.999)
+        J_extent = -100.0*(mask*torch.log(p_extent)).mean()# + (1-mask)*(torch.log(1-p_extent))).mean()
          
         # Tikhonov Regularization - bed
         z_bed = GGaPPWhiten.apply(bed_model,bed - bed_mean)
-        J_prior_bed = 1e-5*(z_bed**2).sum()
+        J_prior_bed = 1e-4*(z_bed**2).sum()
 
         z_bed_mean = GGaPPWhiten.apply(mean_model,bed_mean)
-        J_prior_bed_mean = 1e-5*(z_bed_mean**2).sum()
+        J_prior_bed_mean = 1e-4*(z_bed_mean**2).sum()
 
         # Tikhonov Regularization - log_beta
         z_log_beta = GGaPPWhiten.apply(log_beta_model,log_beta)
-        J_prior_beta = 1e-5*(z_log_beta**2).sum()
+        J_prior_beta = 1e-4*(z_log_beta**2).sum()
 
         z_precipitation_bias = GGaPPWhiten.apply(pbias_model,precipitation_bias)
-        J_prior_pbias = 1e-5*(z_precipitation_bias**2).sum()
+        J_prior_pbias = 1e-4*(z_precipitation_bias**2).sum()
 
         # L2 Regularization - smb offset
-        J_prior_smb = (log_rf - 2.9)**2 + (log_mf - .6016)**2
+        J_prior_smb = 0.0#(log_rf - 2.9)**2 + (log_mf - .6016)**2
 
         bed_at_obs = grid_sample(bed[None,None,:,:],bed_normed_coords[None,None,:,:],mode='bilinear').squeeze()
-        J_bed = 0.01*(torch.sqrt((bed_at_obs - bed_obs)**2 + 100.0).mean() - 10.0)
+        J_bed = torch.nan_to_num(0.01*(torch.sqrt((bed_at_obs - bed_obs)**2 + 100.0).mean() - 10.0))
 
         J = J_srf + J_vel + J_extent + J_prior_bed + J_prior_bed_mean + J_prior_beta + J_prior_pbias + J_prior_smb + J_bed
 
@@ -427,6 +478,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
             delta.data[:,:] = cp.asarray(S_.detach() - S_obs_)
             srf.data[:,:] = cp.asarray(S_.detach())
             bed_mean_field.data[:,:] = cp.asarray(bed_mean_.detach())
+            p_bias_field.data[:,:] = cp.asarray(precipitation_bias_.detach())
             vti_writer.append(mg[level],time=i)
             vti_writer.write_pvd()
         
@@ -439,7 +491,8 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
 
     for i in range(0,max_iters[level]):
         evaluate_loss(i)
-        #optimizer_adam.step()
+        optimizer_adam.step()
+        optimizer_pca.step()
         optimizer_ngd.step()
     evaluate_loss(0,write_vti=False,compute_gradient=False)
 
