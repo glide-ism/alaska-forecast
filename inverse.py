@@ -34,9 +34,9 @@ import geopandas as gpd
 # Load data
 # =============================================================================
 
-BASE_DIR = './domains/wrangell/'
+BASE_DIR = './domains/delta/'
 
-OUTPUT_PATH = f'{BASE_DIR}/inverse/'
+OUTPUT_PATH = f'{BASE_DIR}/inverse_l/'
 
 print("Loading geometry...")
 
@@ -111,8 +111,8 @@ smb_model.grid.insolation.insol_cos.set(gridded_data.monthly_solar_potential_cos
 smb_model.grid.insolation.insol_sin.set(gridded_data.monthly_solar_potential_sin)
 smb_model.grid.temperature.t2m.set(gridded_data.monthly_t2m)
 smb_model.grid.precipitation.precip.set(gridded_data.monthly_precip)
-smb_model.grid.insolation.rf.set(np.exp(2.9))
-smb_model.grid.temperature.mf.set(np.exp(0.6))
+smb_model.grid.insolation.rf.set(20.0)
+smb_model.grid.temperature.mf.set(0.5)
 smb_model.forward()
 
 ### Initialize forcing
@@ -143,7 +143,7 @@ bed_map = GGaPPMap.apply
 
 mean_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
 mean_model.mg.parameters.sigma.set(2000.0)
-mean_model.mg.parameters.l.set(20000.0)
+mean_model.mg.parameters.l.set(10000.0)
 mean_model.mg.parameters.nu.set(1)
 mean_model.forward_solver.fas_options.report_norms.set(False)
 mean_map = GGaPPMap.apply
@@ -156,7 +156,7 @@ log_beta_model.forward_solver.fas_options.report_norms.set(False)
 log_beta_map = GGaPPMap.apply
 
 pbias_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-pbias_model.mg.parameters.sigma.set(0.1)
+pbias_model.mg.parameters.sigma.set(0.3)
 pbias_model.mg.parameters.l.set(10000.0)
 pbias_model.mg.parameters.nu.set(1)
 pbias_model.forward_solver.fas_options.report_norms.set(False)
@@ -299,7 +299,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
                            'lr':0.25,
                            'grad_transform': bed_grad_transform},
                            {'params':bed_mean,
-                           'lr':0.02,
+                           'lr':0.1,
                            'grad_transform': bed_mean_grad_transform},
                            {'params':log_beta,
                             'lr':1.0,
@@ -451,29 +451,24 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         r_s = (S-S_obs)/sigma_s
         J_srf = loss_scale * lambda_s * dx**2 * nu_s**2 * (torch.sqrt(1 + (r_s / nu_s)**2) - 1).sum()
 
-        #J_srf = 2.0*(torch.sqrt((S - S_obs)**2 + 100.0).mean() - 10)
-        
         u_pred = (u[:,1:] + u[:,:-1])/2.
         v_pred = (v[1:,:] + v[:-1,:])/2.     
 
-        lambda_u = 1e-5
+        lambda_u = 1e-4
         sigma_u = 10.0
         nu_u = 1.0
         r_u2 = ((u_pred - u_obs)**2 + (v_pred - v_obs)**2)/sigma_u**2
 
         J_vel = loss_scale * lambda_u * dx**2 * nu_u**2 * (torch.sqrt(1 + r_u2/nu_u**2) - 1).sum()
         
-        #J_vel = 3.0*(torch.sqrt((u_pred - u_obs)**2 + (v_pred - v_obs)**2 + 100.0).mean() - 10.0)
 
         # Extent loss
-
         lambda_e = 1e-4
         s_H = 10.0
 
         p_extent = (2./(1+torch.exp(-H/s_H))-1).clip(min=0.001,max=0.999)
+        #J_extent = -loss_scale * lambda_e * dx**2 * (mask*torch.log(p_extent) + (1-mask)*torch.log(1-p_extent)).sum()
         J_extent = -loss_scale * lambda_e * dx**2 * (mask*torch.log(p_extent)).sum()
-
-        #J_extent = -100.0*(mask*torch.log(p_extent)).mean()# + (1-mask)*(torch.log(1-p_extent))).mean()
 
         bed_pred = grid_sample(bed[None,None,:,:],bed_normed_coords[None,None,:,:],mode='bilinear').squeeze()
         lambda_bed = 1e-5
@@ -482,7 +477,6 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         r_bed = (bed_pred - bed_obs)/sigma_bed 
 
         J_bed = loss_scale * lambda_bed * dx**2 * nu_bed**2 * (torch.sqrt(1 + (r_bed / nu_bed)**2) - 1).sum()
-        #J_bed = torch.nan_to_num(0.01*(torch.sqrt((bed_pred - bed_obs)**2 + 100.0).mean() - 10.0))
 
         # Tikhonov Regularization - bed
         z_bed = GGaPPWhiten.apply(bed_model,bed - bed_mean)
@@ -501,8 +495,8 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         # L2 Regularization - smb offset
         sigma_log_rf = 0.3
         sigma_log_mf = 0.3
-        mu_log_rf = 2.9
-        mu_log_mf = 0.6
+        mu_log_rf = np.log(20.0)
+        mu_log_mf = np.log(0.5)
 
         J_prior_smb = ((log_rf - mu_log_rf)/sigma_log_rf)**2 + ((log_mf - mu_log_mf)/sigma_log_mf)**2
 
