@@ -111,6 +111,8 @@ smb_model.grid.insolation.insol_cos.set(gridded_data.monthly_solar_potential_cos
 smb_model.grid.insolation.insol_sin.set(gridded_data.monthly_solar_potential_sin)
 smb_model.grid.temperature.t2m.set(gridded_data.monthly_t2m)
 smb_model.grid.precipitation.precip.set(gridded_data.monthly_precip)
+smb_model.grid.insolation.rf.set(np.exp(2.9))
+smb_model.grid.temperature.mf.set(np.exp(0.6))
 smb_model.forward()
 
 ### Initialize forcing
@@ -133,7 +135,7 @@ model.adjoint_solver.fas_options.set(
 model.adjoint_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(1.0))
 
 bed_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-bed_model.mg.parameters.sigma.set(250.0)
+bed_model.mg.parameters.sigma.set(500.0)
 bed_model.mg.parameters.l.set(500.0)
 bed_model.mg.parameters.nu.set(1)
 bed_model.forward_solver.fas_options.report_norms.set(False)
@@ -154,7 +156,7 @@ log_beta_model.forward_solver.fas_options.report_norms.set(False)
 log_beta_map = GGaPPMap.apply
 
 pbias_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-pbias_model.mg.parameters.sigma.set(0.5)
+pbias_model.mg.parameters.sigma.set(0.1)
 pbias_model.mg.parameters.l.set(10000.0)
 pbias_model.mg.parameters.nu.set(1)
 pbias_model.forward_solver.fas_options.report_norms.set(False)
@@ -294,7 +296,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     #    return grad
 
     optimizer_ngd = PSGD([{'params':bed,
-                           'lr':0.5,
+                           'lr':0.25,
                            'grad_transform': bed_grad_transform},
                            {'params':bed_mean,
                            'lr':0.02,
@@ -340,7 +342,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
                            # 'grad_to_latent': log_beta_grad_transform,
                            # 'latent_to_param': log_beta_grad_transform},
                            {'params':precipitation_bias,
-                            'lr':0.0003,
+                            'lr':0.001,
                             'grad_to_latent': pbias_grad_transform,
                             'latent_to_param': pbias_grad_transform}
                            ],
@@ -386,7 +388,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         mg.adjoint.lambda_v.set(0.0,start_level=level)
         mg.adjoint.lambda_H.set(0.0,start_level=level)
 
-        precip_ = precip + precipitation_bias #(Vy @ precipitation_bias @ Vx.T)[None,:,:]
+        precip_ = precip + precipitation_bias 
         mf = torch.exp(log_mf)
         rf = torch.exp(log_rf)
 
@@ -454,10 +456,10 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         u_pred = (u[:,1:] + u[:,:-1])/2.
         v_pred = (v[1:,:] + v[:-1,:])/2.     
 
-        lambda_u = 1e-6
-        sigma_u = 25.0
+        lambda_u = 1e-5
+        sigma_u = 10.0
         nu_u = 1.0
-        r_u2 = (((u_pred - u_obs)**2 + (v_pred - v_obs))**2)/sigma_u**2
+        r_u2 = ((u_pred - u_obs)**2 + (v_pred - v_obs)**2)/sigma_u**2
 
         J_vel = loss_scale * lambda_u * dx**2 * nu_u**2 * (torch.sqrt(1 + r_u2/nu_u**2) - 1).sum()
         
@@ -497,7 +499,12 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         J_prior_pbias = loss_scale*(z_precipitation_bias**2).sum()
 
         # L2 Regularization - smb offset
-        J_prior_smb = 0.0#(log_rf - 2.9)**2 + (log_mf - .6016)**2
+        sigma_log_rf = 0.3
+        sigma_log_mf = 0.3
+        mu_log_rf = 2.9
+        mu_log_mf = 0.6
+
+        J_prior_smb = ((log_rf - mu_log_rf)/sigma_log_rf)**2 + ((log_mf - mu_log_mf)/sigma_log_mf)**2
 
         J_data = (J_srf + J_vel + J_extent + J_bed)
         J_prior = (J_prior_bed + J_prior_bed_mean + J_prior_beta + J_prior_pbias + J_prior_smb)
