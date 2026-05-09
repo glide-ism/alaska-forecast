@@ -27,6 +27,8 @@ from glide.data import load_wrangell_preprocessed
 from ggapp.model import MaternPrior
 from ggapp.torch import GGaPPWhiten, GGaPPMap, PSGD, PreconditionedAdam
 
+from torchvision.transforms.functional import gaussian_blur
+
 import xarray as xr
 import geopandas as gpd
 
@@ -36,7 +38,9 @@ import geopandas as gpd
 
 BASE_DIR = './domains/wrangell/'
 
-OUTPUT_PATH = f'{BASE_DIR}/inverse/'
+INPUT_PATH = f'{BASE_DIR}/inverse_long/'
+
+OUTPUT_PATH = f'{BASE_DIR}/inverse_long/rto/rto_{cp.random.randint(1e8)}/'
 
 print("Loading geometry...")
 
@@ -106,13 +110,21 @@ smb_model = ImprovedTemperatureIndex(ny=ny,nx=nx,nt=12,
         x0=x0,y0=y0,
         crs=crs)
 
+# L2 Regularization - smb offset
+sigma_log_rf = 0.1
+sigma_log_mf = 0.1
+mu_rf = 20.0
+mu_mf = 2.0
+mu_log_rf = np.log(mu_rf)
+mu_log_mf = np.log(mu_mf)
+
 smb_model.grid.insolation.insol_mean.set(gridded_data.monthly_solar_potential_mean)
 smb_model.grid.insolation.insol_cos.set(gridded_data.monthly_solar_potential_cos)
 smb_model.grid.insolation.insol_sin.set(gridded_data.monthly_solar_potential_sin)
 smb_model.grid.temperature.t2m.set(gridded_data.monthly_t2m)
 smb_model.grid.precipitation.precip.set(gridded_data.monthly_precip)
-smb_model.grid.insolation.rf.set(20.0)
-smb_model.grid.temperature.mf.set(2.0)
+smb_model.grid.insolation.rf.set(mu_rf)
+smb_model.grid.temperature.mf.set(mu_mf)
 smb_model.forward()
 
 ### Initialize forcing
@@ -136,8 +148,8 @@ model.adjoint_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(1.0
 
 bed_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
 bed_model.mg.parameters.sigma.set(500.0)
-bed_model.mg.parameters.l.set(1000.0)
-bed_model.mg.parameters.nu.set(1)
+bed_model.mg.parameters.l.set(500.0)
+bed_model.mg.parameters.nu.set(3)
 bed_model.forward_solver.fas_options.report_norms.set(False)
 bed_map = GGaPPMap.apply
 
@@ -193,7 +205,7 @@ log_rf = torch.tensor(cp.log(smb_model.grid.insolation.rf.value),
 alpha_t2m = torch.tensor(2.2,
         device='cuda',requires_grad=False)
 
-WARM_START_PATH = None#f'{OUTPUT_PATH}/level_0/torch_vars.p'
+WARM_START_PATH = f'{INPUT_PATH}/level_2/torch_vars.p'
 if WARM_START_PATH is not None:
     d = torch.load(WARM_START_PATH)
     log_beta = d['log_beta']
@@ -202,10 +214,13 @@ if WARM_START_PATH is not None:
     precipitation_bias = d['precipitation_bias']
     log_mf = d['log_mf']
     log_rf = d['log_rf']
-
+    
 rgi_mask = torch.tensor(gridded_data.rgi_mask.values,device='cuda')
 domain_mask = torch.tensor(gridded_data.domain_mask.values,device='cuda')
 base_anomaly = temperature_anomaly.sel(time=2012).temp_anomaly.item()
+
+sigma_s = 10.0
+sigma_u = 10.0
 
 u_obs = torch.tensor(gridded_data.vx.values,
         dtype=torch.float32,device='cuda').nan_to_num().masked_fill(~domain_mask,0.0)
@@ -222,6 +237,11 @@ col_normed =  (2.0*((flightlines[:,0] - xmin)/(xmax - xmin)) - 1)
 row_normed = -(2.0*((flightlines[:,1] - ymin)/(ymax - ymin)) - 1)
 bed_normed_coords = torch.stack([col_normed,row_normed],dim=-1)
 bed_obs = flightlines[:,2]
+
+u_obs += torch.randn_like(u_obs)*sigma_u
+v_obs += torch.randn_like(v_obs)*sigma_u
+S_obs += torch.randn_like(S_obs)*sigma_s
+bed_obs += torch.randn_like(bed_obs)*sigma_s
 
 def compute_smb(smb_model,t2m,t_anomaly,base_anomaly,precip_,mf,rf,domain_mask):
     smb = glare_step(smb_model,t2m + (t_anomaly - base_anomaly),precip_,mf,rf).mean(axis=0)
@@ -249,9 +269,9 @@ def differentiable_prolongation(field,n_times,grid_entity='cell',method='bilinea
     return field
 
 MAX_LEVEL = 2
-MIN_LEVEL = 0
+MIN_LEVEL = 2
 DT = 20.0
-max_iters = [20,50,500]
+max_iters = [0,0,100]
 for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     model.set_top_level(level)
 
@@ -278,6 +298,8 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     
     mask = torch.tensor(rgi_mask*domain_mask,
             dtype=torch.float32,device='cuda')
+
+    mask = (torch.rand(*rgi_mask.shape,device='cuda') < gaussian_blur(rgi_mask.to(torch.float).unsqueeze(0),27).squeeze()).to(torch.float32)
     
     def bed_grad_transform(bed,grad,state,group):
         grad[~(rgi_mask*domain_mask)] = 0.0
@@ -337,6 +359,13 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         )
 
     vti_writer.initialize(mg[level])
+
+    bed_rto_mean = torch.as_tensor(bed_model.sample())
+    log_beta_rto_mean = torch.as_tensor(log_beta_model.sample())
+    pbias_rto_mean = torch.as_tensor(pbias_model.sample())
+
+    log_mf_rto_mean = sigma_log_mf * cp.random.randn().item()
+    log_rf_rto_mean = sigma_log_rf * cp.random.randn().item()
     
     def evaluate_loss(i,compute_gradient=True,write_vti=True):
 
@@ -413,9 +442,9 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         S = differentiable_prolongation(S,level,grid_entity='cell')
 
         loss_scale = 1e-4
+        
 
         lambda_s = 1e-5
-        sigma_s = 10.0
         nu_s = 1.0
         r_s = (S-S_obs)/sigma_s
         J_srf = loss_scale * lambda_s * dx**2 * nu_s**2 * (torch.sqrt(1 + (r_s / nu_s)**2) - 1).sum()
@@ -424,7 +453,6 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         v_pred = (v[1:,:] + v[:-1,:])/2.     
 
         lambda_u = 1e-5
-        sigma_u = 10.0
         nu_u = 1.0
         r_u2 = ((u_pred - u_obs)**2 + (v_pred - v_obs)**2)/sigma_u**2
 
@@ -436,7 +464,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         s_H = 10.0
 
         p_extent = (2./(1+torch.exp(-H/s_H))-1).clip(min=0.001,max=0.999)
-        #J_extent = -loss_scale * lambda_e * dx**2 * (mask*torch.log(p_extent) + (1-mask)*torch.log(1-p_extent)).sum()
+
         J_extent = -loss_scale * lambda_e * dx**2 * (mask*torch.log(p_extent)).sum()
 
         bed_pred = grid_sample(bed[None,None,:,:],bed_normed_coords[None,None,:,:],mode='bilinear').squeeze()
@@ -448,26 +476,22 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         J_bed = loss_scale * lambda_bed * dx**2 * nu_bed**2 * (torch.sqrt(1 + (r_bed / nu_bed)**2) - 1).sum()
 
         # Tikhonov Regularization - bed
-        z_bed = GGaPPWhiten.apply(bed_model,bed - bed_mean)
+        z_bed = GGaPPWhiten.apply(bed_model,bed - bed_rto_mean - bed_mean)
         J_prior_bed = loss_scale*(z_bed**2).sum()
 
         z_bed_mean = GGaPPWhiten.apply(mean_model,bed_mean)
         J_prior_bed_mean = loss_scale*(z_bed_mean**2).sum()
 
         # Tikhonov Regularization - log_beta
-        z_log_beta = GGaPPWhiten.apply(log_beta_model,log_beta)
+        z_log_beta = GGaPPWhiten.apply(log_beta_model,log_beta - log_beta_rto_mean)
         J_prior_beta = loss_scale*(z_log_beta**2).sum()
 
-        z_precipitation_bias = GGaPPWhiten.apply(pbias_model,precipitation_bias)
+        z_precipitation_bias = GGaPPWhiten.apply(pbias_model,precipitation_bias - pbias_rto_mean)
         J_prior_pbias = loss_scale*(z_precipitation_bias**2).sum()
 
-        # L2 Regularization - smb offset
-        sigma_log_rf = 0.1
-        sigma_log_mf = 0.1
-        mu_log_rf = np.log(20.0)
-        mu_log_mf = np.log(2.0)
 
-        J_prior_smb = ((log_rf - mu_log_rf)/sigma_log_rf)**2 + ((log_mf - mu_log_mf)/sigma_log_mf)**2
+
+        J_prior_smb = ((log_rf - log_rf_rto_mean - mu_log_rf)/sigma_log_rf)**2 + ((log_mf - log_mf_rto_mean - mu_log_mf)/sigma_log_mf)**2
 
         J_data = (J_srf + J_vel + J_extent + J_bed)
         J_prior = (J_prior_bed + J_prior_bed_mean + J_prior_beta + J_prior_pbias + J_prior_smb)
@@ -495,20 +519,12 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
 
 
     for i in range(0,max_iters[level]):
-        evaluate_loss(i)
+        evaluate_loss(i,write_vti=False)
         optimizer_adam.step()
         optimizer_pca.step()
         optimizer_ngd.step()
-    evaluate_loss(0,write_vti=False,compute_gradient=False)
+    evaluate_loss(0,write_vti=True,compute_gradient=False)
 
-    u_xr = mg[level].state.u.to_dataarray()
-    v_xr = mg[level].state.v.to_dataarray()
-    H_xr = mg[level].state.H.to_dataarray()
-    bed_xr = mg[level].geometry.bed.to_dataarray()
-    beta_xr = mg[level].sliding.beta.to_dataarray()
-    smb_xr = mg[level].forcing.smb.to_dataarray()
-    ds = xr.merge([u_xr,v_xr,H_xr,bed_xr,beta_xr,smb_xr])
-    ds.to_netcdf(f'{OUTPUT_PATH}/level_{level}/inverse_soln.nc')
     torch.save({'log_beta':log_beta,'bed':bed,'bed_mean':bed_mean,'precipitation_bias':precipitation_bias,'log_rf':log_rf,'log_mf':log_mf},f'{OUTPUT_PATH}/level_{level}/torch_vars.p')
 
 

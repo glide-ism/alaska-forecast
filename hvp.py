@@ -36,7 +36,7 @@ import geopandas as gpd
 
 BASE_DIR = './domains/wrangell/'
 
-OUTPUT_PATH = f'{BASE_DIR}/inverse/'
+OUTPUT_PATH = f'{BASE_DIR}/inverse_long/'
 
 print("Loading geometry...")
 
@@ -106,13 +106,20 @@ smb_model = ImprovedTemperatureIndex(ny=ny,nx=nx,nt=12,
         x0=x0,y0=y0,
         crs=crs)
 
+sigma_log_rf = 0.1
+sigma_log_mf = 0.1
+mu_rf = 20.0
+mu_mf = 2.0
+mu_log_rf = np.log(mu_rf)
+mu_log_mf = np.log(mu_mf)
+
 smb_model.grid.insolation.insol_mean.set(gridded_data.monthly_solar_potential_mean)
 smb_model.grid.insolation.insol_cos.set(gridded_data.monthly_solar_potential_cos)
 smb_model.grid.insolation.insol_sin.set(gridded_data.monthly_solar_potential_sin)
 smb_model.grid.temperature.t2m.set(gridded_data.monthly_t2m)
 smb_model.grid.precipitation.precip.set(gridded_data.monthly_precip)
-smb_model.grid.insolation.rf.set(20.0)
-smb_model.grid.temperature.mf.set(2.0)
+smb_model.grid.insolation.rf.set(mu_rf)
+smb_model.grid.temperature.mf.set(mu_mf)
 smb_model.forward()
 
 ### Initialize forcing
@@ -150,7 +157,7 @@ mean_map = GGaPPMap.apply
 
 log_beta_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
 log_beta_model.mg.parameters.sigma.set(3.0)
-log_beta_model.mg.parameters.l.set(1000.0)
+log_beta_model.mg.parameters.l.set(500.0)
 log_beta_model.mg.parameters.nu.set(1)
 log_beta_model.forward_solver.fas_options.report_norms.set(False)
 log_beta_map = GGaPPMap.apply
@@ -158,7 +165,7 @@ log_beta_map = GGaPPMap.apply
 pbias_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
 pbias_model.mg.parameters.sigma.set(0.1)
 pbias_model.mg.parameters.l.set(10000.0)
-pbias_model.mg.parameters.nu.set(3)
+pbias_model.mg.parameters.nu.set(1)
 pbias_model.forward_solver.fas_options.report_norms.set(False)
 pbias_map = GGaPPMap.apply
 
@@ -193,7 +200,7 @@ log_rf = torch.tensor(cp.log(smb_model.grid.insolation.rf.value),
 alpha_t2m = torch.tensor(2.2,
         device='cuda',requires_grad=False)
 
-WARM_START_PATH = None#f'{OUTPUT_PATH}/level_0/torch_vars.p'
+WARM_START_PATH = f'{OUTPUT_PATH}/level_2/torch_vars.p'
 if WARM_START_PATH is not None:
     d = torch.load(WARM_START_PATH)
     log_beta = d['log_beta']
@@ -249,12 +256,11 @@ def differentiable_prolongation(field,n_times,grid_entity='cell',method='bilinea
     return field
 
 MAX_LEVEL = 2
-MIN_LEVEL = 0
+MIN_LEVEL = 2
 DT = 20.0
 max_iters = [20,50,500]
 for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     model.set_top_level(level)
-
     
     delta = Field(cp.zeros((mg[level].ny,mg[level].nx),dtype=cp.float32),
             grid_entity=GridEntity.CELL,
@@ -324,7 +330,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
                            betas=(0.5,0.99)           
                            )
     
-    vti_writer = VTIWriter(f'{OUTPUT_PATH}/level_{level}/vti', base='wrangell', dx=mg[level].dx,
+    vti_writer = VTIWriter(f'{OUTPUT_PATH}/level_{level}/vti_hvp', base='wrangell', dx=mg[level].dx,
             dynamic_fields={'bed':mg[level].geometry.bed,
                             'beta':mg[level].sliding.beta,
                             'thk':mg[level].state.H,
@@ -341,7 +347,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     def evaluate_loss(i,compute_gradient=True,write_vti=True):
 
         depth = torch.maximum(-bed,torch.zeros_like(bed)).detach()
-        mg.geometry.depth.set(0.1*cp.asarray(depth) + 0.9*mg[0].geometry.depth.data)
+        #mg.geometry.depth.set(0.1*cp.asarray(depth) + 0.9*mg[0].geometry.depth.data)
 
         optimizer_ngd.zero_grad()
         optimizer_pca.zero_grad()
@@ -412,7 +418,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         H = differentiable_prolongation(H,level,grid_entity='cell')
         S = differentiable_prolongation(S,level,grid_entity='cell')
 
-        loss_scale = 1e-4
+        loss_scale = 1.0
 
         lambda_s = 1e-5
         sigma_s = 10.0
@@ -462,10 +468,6 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         J_prior_pbias = loss_scale*(z_precipitation_bias**2).sum()
 
         # L2 Regularization - smb offset
-        sigma_log_rf = 0.1
-        sigma_log_mf = 0.1
-        mu_log_rf = np.log(20.0)
-        mu_log_mf = np.log(2.0)
 
         J_prior_smb = ((log_rf - mu_log_rf)/sigma_log_rf)**2 + ((log_mf - mu_log_mf)/sigma_log_mf)**2
 
@@ -473,7 +475,8 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         J_prior = (J_prior_bed + J_prior_bed_mean + J_prior_beta + J_prior_pbias + J_prior_smb)
 
 
-        J = J_data + J_prior
+        # No prior contribution for hessian vector product
+        J = J_data
 
         if write_vti:
             delta.data[:,:] = cp.asarray(S_.detach() - S_obs_)
@@ -493,22 +496,71 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
             J.backward()
         return J
 
+    evaluate_loss(0,write_vti=False,compute_gradient=True)
+    torch.save({'bed_grad_init':bed.grad,
+                'precipitation_bias_grad_init':precipitation_bias.grad,
+                'log_mf_grad_init':log_mf.grad,
+                'log_rf_grad_init':log_rf.grad},
+               f'{OUTPUT_PATH}/level_{level}/hvps/hvp_init.p')    
+    
+    n_samples = 1000
+    bed_0 = bed.clone().detach()
+    precipitation_bias_0 = precipitation_bias.clone().detach()
+    log_mf_0 = log_mf.clone().detach()
+    log_rf_0 = log_rf.clone().detach()
+    eps = 1e-1
 
-    for i in range(0,max_iters[level]):
+    for i in range(n_samples):
+        z_bed = torch.randn_like(bed_0)
+        z_precipitation_bias = 0*torch.randn_like(precipitation_bias_0)
+        z_log_mf = 0*torch.randn_like(log_mf_0)
+        z_log_rf = 0*torch.randn_like(log_rf_0)
+
+        v_bed = GGaPPMap.apply(bed_model,z_bed)
+        v_precipitation_bias = GGaPPMap.apply(pbias_model,z_precipitation_bias)
+        v_log_mf = z_log_mf * sigma_log_mf
+        v_log_rf = z_log_rf * sigma_log_rf
+
+        bed.data[:,:] = bed_0 + eps * v_bed
+        precipitation_bias.data[:,:] = precipitation_bias_0 + eps * v_precipitation_bias
+        log_mf.data.fill_(log_mf_0 + eps * v_log_mf)
+        log_rf.data.fill_(log_rf_0 + eps * v_log_rf)
+        
         evaluate_loss(i)
-        optimizer_adam.step()
-        optimizer_pca.step()
-        optimizer_ngd.step()
-    evaluate_loss(0,write_vti=False,compute_gradient=False)
 
-    u_xr = mg[level].state.u.to_dataarray()
-    v_xr = mg[level].state.v.to_dataarray()
-    H_xr = mg[level].state.H.to_dataarray()
-    bed_xr = mg[level].geometry.bed.to_dataarray()
-    beta_xr = mg[level].sliding.beta.to_dataarray()
-    smb_xr = mg[level].forcing.smb.to_dataarray()
-    ds = xr.merge([u_xr,v_xr,H_xr,bed_xr,beta_xr,smb_xr])
-    ds.to_netcdf(f'{OUTPUT_PATH}/level_{level}/inverse_soln.nc')
-    torch.save({'log_beta':log_beta,'bed':bed,'bed_mean':bed_mean,'precipitation_bias':precipitation_bias,'log_rf':log_rf,'log_mf':log_mf},f'{OUTPUT_PATH}/level_{level}/torch_vars.p')
+        bed_grad_plus = bed.grad
+        pbias_grad_plus = precipitation_bias.grad
+        log_mf_grad_plus = log_mf.grad
+        log_rf_grad_plus = log_rf.grad
+
+        bed.data[:,:] = bed_0 - eps * v_bed
+        precipitation_bias.data[:,:] = precipitation_bias_0 - eps * v_precipitation_bias
+        log_mf.data.fill_(log_mf_0 - eps * v_log_mf)
+        log_rf.data.fill_(log_rf_0 - eps * v_log_rf)
+        
+        evaluate_loss(i)
+
+        bed_grad_minus = bed.grad
+        pbias_grad_minus = precipitation_bias.grad
+        log_mf_grad_minus = log_mf.grad
+        log_rf_grad_minus = log_rf.grad
+
+        hvp_bed = GGaPPMap.apply(bed_model,(bed_grad_plus - bed_grad_minus)/(2*eps))
+        hvp_pbias = GGaPPMap.apply(pbias_model,(pbias_grad_plus - pbias_grad_minus)/(2*eps))
+        hvp_log_mf = sigma_log_mf * (log_mf_grad_plus - log_mf_grad_minus)/(2*eps)
+        hvp_log_rf = sigma_log_rf * (log_rf_grad_plus - log_rf_grad_minus)/(2*eps)
+
+        torch.save({'bed_hvp':hvp_bed,
+                    'pbias_hvp':hvp_pbias,
+                    'log_mf_hvp':hvp_log_mf,
+                    'log_rf_hvp':hvp_log_rf,
+                    'z_bed':z_bed,
+                    'z_precipitation_bias':z_precipitation_bias,
+                    'z_log_mf':z_log_mf,
+                    'z_log_rf':z_log_rf},
+                   f'{OUTPUT_PATH}/level_{level}/hvps/hvp_{i}.p')    
+
+
+
 
 
