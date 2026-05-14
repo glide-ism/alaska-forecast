@@ -36,7 +36,7 @@ import geopandas as gpd
 
 BASE_DIR = './domains/wrangell/'
 
-OUTPUT_PATH = f'{BASE_DIR}/inverse/'
+OUTPUT_PATH = f'{BASE_DIR}/inverse_white_v2/'
 
 print("Loading geometry...")
 
@@ -106,13 +106,20 @@ smb_model = ImprovedTemperatureIndex(ny=ny,nx=nx,nt=12,
         x0=x0,y0=y0,
         crs=crs)
 
+sigma_log_rf = 0.1
+sigma_log_mf = 0.1
+mu_rf = 20.0
+mu_mf = 2.0
+mu_log_rf = np.log(mu_rf)
+mu_log_mf = np.log(mu_mf)
+
 smb_model.grid.insolation.insol_mean.set(gridded_data.monthly_solar_potential_mean)
 smb_model.grid.insolation.insol_cos.set(gridded_data.monthly_solar_potential_cos)
 smb_model.grid.insolation.insol_sin.set(gridded_data.monthly_solar_potential_sin)
 smb_model.grid.temperature.t2m.set(gridded_data.monthly_t2m)
 smb_model.grid.precipitation.precip.set(gridded_data.monthly_precip)
-smb_model.grid.insolation.rf.set(20.0)
-smb_model.grid.temperature.mf.set(2.0)
+smb_model.grid.insolation.rf.set(mu_rf)
+smb_model.grid.temperature.mf.set(mu_mf)
 smb_model.forward()
 
 ### Initialize forcing
@@ -135,28 +142,28 @@ model.adjoint_solver.fas_options.set(
 model.adjoint_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(1.0))
 
 bed_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-bed_model.mg.parameters.sigma.set(500.0)
+bed_model.mg.parameters.sigma.set(250.0)
 bed_model.mg.parameters.l.set(1000.0)
 bed_model.mg.parameters.nu.set(1)
 bed_model.forward_solver.fas_options.report_norms.set(False)
 bed_map = GGaPPMap.apply
 
 mean_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-mean_model.mg.parameters.sigma.set(2000.0)
+mean_model.mg.parameters.sigma.set(1000.0)
 mean_model.mg.parameters.l.set(10000.0)
-mean_model.mg.parameters.nu.set(1)
+mean_model.mg.parameters.nu.set(3)
 mean_model.forward_solver.fas_options.report_norms.set(False)
 mean_map = GGaPPMap.apply
 
 log_beta_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-log_beta_model.mg.parameters.sigma.set(3.0)
+log_beta_model.mg.parameters.sigma.set(1.0)
 log_beta_model.mg.parameters.l.set(1000.0)
 log_beta_model.mg.parameters.nu.set(1)
 log_beta_model.forward_solver.fas_options.report_norms.set(False)
 log_beta_map = GGaPPMap.apply
 
 pbias_model = MaternPrior(n_levels=N_LEVELS,ny=ny,nx=nx,dx=dx)
-pbias_model.mg.parameters.sigma.set(0.1)
+pbias_model.mg.parameters.sigma.set(0.3)
 pbias_model.mg.parameters.l.set(10000.0)
 pbias_model.mg.parameters.nu.set(3)
 pbias_model.forward_solver.fas_options.report_norms.set(False)
@@ -168,28 +175,45 @@ glide_step = GlideStep.apply
 glare_step = GlareStep.apply
 
 log_beta = torch.tensor(cp.log(mg[0].sliding.beta.data),
-        device='cuda',requires_grad=True)
+        device='cuda',requires_grad=False)
+z_log_beta = GGaPPWhiten.apply(log_beta_model,log_beta)
+z_log_beta.requires_grad_()
+
 H_prev = torch.tensor(mg[0].state.H_prev.data,
         device='cuda',requires_grad=False)
+
 bed = torch.tensor(mg[0].geometry.bed.data,
-        device='cuda',requires_grad=True)
+        device='cuda',requires_grad=False)
 
 bed_mean = torch.zeros(ny,nx, dtype=torch.float32,
-        device='cuda',requires_grad=True)
+        device='cuda',requires_grad=False)
+
+z_bed = GGaPPWhiten.apply(bed_model,bed - bed_mean)
+z_bed_mean = GGaPPWhiten.apply(mean_model, bed_mean)
+
+z_bed.requires_grad_()
+z_bed_mean.requires_grad_()
 
 t2m = torch.tensor(smb_model.grid.temperature.t2m.data,
         device='cuda',requires_grad=False)
 precip = torch.tensor(smb_model.grid.precipitation.precip.data,
         device='cuda',requires_grad=False)
 
-precipitation_bias = torch.zeros(ny,nx,
+z_precipitation_bias = torch.zeros(ny,nx,
         dtype=torch.float32,
         requires_grad=True,device='cuda')
 
 log_mf = torch.tensor(cp.log(smb_model.grid.temperature.mf.value),
-        device='cuda',requires_grad=True)
+        device='cuda',requires_grad=False)
 log_rf = torch.tensor(cp.log(smb_model.grid.insolation.rf.value),
-        device='cuda',requires_grad=True)
+        device='cuda',requires_grad=False)
+
+z_log_mf = (log_mf - mu_log_mf) / sigma_log_mf
+z_log_rf = (log_rf - mu_log_rf) / sigma_log_rf
+
+z_log_mf.requires_grad_()
+z_log_rf.requires_grad_()
+
 alpha_t2m = torch.tensor(2.2,
         device='cuda',requires_grad=False)
 
@@ -248,6 +272,28 @@ def differentiable_prolongation(field,n_times,grid_entity='cell',method='bilinea
         field = interpolate(field[None,None,:,:],(ny_fine,nx_fine),mode='bilinear').squeeze()
     return field
 
+optimizer_sgd = torch.optim.SGD([
+    {'params':z_bed,
+     'lr':0.2},
+    {'params':z_bed_mean,
+     'lr':1.0},
+    {'params':z_log_beta,
+     'lr':0.75}
+    ],
+    momentum=0.5
+  )
+
+optimizer_adam = torch.optim.Adam([
+    {'params':z_precipitation_bias,
+     'lr':0.0003},
+    {'params':z_log_mf,
+     'lr':0.01},
+    {'params':z_log_rf,
+     'lr':0.01}
+    ],
+    betas=(0.5,0.99)
+  )
+
 MAX_LEVEL = 2
 MIN_LEVEL = 0
 DT = 20.0
@@ -255,7 +301,6 @@ max_iters = [20,50,500]
 for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     model.set_top_level(level)
 
-    
     delta = Field(cp.zeros((mg[level].ny,mg[level].nx),dtype=cp.float32),
             grid_entity=GridEntity.CELL,
             dx=mg[level].dx,
@@ -279,50 +324,6 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     mask = torch.tensor(rgi_mask*domain_mask,
             dtype=torch.float32,device='cuda')
     
-    def bed_grad_transform(bed,grad,state,group):
-        grad[~(rgi_mask*domain_mask)] = 0.0
-        grad[:,:] = GGaPPMap.apply(bed_model,GGaPPMap.apply(bed_model,grad))
-        return grad
-
-    def bed_mean_grad_transform(bed,grad,state,group):
-        grad[:,:] = GGaPPMap.apply(mean_model,GGaPPMap.apply(mean_model,grad))
-        return grad
-
-    def log_beta_grad_transform(param,grad,state,group):
-        grad[:,:] = GGaPPMap.apply(log_beta_model,GGaPPMap.apply(log_beta_model,grad))
-        return grad
-
-    optimizer_ngd = PSGD([{'params':bed,
-                           'lr':0.25,
-                           'grad_transform': bed_grad_transform},
-                           {'params':bed_mean,
-                           'lr':0.1,
-                           'grad_transform': bed_mean_grad_transform},
-                           {'params':log_beta,
-                            'lr':1.0,
-                            'grad_transform': log_beta_grad_transform},
-                          ],
-                           momentum=0.5
-                           )
-    
-    def pbias_grad_transform(param,grad,state,group):
-        grad[:,:] = GGaPPMap.apply(pbias_model,grad)
-        return grad
-
-    optimizer_pca = PreconditionedAdam([
-                           {'params':precipitation_bias,
-                            'lr':0.001,
-                            'grad_to_latent': pbias_grad_transform,
-                            'latent_to_param': pbias_grad_transform}
-                           ],
-                           betas=(0.5,0.99)
-                           )
-
-    optimizer_adam = torch.optim.Adam([
-                           {'params':log_mf,'lr':0.01},
-                           {'params':log_rf,'lr':0.01}],
-                           betas=(0.5,0.99)           
-                           )
     
     vti_writer = VTIWriter(f'{OUTPUT_PATH}/level_{level}/vti', base='wrangell', dx=mg[level].dx,
             dynamic_fields={'bed':mg[level].geometry.bed,
@@ -339,13 +340,20 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     vti_writer.initialize(mg[level])
     
     def evaluate_loss(i,compute_gradient=True,write_vti=True):
+        optimizer_sgd.zero_grad()
+        optimizer_adam.zero_grad()
+
+        bed_mean = GGaPPMap.apply(mean_model,z_bed_mean)
+        bed = GGaPPMap.apply(bed_model,z_bed)# + bed_mean
+
+        log_beta = GGaPPMap.apply(log_beta_model,z_log_beta)
+        precipitation_bias = GGaPPMap.apply(pbias_model,z_precipitation_bias)
+
+        log_mf = mu_log_mf + sigma_log_mf * z_log_mf
+        log_rf = mu_log_rf + sigma_log_rf * z_log_rf
 
         depth = torch.maximum(-bed,torch.zeros_like(bed)).detach()
         mg.geometry.depth.set(0.1*cp.asarray(depth) + 0.9*mg[0].geometry.depth.data)
-
-        optimizer_ngd.zero_grad()
-        optimizer_pca.zero_grad()
-        optimizer_adam.zero_grad()
         
         mg.state.u.set(0.0,start_level=level)
         mg.state.v.set(0.0,start_level=level)
@@ -374,7 +382,6 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         t_end = cp.float32(2012)
         dt = cp.float32(DT)
 
-        
         if i % 10 == 0:
             time_writer = VTIWriter(f'{OUTPUT_PATH}/level_{level}/vti', base='time', dx=mg[level].dx,
                 dynamic_fields={'thk':mg[level].state.H,
@@ -414,7 +421,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
 
         loss_scale = 1e-4
 
-        lambda_s = 1e-5
+        lambda_s = 2e-5
         sigma_s = 10.0
         nu_s = 1.0
         r_s = (S-S_obs)/sigma_s
@@ -423,7 +430,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         u_pred = (u[:,1:] + u[:,:-1])/2.
         v_pred = (v[1:,:] + v[:-1,:])/2.     
 
-        lambda_u = 1e-5
+        lambda_u = 2e-5
         sigma_u = 10.0
         nu_u = 1.0
         r_u2 = ((u_pred - u_obs)**2 + (v_pred - v_obs)**2)/sigma_u**2
@@ -432,7 +439,7 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         
 
         # Extent loss
-        lambda_e = 1e-4
+        lambda_e = 2e-4
         s_H = 10.0
 
         p_extent = (2./(1+torch.exp(-H/s_H))-1).clip(min=0.001,max=0.999)
@@ -440,33 +447,23 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
         J_extent = -loss_scale * lambda_e * dx**2 * (mask*torch.log(p_extent)).sum()
 
         bed_pred = grid_sample(bed[None,None,:,:],bed_normed_coords[None,None,:,:],mode='bilinear').squeeze()
-        lambda_bed = 1e-5
+        lambda_bed = 2e-5
         sigma_bed = 10.0
         nu_bed = 1.0
-        r_bed = (bed_pred - bed_obs)/sigma_bed 
+        #r_bed = (bed_pred - bed_obs)/sigma_bed 
 
-        J_bed = loss_scale * lambda_bed * dx**2 * nu_bed**2 * (torch.sqrt(1 + (r_bed / nu_bed)**2) - 1).sum()
+        #J_bed = loss_scale * lambda_bed * dx**2 * nu_bed**2 * (torch.sqrt(1 + (r_bed / nu_bed)**2) - 1).sum()
+
+        r_bed_flightlines = (bed_pred - bed_obs)/sigma_bed 
+        r_bed_grid = (bed-S_obs)/sigma_s*(1-mask)
+        J_bed = loss_scale * lambda_bed * dx**2 * nu_bed**2 * ((torch.sqrt(1 + (r_bed_flightlines / nu_bed)**2) - 1).sum() + (torch.sqrt(1 + (r_bed_grid / nu_bed)**2) - 1).sum())
 
         # Tikhonov Regularization - bed
-        z_bed = GGaPPWhiten.apply(bed_model,bed - bed_mean)
-        J_prior_bed = loss_scale*(z_bed**2).sum()
-
-        z_bed_mean = GGaPPWhiten.apply(mean_model,bed_mean)
+        z_bed_ = GGaPPWhiten.apply(bed_model,bed - bed_mean)
+        J_prior_bed = loss_scale*(z_bed_**2).sum()
         J_prior_bed_mean = loss_scale*(z_bed_mean**2).sum()
-
-        # Tikhonov Regularization - log_beta
-        z_log_beta = GGaPPWhiten.apply(log_beta_model,log_beta)
         J_prior_beta = loss_scale*(z_log_beta**2).sum()
-
-        z_precipitation_bias = GGaPPWhiten.apply(pbias_model,precipitation_bias)
         J_prior_pbias = loss_scale*(z_precipitation_bias**2).sum()
-
-        # L2 Regularization - smb offset
-        sigma_log_rf = 0.1
-        sigma_log_mf = 0.1
-        mu_log_rf = np.log(20.0)
-        mu_log_mf = np.log(2.0)
-
         J_prior_smb = ((log_rf - mu_log_rf)/sigma_log_rf)**2 + ((log_mf - mu_log_mf)/sigma_log_mf)**2
 
         J_data = (J_srf + J_vel + J_extent + J_bed)
@@ -496,9 +493,8 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
 
     for i in range(0,max_iters[level]):
         evaluate_loss(i)
+        optimizer_sgd.step()
         optimizer_adam.step()
-        optimizer_pca.step()
-        optimizer_ngd.step()
     evaluate_loss(0,write_vti=False,compute_gradient=False)
 
     u_xr = mg[level].state.u.to_dataarray()
@@ -509,6 +505,4 @@ for level in range(MAX_LEVEL,MIN_LEVEL-1,-1):
     smb_xr = mg[level].forcing.smb.to_dataarray()
     ds = xr.merge([u_xr,v_xr,H_xr,bed_xr,beta_xr,smb_xr])
     ds.to_netcdf(f'{OUTPUT_PATH}/level_{level}/inverse_soln.nc')
-    torch.save({'log_beta':log_beta,'bed':bed,'bed_mean':bed_mean,'precipitation_bias':precipitation_bias,'log_rf':log_rf,'log_mf':log_mf},f'{OUTPUT_PATH}/level_{level}/torch_vars.p')
-
-
+    torch.save({'log_beta':z_log_beta,'bed':z_bed,'bed_mean':z_bed_mean,'precipitation_bias':z_precipitation_bias,'log_rf':z_log_rf,'log_mf':z_log_mf},f'{OUTPUT_PATH}/level_{level}/torch_vars.p')
