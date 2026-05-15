@@ -9,7 +9,7 @@ import torch
 import xarray as xr
 
 #from configs.wrangell import WRANGELL as config
-from configs.delta import DELTA as config
+from configs.st_elias import ST_ELIAS as config
 from glacier_inverse import GlacierProblem
 from glacier_inverse.forward import differentiable_restriction
 from glacier_inverse.io import (
@@ -21,11 +21,15 @@ from glacier_inverse.io import (
 OUTPUT_PATH = f"{config.base_dir}/inverse_refactor/"
 WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
 
-MAX_LEVEL = 2
-MIN_LEVEL = 0
-MAX_ITERS = [20, 50, 500]
+MAX_LEVEL = 3
+MIN_LEVEL = 3
+MAX_ITERS = [20, 50, 500, 500]
 
 problem = GlacierProblem(config)
+problem.t_start=512.0
+problem.depth_blend = 0.01
+
+
 params = problem.params
 
 if WARM_START_PATH is not None:
