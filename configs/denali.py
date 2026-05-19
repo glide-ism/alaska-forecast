@@ -1,5 +1,5 @@
 """
-Wrangell domain configuration.
+St. Elias domain configuration.
 
 All numerical knobs that the four scripts share live here, so the physical
 model is identical across inverse / rto / posterior / sensitivity by
@@ -8,9 +8,9 @@ stay in the driver scripts.
 """
 from glacier_inverse.config import GlacierConfig
 
-WRANGELL = GlacierConfig(
-    base_dir="./domains/wrangell/",
-    vti_base_name="wrangell",
+DENALI = GlacierConfig(
+    base_dir="./domains/denali/",
+    vti_base_name="denali",
     sigma_log_mf = 1.,
     sigma_log_rf = 1.,
     sigma_bed=30.0,

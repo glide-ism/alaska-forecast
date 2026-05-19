@@ -137,6 +137,21 @@ def main() -> int:
           and obs.bed_normed_coords.is_cuda,
           f"shape={tuple(obs.bed_normed_coords.shape)}")
 
+    if obs.snow_label is not None:
+        dom = (problem.ny, problem.nx)
+        check("snow_label shape == domain, in [0,1], on cuda",
+              tuple(obs.snow_label.shape) == dom and obs.snow_label.is_cuda
+              and obs.snow_label.min() >= 0.0 and obs.snow_label.max() <= 1.0,
+              f"shape={tuple(obs.snow_label.shape)}, "
+              f"range=[{obs.snow_label.min():.3f}, {obs.snow_label.max():.3f}]")
+        check("snow_mask is 0/1 with some valid cells",
+              tuple(obs.snow_mask.shape) == dom
+              and set(obs.snow_mask.unique().tolist()) <= {0.0, 1.0}
+              and obs.snow_mask.sum() > 0,
+              f"valid cells = {int(obs.snow_mask.sum())}")
+    else:
+        print("  [SKIP] no snowline product for this domain")
+
     header("6. Single forward step at coarsest level")
     level = config.n_levels - 1  # 5 for default n_levels=6
     problem.model.set_top_level(level)
@@ -164,6 +179,13 @@ def main() -> int:
     J = loss_terms.J
     check("loss is finite", torch.isfinite(J).item(),
           f"J = {J.item():.4f}")
+    check("snowline term is finite",
+          torch.isfinite(torch.as_tensor(loss_terms.J_snow)).item(),
+          f"J_snow = {float(loss_terms.J_snow):.4f}")
+    if obs.snow_label is not None:
+        check("snowline term is active (non-zero)",
+              float(loss_terms.J_snow) != 0.0,
+              f"J_snow = {float(loss_terms.J_snow):.4f}")
 
     J.backward()
     check("z_bed received a finite gradient",

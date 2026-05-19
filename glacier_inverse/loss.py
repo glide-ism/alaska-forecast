@@ -60,6 +60,7 @@ class LossTerms:
     J_vel:            torch.Tensor
     J_extent:         torch.Tensor
     J_bed:            torch.Tensor
+    J_snow:           torch.Tensor
     J_prior_bed:      torch.Tensor
     J_prior_bed_mean: torch.Tensor
     J_prior_beta:     torch.Tensor
@@ -68,7 +69,7 @@ class LossTerms:
 
     @property
     def J_data(self):
-        return self.J_srf + self.J_vel + self.J_extent + self.J_bed
+        return self.J_srf + self.J_vel + self.J_extent + self.J_bed + self.J_snow
 
     @property
     def J_prior(self):
@@ -88,7 +89,8 @@ class LossTerms:
         print(f"Srf Loss: {self.J_srf.item():.2f}, "
               f"U Loss: {self.J_vel.item():.2f}, "
               f"Ext Loss: {self.J_extent.item():.2f}, "
-              f"Bed Loss: {self.J_bed.item():.2f}")
+              f"Bed Loss: {self.J_bed.item():.2f}, "
+              f"Snow Loss: {float(self.J_snow):.2f}")
         print(f"Bed Prior: {float(self.J_prior_bed):.2f}, "
               f"Bed Mean Prior: {float(self.J_prior_bed_mean):.2f}, "
               f"Beta Prior: {float(self.J_prior_beta):.2f}, "
@@ -127,18 +129,58 @@ def compute_data_misfit(
     p_extent = (2.0 / (1 + torch.exp(-H_fine / config.s_H)) - 1).clip(min=0.001, max=0.999)
     J_extent = -config.loss_scale * config.lambda_e * dx ** 2 * (mask * torch.log(p_extent)).sum()
 
-    # Bed: flightline samples + grid bed-equals-surface where no ice (1-mask).
+    # Bed: flightline samples + grid bed-equals-DEM where no ice (1-mask).
+    # The off-ice anchor uses the full DEM (topography + bathymetry), not the
+    # sea-level-clamped S_obs, so submarine bed is anchored to bathymetry.
     bed_at_flightlines = grid_sample(
         bed_fine[None, None, :, :],
         observations.bed_normed_coords[None, None, :, :],
         mode="bilinear",
     ).squeeze()
     r_bed_fl = (bed_at_flightlines - observations.bed_obs) / config.sigma_bed
-    r_bed_grid = (bed_fine - observations.S_obs) / config.sigma_s * (1 - mask)
+    r_bed_grid = (bed_fine - observations.dem) / config.sigma_s * (1 - mask)
     J_bed = scale * config.lambda_bed * (_huber(r_bed_fl, config.nu_bed).sum()
                                           + _huber(r_bed_grid, config.nu_bed).sum())
 
     return J_srf, J_vel, J_extent, J_bed
+
+
+def compute_snowline_misfit(
+    *,
+    config,
+    sim_result,
+    observations,
+    dx: float,
+) -> torch.Tensor:
+    """Snowline (ELA-proxy) misfit as a masked Bernoulli log-likelihood.
+
+    The end-of-summer snowline product gives, per cell, the fraction of the
+    glacierized subarea that retained snow (`snow_label` in [0, 1]); a cell
+    that is entirely snow at the end of the melt season is interpreted as
+    sitting above the ELA (in the accumulation area). The model produces a
+    logit by scaling its SMB field, so
+
+        sigmoid(SMB / s_smb) ≈ P(cell is above the ELA),
+
+    which is positive where SMB > 0 (accumulation) and negative where the
+    surface is melting out. The product is only defined on ice, so the loss
+    is restricted to `snow_mask` (valid, glacierized cells). Returns a scalar
+    on the same scale as the other data-misfit terms; falls back to 0 when
+    the domain has no snowline product.
+    """
+    label = observations.snow_label
+    mask = observations.snow_mask
+    smb = sim_result.smb_fine
+    if label is None or mask is None or smb is None:
+        ref = smb if smb is not None else label
+        return torch.zeros((), device=ref.device) if ref is not None else torch.tensor(0.0)
+
+    logits = smb / config.s_smb
+    # weight = 0/1 mask, so off-ice / no-data cells drop out of the sum.
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, label, weight=mask, reduction="sum",
+    )
+    return config.loss_scale * config.lambda_snow * dx ** 2 * bce
 
 
 def compute_prior(

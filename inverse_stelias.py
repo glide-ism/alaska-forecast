@@ -18,17 +18,15 @@ from glacier_inverse.io import (
 )
 
 
-OUTPUT_PATH = f"{config.base_dir}/inverse_refactor/"
-WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
+OUTPUT_PATH = f"{config.base_dir}/inverse_init/"
+WARM_START_PATH = f"{OUTPUT_PATH}/level_2/torch_vars.p"  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
 
-MAX_LEVEL = 3
-MIN_LEVEL = 3
-MAX_ITERS = [20, 50, 500, 500]
+MAX_LEVEL = 1
+MIN_LEVEL = 1
+MAX_ITERS = [0, 20, 50, 500]
 
 problem = GlacierProblem(config)
-problem.t_start=512.0
-problem.depth_blend = 0.01
-
+#problem.smb_model.grid.temperature.daily_amp_t2m.set(2.0)
 
 params = problem.params
 
@@ -42,7 +40,7 @@ optimizer_sgd = torch.optim.SGD([
 ], momentum=0.5)
 
 optimizer_adam = torch.optim.Adam([
-    {"params": params.z_pbias, "lr": 0.0003},
+    {"params": params.z_pbias, "lr": 0.001},
     {"params": params.z_log_mf, "lr": 0.01},
     {"params": params.z_log_rf, "lr": 0.01},
 ], betas=(0.5, 0.99))
@@ -63,7 +61,6 @@ for level in range(MAX_LEVEL, MIN_LEVEL - 1, -1):
     level_dir = f"{OUTPUT_PATH}/level_{level}/vti"
     vti_writer = make_loss_vti_writer(problem.mg[level], level_dir,
                                        config.vti_base_name, diag)
-
     for i in range(MAX_ITERS[level]):
         optimizer_sgd.zero_grad()
         optimizer_adam.zero_grad()

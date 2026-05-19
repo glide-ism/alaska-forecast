@@ -45,7 +45,7 @@ class GlacierConfig:
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,  l=1000.0,  nu=1)
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0, l=10000.0, nu=3)
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=1.0,    l=1000.0,  nu=1)
-    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.3,    l=10000.0, nu=3)
+    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,    l=10000.0, nu=3)
 
     # Scalar SMB priors (log-normal). mu_log_* is derived as log(mu_*).
     mu_rf: float = 20.0
@@ -60,17 +60,23 @@ class GlacierConfig:
 
     # Loss weights. lambda_bed unified to 2e-5 (was 1e-5 in pre-refactor rto_sample.py).
     loss_scale: float = 1e-4
-    lambda_s:   float = 2e-5
-    lambda_u:   float = 2e-5
-    lambda_e:   float = 2e-4
-    lambda_bed: float = 2e-5
+    lambda_s:    float = 2e-5
+    lambda_u:    float = 2e-5
+    lambda_e:    float = 2e-4
+    lambda_bed:  float = 2e-5
+    lambda_snow: float = 2e-4    # weight on the snowline (ELA) BCE term
     nu_s:   float = 1.0
     nu_u:   float = 1.0
     nu_bed: float = 1.0
     s_H:    float = 10.0
+    # SMB -> logit scale for the snowline term. The model SMB (m ice-eq/yr)
+    # is divided by this before the sigmoid, so sigmoid(SMB / s_smb) reads as
+    # P(cell is above the ELA, i.e. in the accumulation area).
+    s_smb:  float = 1.0
 
     # Ice rheology
     rho_ice:  float = 917.0
+    rho_water: float = 1000.0   # kg/m^3, freshwater (proglacial-lake termini)
     gravity:  float = 9.81
     n_glen:   int   = 3
     A_glen:   float = 1e-16    # Pa^-n s^-1
@@ -86,6 +92,11 @@ class GlacierConfig:
     sigmoid_c:    float = 0.1
     sigmoid_k:    float = 4.0
     depth_blend:  float = 0.1    # weight on new bed-derived depth vs prior depth
+    # Seed the integration from the thickness implied by the observed surface
+    # (S_obs - bed, with the hydrostatic value for floating ice) instead of the
+    # ice-free state. Matters for tidewater hysteresis. Not differentiated.
+    init_from_observed_geometry: bool = False
+    init_H_floor: float = 0.1    # minimum/ice-free thickness used when seeding
 
     # Solver settings
     forward_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
@@ -98,6 +109,7 @@ class GlacierConfig:
     gridded_filename:    str = "GLIDE_inputs.nc"
     flightline_filename: str = "flightlines.gpkg"
     anomaly_filename:    str = "temperature_anomaly.nc"
+    snowline_filename:   str = "gridded_snowline.nc"  # optional; ELA proxy
 
     # Diagnostics
     vti_base_name: str = "glacier"

@@ -8,8 +8,10 @@ stay here.
 import torch
 import xarray as xr
 
+from configs.denali import DENALI as config
+#from configs.juneau import JUNEAU as config
 #from configs.wrangell import WRANGELL as config
-from configs.delta import DELTA as config
+#from configs.delta import DELTA as config
 from glacier_inverse import GlacierProblem
 from glacier_inverse.forward import differentiable_restriction
 from glacier_inverse.io import (
@@ -18,7 +20,7 @@ from glacier_inverse.io import (
 )
 
 
-OUTPUT_PATH = f"{config.base_dir}/inverse_refactor/"
+OUTPUT_PATH = f"{config.base_dir}/inverse_snowline_v2/"
 WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
 
 MAX_LEVEL = 2

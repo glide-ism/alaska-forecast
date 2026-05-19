@@ -28,7 +28,10 @@ from ggapp.torch import GGaPPMap, GGaPPWhiten
 
 from .config import GlacierConfig, SolverConfig
 from .forward import simulate
-from .loss import LossTerms, PriorMeans, compute_data_misfit, compute_prior
+from .loss import (
+    LossTerms, PriorMeans, compute_data_misfit, compute_prior,
+    compute_snowline_misfit,
+)
 from .priors import GlacierPriors
 
 
@@ -36,11 +39,17 @@ from .priors import GlacierPriors
 class Observations:
     u_obs: torch.Tensor
     v_obs: torch.Tensor
-    S_obs: torch.Tensor
+    S_obs: torch.Tensor         # ice/water surface: max(DEM, 0)
+    dem: torch.Tensor           # full DEM (topography + bathymetry); the
+                                # off-ice bed anchor
     bed_obs: torch.Tensor
     bed_normed_coords: torch.Tensor
     rgi_mask: torch.Tensor      # 0/1 ice extent
     domain_mask: torch.Tensor   # 0/1 simulation domain
+    # End-of-summer snowline (ELA proxy). Optional: domains without the
+    # product leave these None and the snowline loss term is skipped.
+    snow_label: Optional[torch.Tensor] = None   # snow fraction in [0, 1]
+    snow_mask: Optional[torch.Tensor] = None    # 0/1 valid (on-ice) cells
 
     def randomized(
         self,
@@ -67,10 +76,18 @@ class Observations:
             u_obs=self.u_obs + eps_u * sigma_u,
             v_obs=self.v_obs + eps_v * sigma_u,
             S_obs=self.S_obs + eps_S * sigma_s,
+            # The off-ice bed anchor shares eps_S with the surface term (as it
+            # did when this term read S_obs directly), so RTO noise bookkeeping
+            # is unchanged.
+            dem=self.dem + eps_S * sigma_s,
             bed_obs=self.bed_obs + eps_bed * sigma_bed,
             bed_normed_coords=self.bed_normed_coords,
             rgi_mask=self.rgi_mask,
             domain_mask=self.domain_mask,
+            # The snowline label is a categorical observation with no
+            # Gaussian noise model, so RTO passes it through unperturbed.
+            snow_label=self.snow_label,
+            snow_mask=self.snow_mask,
         )
 
 
@@ -152,6 +169,16 @@ class GlacierProblem:
 
         self.crs = pyproj.CRS(self.gridded_data.spatial_ref.crs_wkt)
         self.gridded_data = _crop_to_factor(self.gridded_data, 2 ** cfg.n_levels)
+
+        # Optional end-of-summer snowline product (ELA proxy). Built on the
+        # same DEM grid as GLIDE_inputs, so the identical centered crop keeps
+        # it aligned. Domains without the file simply skip the snowline loss.
+        snowline_path = inputs_dir / cfg.snowline_filename
+        if snowline_path.exists():
+            self.snowline_data = _crop_to_factor(
+                xr.open_dataset(snowline_path), 2 ** cfg.n_levels)
+        else:
+            self.snowline_data = None
 
         ny, nx = self.gridded_data.sizes["y"], self.gridded_data.sizes["x"]
         dx = (self.gridded_data.x[1] - self.gridded_data.x[0]).item()
@@ -237,7 +264,8 @@ class GlacierProblem:
             .nan_to_num().masked_fill(~domain_mask, 0.0)
         v_obs = torch.tensor(gd.vy.values, dtype=torch.float32, device="cuda") \
             .nan_to_num().masked_fill(~domain_mask, 0.0)
-        S_obs = torch.tensor(gd.elevation.values, dtype=torch.float32, device="cuda")
+        dem = torch.tensor(gd.elevation.values, dtype=torch.float32, device="cuda")
+        S_obs = torch.clamp(dem, min=0.0)
 
         flightlines = torch.tensor(flightlines_df[["x", "y", "bed"]].values,
                                     dtype=torch.float32, device="cuda")
@@ -248,11 +276,45 @@ class GlacierProblem:
         bed_normed_coords = torch.stack([col_normed, row_normed], dim=-1)
         bed_obs = flightlines[:, 2]
 
+        snow_label, snow_mask = self._build_snowline(domain_mask)
+
         return Observations(
-            u_obs=u_obs, v_obs=v_obs, S_obs=S_obs,
+            u_obs=u_obs, v_obs=v_obs, S_obs=S_obs, dem=dem,
             bed_obs=bed_obs, bed_normed_coords=bed_normed_coords,
             rgi_mask=rgi_mask, domain_mask=domain_mask,
+            snow_label=snow_label, snow_mask=snow_mask,
         )
+
+    def _build_snowline(self, domain_mask: torch.Tensor):
+        """Snow-fraction label and validity mask on the (cropped) grid.
+
+        `snow_fraction` is the fraction of the glacierized subarea classified
+        as retained snow (≈ accumulation area / above the ELA). It is only
+        defined where the product classified ice at all (`glacier_fraction`
+        > 0), so that — intersected with the simulation domain — is the BCE
+        validity mask. Returns (None, None) when the domain has no product.
+        """
+        sd = self.snowline_data
+        if sd is None:
+            return None, None
+
+        expected = (self.ny, self.nx)
+        if sd.snow_fraction.shape != expected:
+            raise ValueError(
+                f"snowline grid {tuple(sd.snow_fraction.shape)} does not match "
+                f"the cropped model grid {expected}; rebuild "
+                f"{self.config.snowline_filename} on the DEM grid."
+            )
+
+        snow_label = torch.tensor(
+            sd.snow_fraction.values, dtype=torch.float32, device="cuda"
+        ).nan_to_num().clamp_(0.0, 1.0)
+        glacier_fraction = torch.tensor(
+            sd.glacier_fraction.values, dtype=torch.float32, device="cuda"
+        ).nan_to_num()
+        snow_mask = ((glacier_fraction > 0.0) & domain_mask).to(torch.float32)
+        snow_label = snow_label.masked_fill(snow_mask == 0.0, 0.0)
+        return snow_label, snow_mask
 
     def _build_initial_parameters(self) -> WhitenedParameters:
         priors = self.priors
@@ -298,6 +360,33 @@ class GlacierProblem:
             pbias=pbias, log_mf=log_mf, log_rf=log_rf,
         )
 
+    def _initial_thickness_from_geometry(self, bed: torch.Tensor) -> torch.Tensor:
+        """Seed integration thickness from the observed surface and the current
+        bed iterate.
+
+        Inverts the surface model S = max(bed + H, (1 - r) H) for H given the
+        observed surface and the *current optimized bed* (`physical.bed`):
+        grounded ice gets S_obs - bed, floating ice the hydrostatic value
+        S_obs / (1 - r). The bed is detached, so the seeded thickness tracks
+        the bed iterate across the inversion but carries no gradient w.r.t. it.
+        Restricted to the observed ice extent and floored at `init_H_floor`.
+        """
+        cfg = self.config
+        obs = self.observations
+        r = cfg.rho_ice / cfg.rho_water
+        bed = bed.detach()                  # current bed iterate, no gradient
+        S_obs = obs.S_obs                   # max(DEM, 0)
+
+        H_grounded = S_obs - bed
+        H_float = S_obs / (1.0 - r)
+        grounded = bed >= -(r / (1.0 - r)) * S_obs
+        H = torch.where(grounded, H_grounded, H_float)
+
+        ice = obs.rgi_mask.to(torch.float32)
+        H = torch.clamp(H, min=cfg.init_H_floor) * ice \
+            + cfg.init_H_floor * (1.0 - ice)
+        return H.to(torch.float32)
+
     def reset_state(self, level: int) -> None:
         mg = self.mg
         mg.state.u.set(0.0, start_level=level)
@@ -338,12 +427,16 @@ class GlacierProblem:
         self.update_depth(physical.bed)
         self.reset_state(level)
 
-        precip_ = self.precip + physical.pbias
+        precip_ = self.precip * torch.exp(physical.pbias)
         mf = torch.exp(physical.log_mf)
         rf = torch.exp(physical.log_rf)
 
         bed_ = differentiable_restriction(physical.bed, level)
-        H_prev_ = differentiable_restriction(self.H_prev, level)
+        if cfg.init_from_observed_geometry:
+            H_prev_full = self._initial_thickness_from_geometry(physical.bed)
+        else:
+            H_prev_full = self.H_prev
+        H_prev_ = differentiable_restriction(H_prev_full, level)
         log_beta_ = differentiable_restriction(physical.log_beta, level)
         beta_ = torch.exp(log_beta_)
 
@@ -366,6 +459,7 @@ class GlacierProblem:
             base_anomaly=self.base_anomaly,
             alpha_t2m=self.alpha_t2m,
             dx_fine=self.dx,
+            flotation_factor=1.0 - cfg.rho_ice / cfg.rho_water,
             record_volumes_at=record_volumes_at,
             time_writer=time_writer,
         )
@@ -414,6 +508,12 @@ class GlacierProblem:
             mask=mask,
             dx=self.dx,
         )
+        J_snow = compute_snowline_misfit(
+            config=self.config,
+            sim_result=sim,
+            observations=observations,
+            dx=self.dx,
+        )
         J_prior_terms = compute_prior(
             config=self.config,
             priors=self.priors,
@@ -426,6 +526,7 @@ class GlacierProblem:
         )
         return LossTerms(
             J_srf=J_srf, J_vel=J_vel, J_extent=J_extent, J_bed=J_bed,
+            J_snow=J_snow,
             J_prior_bed=J_prior_terms[0],
             J_prior_bed_mean=J_prior_terms[1],
             J_prior_beta=J_prior_terms[2],

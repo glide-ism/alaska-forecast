@@ -54,14 +54,19 @@ class SimResult:
     v: torch.Tensor
     H: torch.Tensor
     bed_coarse: torch.Tensor    # the restricted bed used during stepping
-    S_coarse: torch.Tensor      # bed_coarse + H
+    S_coarse: torch.Tensor      # max(bed_coarse + H, flotation freeboard)
     # Final-level prolonged outputs (matched to fine grid).
     u_fine: torch.Tensor
     v_fine: torch.Tensor
     H_fine: torch.Tensor
     S_fine: torch.Tensor
+    # SMB from the final time step (the calibration-epoch field used by the
+    # snowline / ELA loss). `smb_fine` is full resolution; `smb_coarse` is the
+    # restricted field actually fed to the ice dynamics. None if no step ran.
+    smb_fine: Optional[torch.Tensor] = None
+    smb_coarse: Optional[torch.Tensor] = None
     # Volume checkpoints keyed by year — populated only when requested.
-    volumes: dict
+    volumes: dict = None
 
 
 def simulate(
@@ -84,6 +89,7 @@ def simulate(
     base_anomaly: float,
     alpha_t2m: float,
     dx_fine: float,
+    flotation_factor: float = 0.0,
     record_volumes_at: Optional[list] = None,
     time_writer=None,
 ) -> SimResult:
@@ -92,9 +98,16 @@ def simulate(
     All field inputs (bed_, beta_, H_prev_) are expected at the coarse grid;
     full-grid quantities (t2m, precip_, domain_mask) are restricted internally.
     Returns coarse u, v, H plus prolonged u_fine, v_fine, H_fine, S_fine.
+
+    `flotation_factor` is `1 - rho_i/rho_w`; the surface is lower-bounded by
+    the flotation freeboard `flotation_factor * H` for floating ice. The
+    default of 0.0 reduces the bound to a sea-level floor (inert for grounded
+    ice); callers pass the physical value derived from the config.
     """
     record_volumes_at = list(record_volumes_at or [])
     volumes: dict = {}
+    last_smb = None      # fine-grid SMB from the most recent step
+    last_smb_ = None     # restricted SMB from the most recent step
 
     t = cp.float32(t_start)
     t_end_c = cp.float32(t_end)
@@ -113,6 +126,7 @@ def simulate(
                          t2m, t_anomaly, base_anomaly, precip_,
                          mf, rf, domain_mask, use_reentrant=False)
         smb_ = differentiable_restriction(smb, level)
+        last_smb, last_smb_ = smb, smb_
 
         u, v, H = glide_step(t, dt_c, model, level, H_prev_, bed_, beta_, smb_)
         t += dt_c
@@ -127,7 +141,7 @@ def simulate(
             time_writer.append(model.mg[level], time=float(t))
             time_writer.write_pvd()
 
-    S_coarse = bed_ + H
+    S_coarse = torch.maximum(bed_ + H, flotation_factor * H)
     u_fine = differentiable_prolongation(u, level, grid_entity="vfacet")
     v_fine = differentiable_prolongation(v, level, grid_entity="hfacet")
     H_fine = differentiable_prolongation(H, level, grid_entity="cell")
@@ -137,5 +151,6 @@ def simulate(
         u=u, v=v, H=H,
         bed_coarse=bed_, S_coarse=S_coarse,
         u_fine=u_fine, v_fine=v_fine, H_fine=H_fine, S_fine=S_fine,
+        smb_fine=last_smb, smb_coarse=last_smb_,
         volumes=volumes,
     )

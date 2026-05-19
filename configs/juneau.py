@@ -8,12 +8,12 @@ stay in the driver scripts.
 """
 from glacier_inverse.config import GlacierConfig
 
-WRANGELL = GlacierConfig(
-    base_dir="./domains/wrangell/",
-    vti_base_name="wrangell",
-    sigma_log_mf = 1.,
-    sigma_log_rf = 1.,
-    sigma_bed=30.0,
-    mu_rf=50.0,
-    init_from_observed_geometry=True
+JUNEAU = GlacierConfig(
+    base_dir="./domains/juneau/",
+    vti_base_name="juneau",
+    sigma_log_mf=1.0,
+    sigma_log_rf=1.0
+
+    #alpha_t2m=1.0,
+    #mu_mf=1.0
 )
