@@ -15,17 +15,19 @@ import torch
 from scipy.stats import norm, qmc
 from torchvision.transforms.functional import gaussian_blur
 
-#from configs.wrangell import WRANGELL
-from configs.delta import DELTA as config
-from glacier_inverse import GlacierProblem, PriorMeans
+from glacier_inverse import GlacierProblem, PriorMeans, load_config
 from glacier_inverse.forward import differentiable_restriction
 from glacier_inverse.io import (
     load_whitened_params_into, make_diagnostic_fields, make_loss_vti_writer,
     make_time_vti_writer, save_whitened_params, update_diagnostic_fields,
 )
 
+# Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
+DOMAIN = "domains/delta"
+config = load_config(DOMAIN)
 
-INPUT_PATH = f"{config.base_dir}/inverse_refactor/"
+
+INPUT_PATH = config.output_dir
 WARM_START_PATH = f"{INPUT_PATH}/level_2/torch_vars.p"
 
 N_SAMPLES = 250

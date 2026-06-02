@@ -120,6 +120,36 @@ class GlacierConfig:
     # Diagnostics
     vti_base_name: str = "glacier"
 
+    # Experiment subdirectory (under base_dir). Writers (inverse) write here;
+    # readers (posterior, sensitivity, rto continuation) read from here. Edit
+    # the domain config to switch experiments rather than editing each driver.
+    results_subdir: str = "inverse"
+
+    # Multigrid schedule. max_level is the coarsest grid the solver starts on;
+    # min_level is the finest grid it ends on. max_iters[level] is the number
+    # of optimizer iterations spent at each level (indexed by the level number,
+    # so unused entries below min_level can be 0 or any placeholder).
+    min_level: int = 0
+    max_level: int = 2
+    max_iters: tuple = (20, 50, 500)
+
+    # Per-parameter learning rates. These are tightly coupled to the prior
+    # hyperparameters above — in whitened coordinates the natural step is set
+    # by the prior curvature, so a domain that changes a prior typically has
+    # to retune the corresponding lr. SGD on the field params, Adam on the
+    # scalar / smooth params.
+    lr_z_bed:      float = 0.0325
+    lr_z_bed_mean: float = 0.5
+    lr_z_log_beta: float = 0.25
+    lr_z_pbias:    float = 0.001
+    lr_z_log_mf:   float = 0.01
+    lr_z_log_rf:   float = 0.01
+
+    @property
+    def output_dir(self) -> str:
+        """Absolute path to this domain's active experiment directory."""
+        return f"{self.base_dir}/{self.results_subdir}"
+
     @property
     def B_rate(self) -> float:
         """Computed rate factor used by IceDynamics rheology.B."""

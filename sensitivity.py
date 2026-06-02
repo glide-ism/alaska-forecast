@@ -14,14 +14,14 @@ import cupy as cp
 from ggapp.torch import GGaPPMap
 from glide.field import Field, GridEntity
 
-from configs.wrangell import WRANGELL
-from glacier_inverse import GlacierProblem
+from glacier_inverse import GlacierProblem, load_config
 from glacier_inverse.problem import PhysicalParameters
 from glacier_inverse.io import make_time_vti_writer
 
-
-config = WRANGELL
-INPUT_PATH = f"{config.base_dir}/inverse_refactor/"
+# Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
+DOMAIN = "domains/wrangell"
+config = load_config(DOMAIN)
+INPUT_PATH = config.output_dir
 OUTPUT_PATH = f"{INPUT_PATH}/sens/"
 LEVEL = 2
 

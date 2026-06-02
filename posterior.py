@@ -12,12 +12,15 @@ import torch
 
 from ggapp.torch import GGaPPMap
 
-#from configs.wrangell import WRANGELL
-from configs.delta import DELTA as config
+from glacier_inverse import load_config
 from glacier_inverse.priors import GlacierPriors, domain_shape
 
+# Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
+DOMAIN = "domains/delta"
+config = load_config(DOMAIN)
 
-INPUT_PATH = f"{config.base_dir}/inverse_refactor/"
+
+INPUT_PATH = config.output_dir
 MAX_SAMPLES = 100000
 
 ny, nx, dx = domain_shape(config)

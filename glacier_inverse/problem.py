@@ -28,10 +28,7 @@ from ggapp.torch import GGaPPMap, GGaPPWhiten
 
 from .config import GlacierConfig, SolverConfig
 from .forward import simulate, differentiable_restriction, differentiable_prolongation
-from .loss import (
-    LossTerms, PriorMeans, compute_data_misfit, compute_prior,
-    compute_snowline_misfit,
-)
+from .loss import LossTerms, PriorMeans, compute_data_loss, compute_prior
 from .priors import GlacierPriors
 
 
@@ -588,18 +585,12 @@ class GlacierProblem:
         if mask is None:
             mask = (observations.rgi_mask * observations.domain_mask).to(torch.float32)
 
-        J_srf, J_vel, J_extent, J_bed = compute_data_misfit(
+        J_srf, J_vel, J_extent, J_bed, J_snow = compute_data_loss(
             config=self.config,
             sim_result=sim,
-            bed_fine=physical.bed,
+            physical=physical,
             observations=observations,
             mask=mask,
-            dx=self.dx,
-        )
-        J_snow = compute_snowline_misfit(
-            config=self.config,
-            sim_result=sim,
-            observations=observations,
             dx=self.dx,
         )
         J_prior_terms = compute_prior(

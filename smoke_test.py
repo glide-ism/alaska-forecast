@@ -27,8 +27,10 @@ import torch
 
 from ggapp.torch import GGaPPMap, GGaPPWhiten
 
-from configs.wrangell import WRANGELL
-from glacier_inverse import GlacierProblem
+from glacier_inverse import GlacierProblem, load_config
+
+# Domain to smoke-test. Override at the call site if you want a different one.
+SMOKE_DOMAIN = "domains/wrangell"
 
 
 _failures = 0
@@ -48,7 +50,7 @@ def header(title: str) -> None:
 
 
 def main() -> int:
-    config = WRANGELL
+    config = load_config(SMOKE_DOMAIN)
 
     header("Building GlacierProblem")
     try:
