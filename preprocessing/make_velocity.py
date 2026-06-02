@@ -66,6 +66,7 @@ def build_velocity(domain_path: str) -> xr.Dataset:
     velocity_ds = dem_ds.copy()
     velocity_ds['vx'] = (('y', 'x'), vx_project.astype('float32'))
     velocity_ds['vy'] = (('y', 'x'), vy_project.astype('float32'))
+    velocity_ds['vmask'] = (('y','x'),(((vx_project**2 + vy_project**2)**0.5) > 1.0).astype('float32'))
 
     for name in ('elevation', 'topography', 'bathymetry', 'bathymetry_mask',
                  'domain_mask', 'rgi_mask'):

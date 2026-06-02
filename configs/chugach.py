@@ -1,5 +1,5 @@
 """
-St. Elias domain configuration.
+Wrangell domain configuration.
 
 All numerical knobs that the four scripts share live here, so the physical
 model is identical across inverse / rto / posterior / sensitivity by
@@ -8,9 +8,9 @@ stay in the driver scripts.
 """
 from glacier_inverse.config import GlacierConfig, PriorHyperparams
 
-DENALI = GlacierConfig(
-    base_dir="./domains/denali/",
-    vti_base_name="denali",
+CHUGACH = GlacierConfig(
+    base_dir="./domains/chugach/",
+    vti_base_name="chugach",
     lambda_u=2.0e-6,
     lambda_s=2.0e-6,
     lambda_bed=2.0e-6,
@@ -21,8 +21,8 @@ DENALI = GlacierConfig(
     ssa_damping=1.0,
     sliding_m=1.0,
     beta_init=0.1,
-    init_from_observed_geometry = False,
+    init_from_observed_geometry = True,
     debris_factor=0.5,
-    #pbias_prior = PriorHyperparams(sigma=0.1,    l=10000.0, nu=1)   
-    bed_prior = PriorHyperparams(sigma=250,    l=1000.0, nu=1),
+    sigma_log_mf = 1.0,
+    bed_prior = PriorHyperparams(sigma=500,    l=2000.0, nu=1),
 )

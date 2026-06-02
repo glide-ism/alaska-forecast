@@ -8,7 +8,6 @@ stay here.
 import torch
 import xarray as xr
 
-#from configs.wrangell import WRANGELL as config
 from configs.st_elias import ST_ELIAS as config
 from glacier_inverse import GlacierProblem
 from glacier_inverse.forward import differentiable_restriction
@@ -18,25 +17,25 @@ from glacier_inverse.io import (
 )
 
 
-OUTPUT_PATH = f"{config.base_dir}/inverse_init/"
-WARM_START_PATH = f"{OUTPUT_PATH}/level_2/torch_vars.p"  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
+OUTPUT_PATH = f"{config.base_dir}/inverse_brier_test/"
+WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
 
-MAX_LEVEL = 1
+MAX_LEVEL = 3
 MIN_LEVEL = 1
 MAX_ITERS = [0, 20, 50, 500]
 
 problem = GlacierProblem(config)
-#problem.smb_model.grid.temperature.daily_amp_t2m.set(2.0)
-
 params = problem.params
 
 if WARM_START_PATH is not None:
     load_whitened_params_into(params, WARM_START_PATH)
 
+problem.write_observations(f"{OUTPUT_PATH}/level_{MIN_LEVEL}/vti")
+
 optimizer_sgd = torch.optim.SGD([
-    {"params": params.z_bed, "lr": 0.2},
-    {"params": params.z_bed_mean, "lr": 1.0},
-    {"params": params.z_log_beta, "lr": 0.75},
+    {"params": params.z_bed, "lr": 0.0175},
+    {"params": params.z_bed_mean, "lr": 0.5},
+    {"params": params.z_log_beta, "lr": 0.25},
 ], momentum=0.5)
 
 optimizer_adam = torch.optim.Adam([

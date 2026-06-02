@@ -112,6 +112,7 @@ def compute_data_misfit(
     u_fine = sim_result.u_fine
     v_fine = sim_result.v_fine
     H_fine = sim_result.H_fine
+    active_fine = sim_result.active_fine
 
     scale = config.loss_scale * dx ** 2
 
@@ -122,14 +123,24 @@ def compute_data_misfit(
     # Velocity misfit (averaged onto cell centers).
     u_pred = (u_fine[:, 1:] + u_fine[:, :-1]) / 2.0
     v_pred = (v_fine[1:, :] + v_fine[:-1, :]) / 2.0
-    r_u2 = ((u_pred - observations.u_obs) ** 2 + (v_pred - observations.v_obs) ** 2) / config.sigma_u ** 2
+
+    v_mask = (observations.u_obs**2 + observations.v_obs**2) > 5.0
+
+    r_u2 = (((u_pred - observations.u_obs) ** 2 + (v_pred - observations.v_obs) ** 2) / config.sigma_u ** 2)# * v_mask #observations.v_mask
+
     J_vel = scale * config.lambda_u * config.nu_u ** 2 * (torch.sqrt(1 + r_u2 / config.nu_u ** 2) - 1).sum()
 
-    # Glacier extent (Bernoulli log-likelihood with mask).
-    p_extent = (2.0 / (1 + torch.exp(-H_fine / config.s_H)) - 1).clip(min=0.001, max=0.999)
-    J_extent = -config.loss_scale * config.lambda_e * dx ** 2 * (mask * torch.log(p_extent)).sum()
-
-    # Bed: flightline samples + grid bed-equals-DEM where no ice (1-mask).
+    # Glacier extent (Brier log-likelihood with mask).
+    p_extent_dyn = (2.0 / (1 + torch.exp(-H_fine / config.s_H)) - 1).clip(min=0.001, max=0.999)
+    p_extent_smb = (1/(1+torch.exp(-config.dt / config.s_H * sim_result.smb_fine))).clip(min=0.001,max=0.999)
+    p_extent = p_extent_dyn * (1-active_fine) + p_extent_smb * active_fine
+    #J_extent = config.loss_scale * config.lambda_e * dx ** 2 * (((p_extent_dyn - mask)/0.5)**2).sum()
+    #J_extent += config.loss_scale * config.lambda_e * dx ** 2 * (active_fine * ((p_extent_smb - mask)/0.5)**2).sum()
+    #J_extent = config.loss_scale * config.lambda_e * dx ** 2 * (mask * ((1 - p_extent)/0.5)**2 + (1 - mask) * (p_extent/0.5)**2).sum() 
+    J_extent = config.loss_scale * config.lambda_e * dx ** 2 * (mask * ((1 - p_extent)/0.5)**2).sum() 
+    #J_extent = -config.loss_scale * config.lambda_e * dx ** 2 * (mask * torch.log(p_extent_dyn)).sum() 
+    
+# Bed: flightline samples + grid bed-equals-DEM where no ice (1-mask).
     # The off-ice anchor uses the full DEM (topography + bathymetry), not the
     # sea-level-clamped S_obs, so submarine bed is anchored to bathymetry.
     bed_at_flightlines = grid_sample(
@@ -138,6 +149,7 @@ def compute_data_misfit(
         mode="bilinear",
     ).squeeze()
     r_bed_fl = (bed_at_flightlines - observations.bed_obs) / config.sigma_bed
+    #r_bed_grid = (bed_fine - observations.dem) / config.sigma_s * (1 - observations.obs_mask)
     r_bed_grid = (bed_fine - observations.dem) / config.sigma_s * (1 - mask)
     J_bed = scale * config.lambda_bed * (_huber(r_bed_fl, config.nu_bed).sum()
                                           + _huber(r_bed_grid, config.nu_bed).sum())
@@ -177,11 +189,14 @@ def compute_snowline_misfit(
 
     logits = smb / config.s_smb
     # weight = 0/1 mask, so off-ice / no-data cells drop out of the sum.
-    bce = torch.nn.functional.binary_cross_entropy_with_logits(
-        logits, label, weight=mask, reduction="sum",
-    )
-    return config.loss_scale * config.lambda_snow * dx ** 2 * bce
+    #bce = torch.nn.functional.binary_cross_entropy_with_logits(
+    #    logits, label, weight=mask, reduction="sum",
+    #)
+    #return config.loss_scale * config.lambda_snow * dx ** 2 * bce
 
+    y = torch.nn.functional.sigmoid(logits)
+    brier = (mask * ((y - label)/0.25)**2).sum()
+    return config.loss_scale * config.lambda_snow * dx ** 2 * brier
 
 def compute_prior(
     *,
@@ -209,9 +224,9 @@ def compute_prior(
     J_prior_beta = scale * ((params.z_log_beta - prior_means.value("z_log_beta", params.z_log_beta)) ** 2).sum()
     J_prior_pbias = scale * ((params.z_pbias - prior_means.value("z_pbias", params.z_pbias)) ** 2).sum()
 
-    z_log_rf_now = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
-    z_log_mf_now = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
-    J_prior_smb = ((z_log_rf_now - prior_means.value("z_log_rf", z_log_rf_now)) ** 2
-                   + (z_log_mf_now - prior_means.value("z_log_mf", z_log_mf_now)) ** 2)
+    #z_log_rf_now = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
+    #z_log_mf_now = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
+    J_prior_smb = scale * ((params.z_log_rf - prior_means.value("z_log_rf", params.z_log_rf)) ** 2
+                   + (params.z_log_mf - prior_means.value("z_log_mf", params.z_log_mf)) ** 2)
 
     return J_prior_bed, J_prior_bed_mean, J_prior_beta, J_prior_pbias, J_prior_smb

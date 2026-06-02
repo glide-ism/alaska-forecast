@@ -68,6 +68,39 @@ def make_time_vti_writer(mg_level, output_dir: str, base: str = "time") -> VTIWr
     )
 
 
+def _as_cell_field(arr, mg_level) -> Field:
+    """Wrap a 2-D array (torch / cupy / numpy) as a cell-centered Field on
+    `mg_level`. Torch tensors are detached and moved through the CUDA array
+    interface; everything is cast to float32 so VTI export is uniform."""
+    if isinstance(arr, torch.Tensor):
+        arr = arr.detach().to(torch.float32)
+    data = cp.asarray(arr, dtype=cp.float32)
+    return Field(data, grid_entity=GridEntity.CELL, dx=mg_level.dx, grid=mg_level)
+
+
+def write_static_vti(mg_level, output_dir: str, base: str,
+                     scalar_fields: dict, vector_fields: dict = None) -> None:
+    """Write a single-frame PVD of static (non-evolving) fields.
+
+    `scalar_fields` maps name -> 2-D array; `vector_fields` maps name ->
+    (comp_x, comp_y) 2-D arrays. Used to dump the observational products once
+    so they can be flipped through alongside the per-iteration diagnostics.
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    dynamic_fields = {
+        name: _as_cell_field(arr, mg_level)
+        for name, arr in scalar_fields.items()
+    }
+    for name, (cx, cy) in (vector_fields or {}).items():
+        dynamic_fields[name] = [_as_cell_field(cx, mg_level),
+                                _as_cell_field(cy, mg_level)]
+    writer = VTIWriter(output_dir, base=base, dx=mg_level.dx,
+                       dynamic_fields=dynamic_fields)
+    writer.initialize(mg_level)
+    writer.append(mg_level, time=0.0)
+    writer.write_pvd()
+
+
 def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbias_) -> None:
     """Copy detached tensors into the cupy-backed diagnostic Fields."""
     diag.delta.data[:, :] = cp.asarray(S_.detach() - S_obs_)

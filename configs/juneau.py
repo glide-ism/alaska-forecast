@@ -6,14 +6,42 @@ model is identical across inverse / rto / posterior / sensitivity by
 construction. Per-task knobs (max iterations, output paths, warm-start path)
 stay in the driver scripts.
 """
-from glacier_inverse.config import GlacierConfig
+from glacier_inverse.config import GlacierConfig, PriorHyperparams
 
 JUNEAU = GlacierConfig(
     base_dir="./domains/juneau/",
     vti_base_name="juneau",
-    sigma_log_mf=1.0,
-    sigma_log_rf=1.0
-
-    #alpha_t2m=1.0,
-    #mu_mf=1.0
+    lambda_u=2.0e-6,
+    lambda_s=2.0e-6,
+    lambda_bed=2.0e-6,
+    lambda_e=2e-5,
+    lambda_snow=2e-5,
+    loss_scale=1e-3,
+    s_smb=0.5,
+    ssa_damping=1.0,
+    sliding_m=1.0,
+    beta_init=0.1, 
+    depth_blend=0.0,
+    debris_factor=0.0,
+    init_from_observed_geometry = False,
+    bed_prior = PriorHyperparams(sigma=500, l=2000.0, nu=1)   
 )
+"""
+JUNEAU = GlacierConfig(
+    base_dir="./domains/juneau/",
+    vti_base_name="juneau",
+    lambda_u=2.0e-6,
+    lambda_s=2.0e-6,
+    lambda_bed=2.0e-6,
+    lambda_e=2e-5,
+    lambda_snow=2e-5,
+    loss_scale=1e-3,
+    s_smb=0.5,
+    ssa_damping=1.0,
+    sliding_m=1.0,
+    beta_init=0.1, 
+    depth_blend=0.0,
+    debris_factor=0.0,
+    init_from_observed_geometry = True
+)
+"""

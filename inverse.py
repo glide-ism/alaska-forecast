@@ -8,10 +8,11 @@ stay here.
 import torch
 import xarray as xr
 
-from configs.denali import DENALI as config
+#from configs.denali import DENALI as config
 #from configs.juneau import JUNEAU as config
-#from configs.wrangell import WRANGELL as config
 #from configs.delta import DELTA as config
+#from configs.wrangell import WRANGELL as config
+from configs.chugach import CHUGACH as config
 from glacier_inverse import GlacierProblem
 from glacier_inverse.forward import differentiable_restriction
 from glacier_inverse.io import (
@@ -20,7 +21,7 @@ from glacier_inverse.io import (
 )
 
 
-OUTPUT_PATH = f"{config.base_dir}/inverse_snowline_v2/"
+OUTPUT_PATH = f"{config.base_dir}/inverse_brier_test/"
 WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
 
 MAX_LEVEL = 2
@@ -33,18 +34,28 @@ params = problem.params
 if WARM_START_PATH is not None:
     load_whitened_params_into(params, WARM_START_PATH)
 
+# Dump the observational products once, alongside the finest-level diagnostics.
+problem.write_observations(f"{OUTPUT_PATH}/level_{MIN_LEVEL}/vti")
+
 optimizer_sgd = torch.optim.SGD([
-    {"params": params.z_bed, "lr": 0.2},
-    {"params": params.z_bed_mean, "lr": 1.0},
-    {"params": params.z_log_beta, "lr": 0.75},
+    {"params": params.z_bed, "lr": 0.0325},
+    #{"params": params.z_bed, "lr": 0.5},
+    {"params": params.z_bed_mean, "lr": 0.5},
+    {"params": params.z_log_beta, "lr": 0.25},
 ], momentum=0.5)
 
+# Good params!
+#optimizer_sgd = torch.optim.SGD([
+#    {"params": params.z_bed, "lr": 0.5},
+#    {"params": params.z_bed_mean, "lr": 0.5},
+#    {"params": params.z_log_beta, "lr": 0.25},
+#], momentum=0.5)
+
 optimizer_adam = torch.optim.Adam([
-    {"params": params.z_pbias, "lr": 0.0003},
+    {"params": params.z_pbias, "lr": 0.001},
     {"params": params.z_log_mf, "lr": 0.01},
     {"params": params.z_log_rf, "lr": 0.01},
 ], betas=(0.5, 0.99))
-
 
 def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     bed_mean_coarse = differentiable_restriction(physical.bed_mean, level)

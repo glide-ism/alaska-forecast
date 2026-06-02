@@ -40,18 +40,22 @@ class GlacierConfig:
     t_end: float = 2012.0
     base_anomaly_year: int = 2012
     alpha_t2m: float = 2.2
+    
+    base_precip_year: int = 2012
+    alpha_precip: float = 0.2
 
     # Field priors (Matern)
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,  l=1000.0,  nu=1)
-    mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0, l=10000.0, nu=3)
-    log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=1.0,    l=1000.0,  nu=1)
-    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,    l=10000.0, nu=3)
+    mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0, l=10000.0, nu=1)
+    log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,    l=1000.0,  nu=1)
+    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,    l=10000.0, nu=1)
 
     # Scalar SMB priors (log-normal). mu_log_* is derived as log(mu_*).
-    mu_rf: float = 20.0
+    mu_rf: float = 50.0
     mu_mf: float = 2.0
     sigma_log_rf: float = 0.1
     sigma_log_mf: float = 0.1
+    debris_factor: float = 0.5 # Amount by which debris cover reduces melt of bare ice. 
 
     # Observation noise
     sigma_s: float = 10.0
@@ -72,7 +76,7 @@ class GlacierConfig:
     # SMB -> logit scale for the snowline term. The model SMB (m ice-eq/yr)
     # is divided by this before the sigmoid, so sigmoid(SMB / s_smb) reads as
     # P(cell is above the ELA, i.e. in the accumulation area).
-    s_smb:  float = 1.0
+    s_smb:  float = 0.2
 
     # Ice rheology
     rho_ice:  float = 917.0
@@ -88,7 +92,7 @@ class GlacierConfig:
     water_drag:  float = 0.01
 
     # Calving / geometry
-    calving_rate: float = 1000.0
+    calving_rate: float = 250.0
     sigmoid_c:    float = 0.1
     sigmoid_k:    float = 4.0
     depth_blend:  float = 0.1    # weight on new bed-derived depth vs prior depth
@@ -109,7 +113,9 @@ class GlacierConfig:
     gridded_filename:    str = "GLIDE_inputs.nc"
     flightline_filename: str = "flightlines.gpkg"
     anomaly_filename:    str = "temperature_anomaly.nc"
+    precip_anomaly_filename: str = "precip_anomaly.nc"  # optional; multiplicative
     snowline_filename:   str = "gridded_snowline.nc"  # optional; ELA proxy
+    debris_filename:   str = "gridded_debris.nc"  # optional; ELA proxy
 
     # Diagnostics
     vti_base_name: str = "glacier"
