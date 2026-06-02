@@ -21,6 +21,7 @@ Output: {domain_path}/model_inputs/gridded_dem.nc
 """
 import argparse
 import math
+import os
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -36,8 +37,10 @@ from bmi_topography import Topography
 from projection_dictionary import crs
 
 
-# TODO: move secret to env var / config
-OPENTOPOGRAPHY_API_KEY = 'dc10c5a9ed81a06019b050fbf754d1b1'
+# Free per-user key from
+# https://opentopography.org/blog/introducing-api-keys-access-opentopography-global-datasets
+# Set it in your shell, e.g. `export OPENTOPOGRAPHY_API_KEY=...`.
+OPENTOPOGRAPHY_API_KEY = os.environ.get("OPENTOPOGRAPHY_API_KEY")
 NOAA_DEM_SERVICE = (
     "https://gis.ngdc.noaa.gov/arcgis/rest/services/"
     "DEM_mosaics/DEM_global_mosaic/ImageServer"
@@ -56,7 +59,6 @@ BBOX_BOUNDARY_SAMPLES = 100
 # Small lat/lon padding on the fetch extent to absorb numerical roundoff
 # between forward/inverse projection at the very edges of the target grid.
 FETCH_PAD_DEG = 0.01
-
 
 def export_dem(
     xmin, ymin, xmax, ymax, out_file,
@@ -242,6 +244,11 @@ def build_dem(domain_path: str) -> xr.Dataset:
     )
 
     # Fetch topography over the lat/lon fetch extent
+    if not OPENTOPOGRAPHY_API_KEY:
+        raise RuntimeError(
+            "Set the OPENTOPOGRAPHY_API_KEY environment variable. Get a free key at "
+            "https://opentopography.org/blog/introducing-api-keys-access-opentopography-global-datasets"
+        )
     topography_params = Topography.DEFAULT.copy()
     topography_params['api_key'] = OPENTOPOGRAPHY_API_KEY
     topography_params['dem_type'] = DEM_TYPE
