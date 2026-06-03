@@ -15,7 +15,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="wrangell",
-    results_subdir="inverse_refactor",
+    results_subdir="inverse",
     lambda_u=2.0e-6,
     lambda_s=2.0e-6,
     lambda_bed=2.0e-6,
@@ -28,5 +28,6 @@ CONFIG = GlacierConfig(
     beta_init=0.1,
     depth_blend=0.0,
     init_from_observed_geometry = False,
-    debris_factor=0.0
+    debris_factor=0.5,
+    lr_z_bed=0.5
 )

@@ -27,7 +27,9 @@ CONFIG = GlacierConfig(
     sliding_m=1.0,
     beta_init=0.1,
     depth_blend=0.0,
-    debris_factor=0.0,
+    debris_factor=0.5,
+    sigma_log_mf = 1.0,
+    sigma_log_rf = 0.2,
     init_from_observed_geometry = False,
     bed_prior = PriorHyperparams(sigma=500, l=2000.0, nu=1)
 )

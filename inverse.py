@@ -16,7 +16,7 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/denali"
+DOMAIN = "domains/juneau"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir

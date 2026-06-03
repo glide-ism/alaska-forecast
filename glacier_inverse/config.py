@@ -52,7 +52,7 @@ class GlacierConfig:
 
     # Scalar SMB priors (log-normal). mu_log_* is derived as log(mu_*).
     mu_rf: float = 50.0
-    mu_mf: float = 2.0
+    mu_mf: float = 3.0
     sigma_log_rf: float = 0.1
     sigma_log_mf: float = 0.1
     debris_factor: float = 0.5 # Amount by which debris cover reduces melt of bare ice. 
