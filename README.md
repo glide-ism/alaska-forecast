@@ -9,7 +9,9 @@ This is an experiment/orchestration workspace rather than an installable package
 pip install -r requirements.txt
 ```
 
-The geospatial (GDAL/PROJ) and GPU (CUDA via `cupy`/`torch`) dependencies can be awkward through pip; see the notes at the top of `requirements.txt`. If you are actively developing the `glide-ism` libraries alongside this repo, install them editable instead (`pip install -e ../glide`, etc.).
+The geospatial (GDAL/PROJ) and GPU (CUDA via `cupy`/`torch`) dependencies can be awkward through pip; see the notes at the top of `requirements.txt`. In particular, CuPy ships a separate wheel per CUDA major version — `requirements.txt` defaults to `cupy-cuda12x`, so if you are on CUDA 11 or 13 edit that line to the matching wheel before installing.
+
+If you are actively developing the `glide-ism` libraries alongside this repo, install them editable instead (`pip install -e ../glide`, etc.); each lib also exposes `cuda11`/`cuda12`/`cuda13` extras (e.g. `pip install -e ../glide[cuda12]`).
 
 ## Common data
 

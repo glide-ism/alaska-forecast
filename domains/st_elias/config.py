@@ -17,7 +17,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="st_elias",
-    results_subdir="inverse_brier_test",
+    results_subdir="inverse",
     # St. Elias is large; start one level coarser than the other domains, and
     # the bed prior is wider here so the bed step needs to be smaller.
     min_level=1,
