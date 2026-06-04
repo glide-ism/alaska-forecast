@@ -51,7 +51,6 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
 
-
 for level in range(config.max_level, config.min_level - 1, -1):
     problem.model.set_top_level(level)
     diag = make_diagnostic_fields(problem.mg[level])

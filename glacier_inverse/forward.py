@@ -20,8 +20,13 @@ glare_step = GlareStep.apply
 glide_step = GlideStep.apply
 
 
-def compute_smb(smb_model, t2m, t_anomaly, base_anomaly, precip_, debris, mf, rf, domain_mask):
-    smb = glare_step(smb_model, t2m + (t_anomaly - base_anomaly), precip_, mf, rf, debris).mean(axis=0)
+def compute_smb(smb_model, t2m, t_anomaly, base_anomaly, precip_, precip_multiplier,
+                debris, mf, rf, domain_mask):
+    # `precip_multiplier` is a scalar applied here, inside the checkpoint, so the
+    # full (12, ny, nx) scaled precip field is recomputed in backward rather than
+    # stored per time step (otherwise ~50 full-grid copies are retained).
+    precip_step = precip_ * precip_multiplier
+    smb = glare_step(smb_model, t2m + (t_anomaly - base_anomaly), precip_step, mf, rf, debris).mean(axis=0)
     return smb.masked_fill(~domain_mask, -10)
 
 
@@ -139,12 +144,11 @@ def simulate(
             p_anom_1 = precip_anomaly.sel(time=int(min(float(t + dt_c), p_year_max))).precip_anomaly.item()
             p_ratio = 0.5 * (p_anom_0 + p_anom_1) / base_precip
             precip_multiplier = 1.0 + alpha_precip * (p_ratio - 1.0)
-            precip_step = precip_ * precip_multiplier
         else:
-            precip_step = precip_
+            precip_multiplier = 1.0
 
         smb = checkpoint(compute_smb, smb_model,
-                         t2m, t_anomaly, base_anomaly, precip_step,
+                         t2m, t_anomaly, base_anomaly, precip_, precip_multiplier,
                          debris,
                          mf, rf, domain_mask, use_reentrant=False)
         smb_ = differentiable_restriction(smb, level)
