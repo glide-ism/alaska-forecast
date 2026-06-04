@@ -69,7 +69,8 @@ for level in range(config.max_level, config.min_level - 1, -1):
         sim, physical = problem.simulate(
             level=level, params=params, time_writer=time_writer)
         loss_terms = problem.compute_loss(
-            sim=sim, physical=physical, params=params)
+            sim=sim, physical=physical, params=params,
+            iteration=i, level=level, schedule=True)
         loss_terms.log(i)
 
         write_loss_vti(diag, vti_writer, sim, physical, level, i)

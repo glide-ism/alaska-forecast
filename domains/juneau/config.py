@@ -31,7 +31,8 @@ CONFIG = GlacierConfig(
     sigma_log_mf = 1.0,
     sigma_log_rf = 0.2,
     init_from_observed_geometry = False,
-    bed_prior = PriorHyperparams(sigma=500, l=2000.0, nu=1)
+    bed_prior = PriorHyperparams(sigma=500, l=2000.0, nu=1),
+    lr_z_bed=0.5/16
 )
 """
 CONFIG = GlacierConfig(

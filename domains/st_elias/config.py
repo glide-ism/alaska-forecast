@@ -8,7 +8,7 @@ stay in the driver scripts.
 """
 from pathlib import Path
 
-from glacier_inverse.config import GlacierConfig, PriorHyperparams
+from glacier_inverse.config import GlacierConfig, PriorHyperparams, Schedule
 
 _HERE = Path(__file__).parent
 
@@ -23,13 +23,11 @@ CONFIG = GlacierConfig(
     min_level=1,
     max_level=3,
     max_iters=(0, 20, 50, 500),
-    lr_z_bed=0.0175,
-    #t_start=1512,
     lambda_u=4.0e-6,
     lambda_s=2.0e-6,
     lambda_bed=2.0e-6,
     lambda_e=2e-5,
-    lambda_snow=0e-5,
+    lambda_snow=Schedule(final=1e-5,ramp=lambda i,level: 0.0 if (i<50 and level==3) else 1e-5),
     loss_scale=1e-3,
     s_smb=0.5,
     ssa_damping=1.0,
@@ -37,33 +35,9 @@ CONFIG = GlacierConfig(
     beta_init=0.1,
     init_from_observed_geometry = True,
     debris_factor=0.5,
-    #pbias_prior = PriorHyperparams(sigma=0.1,    l=10000.0, nu=1),
+    sigma_log_mf = 1.0,
+    sigma_log_rf = 0.2,
     bed_prior = PriorHyperparams(sigma=500,    l=2000.0, nu=1),
-    #log_beta_prior = PriorHyperparams(sigma=3.0,    l=1000.0,  nu=1),
+    lr_z_bed=0.0175,
     depth_blend=0.1
-    #A_glen=2e-16
 )
-"""
-CONFIG = GlacierConfig(
-    base_dir=str(_HERE),
-    vti_base_name="st_elias",
-    #t_start=512,
-    lambda_u=5.0e-6,
-    lambda_s=1.0e-6,
-    lambda_bed=1.0e-6,
-    lambda_e=1e-5,
-    lambda_snow=5e-6,
-    loss_scale=1e-3,
-    s_smb=0.5,
-    ssa_damping=1.0,
-    #sliding_m=1.0,
-    #beta_init=0.05,
-    init_from_observed_geometry = True,
-    debris_factor=0.0,
-    #pbias_prior = PriorHyperparams(sigma=0.1,    l=10000.0, nu=1),
-    bed_prior = PriorHyperparams(sigma=500,    l=1000.0, nu=1),
-    log_beta_prior = PriorHyperparams(sigma=3.0,    l=1000.0,  nu=1),
-    depth_blend=0.1
-    #A_glen=2e-16
-)
-"""

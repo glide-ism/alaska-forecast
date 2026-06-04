@@ -258,6 +258,9 @@ for sample_idx in range(28,N_SAMPLES):
 
         sim, physical = problem.simulate(
             level=LEVEL, params=params, time_writer=time_writer)
+        # No scheduling here: RTO warm-starts from the MAP, so every sample uses
+        # the steady-state loss weights (Schedule.final) the inverse solve
+        # converged to. compute_loss defaults to schedule=False.
         loss_terms = problem.compute_loss(
             sim=sim, physical=physical, params=params,
             observations=observations, prior_means=prior_means, mask=mask,

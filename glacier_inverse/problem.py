@@ -578,15 +578,27 @@ class GlacierProblem:
         observations: Optional[Observations] = None,
         prior_means: Optional[PriorMeans] = None,
         mask: Optional[torch.Tensor] = None,
+        iteration: int = 0,
+        level: int = 0,
+        schedule: bool = False,
     ) -> LossTerms:
-        """Assemble all loss terms from a finished simulation."""
+        """Assemble all loss terms from a finished simulation.
+
+        `iteration`/`level` resolve any scheduled loss weights in the config to
+        their value at this optimizer step. `schedule` selects whether
+        continuation ramps are honored (the initial inverse solve, `schedule=True`)
+        or each weight collapses to its steady-state value (RTO and analysis, the
+        default) — see GlacierConfig.at_iteration. Constant weights are unaffected
+        either way.
+        """
         observations = observations or self.observations
         prior_means = prior_means or PriorMeans.zeros()
         if mask is None:
             mask = (observations.rgi_mask * observations.domain_mask).to(torch.float32)
 
+        config = self.config.at_iteration(iteration, level, schedule=schedule)
         J_srf, J_vel, J_extent, J_bed, J_snow = compute_data_loss(
-            config=self.config,
+            config=config,
             sim_result=sim,
             physical=physical,
             observations=observations,
@@ -594,7 +606,7 @@ class GlacierProblem:
             dx=self.dx,
         )
         J_prior_terms = compute_prior(
-            config=self.config,
+            config=config,
             priors=self.priors,
             params=params,
             physical_bed=physical.bed,

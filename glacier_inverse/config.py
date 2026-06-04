@@ -6,7 +6,75 @@ hyperparameters, prior hyperparameters, observation noise, solver tolerances,
 loss weights, paths — so the four tasks (inverse, rto, posterior, sensitivity)
 share the same physical model by construction.
 """
-from dataclasses import dataclass, field
+import inspect
+from dataclasses import dataclass, field, replace
+from typing import Callable, Union
+
+# The GlacierConfig fields that may be given as a schedule instead of a constant.
+SCHEDULABLE_WEIGHTS = (
+    "loss_scale", "lambda_s", "lambda_u", "lambda_e", "lambda_bed", "lambda_snow",
+)
+
+
+def _accepts_two_positional(fn: Callable) -> bool:
+    """True if `fn` can be called with two positional args, f(i, level); False if
+    it only takes one, f(i). Used to support both schedule arities."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (ValueError, TypeError):
+        return False  # builtins without an introspectable signature: assume f(i)
+    positional = [p for p in params
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    has_var_positional = any(p.kind is p.VAR_POSITIONAL for p in params)
+    return has_var_positional or len(positional) >= 2
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """A loss weight that follows a continuation ramp during the initial MAP
+    solve only, collapsing to a single steady-state value everywhere else.
+
+    `final` is the contract weight shared by all four tasks: RTO, posterior, and
+    sensitivity always use it, so they target the same objective the MAP solve
+    converges to. `ramp` is a callable f(i) or f(i, level) honored only when a
+    driver opts into scheduling (inverse.py); it should asymptote to `final`.
+    """
+    final: float
+    ramp: Callable[..., float]
+
+    def at(self, iteration: int, level: int) -> float:
+        fn = self.ramp
+        return fn(iteration, level) if _accepts_two_positional(fn) else fn(iteration)
+
+
+# A schedulable loss weight. `schedule=` on GlacierConfig.at_iteration selects
+# whether continuation is honored (the initial inverse solve) or the steady-state
+# value is used (RTO / posterior / sensitivity).
+LossWeight = Union[float, Schedule, Callable[..., float]]
+
+
+def resolve_weight(value: LossWeight, iteration: int, level: int, *,
+                   schedule: bool) -> float:
+    """Resolve a (possibly scheduled) loss weight to a float.
+
+    * constants pass through unchanged;
+    * a Schedule yields its continuation value when `schedule` is True, else its
+      steady-state `final`;
+    * a bare callable is an inverse-only shorthand: honored when `schedule` is
+      True, but rejected otherwise — it declares no steady state, so RTO and the
+      analysis tasks cannot use it consistently (wrap it in Schedule(final=...)).
+    """
+    if isinstance(value, Schedule):
+        return value.at(iteration, level) if schedule else value.final
+    if callable(value):
+        if not schedule:
+            raise TypeError(
+                "loss weight is a bare schedule callable, but this task does not "
+                "use scheduling. Wrap it as Schedule(final=..., ramp=...) so the "
+                "steady-state value is defined for RTO / posterior / sensitivity."
+            )
+        return value(iteration, level) if _accepts_two_positional(value) else value(iteration)
+    return value
 
 
 @dataclass(frozen=True)
@@ -63,12 +131,16 @@ class GlacierConfig:
     sigma_bed: float = 10.0
 
     # Loss weights. lambda_bed unified to 2e-5 (was 1e-5 in pre-refactor rto_sample.py).
-    loss_scale: float = 1e-4
-    lambda_s:    float = 2e-5
-    lambda_u:    float = 2e-5
-    lambda_e:    float = 2e-4
-    lambda_bed:  float = 2e-5
-    lambda_snow: float = 2e-4    # weight on the snowline (ELA) BCE term
+    # Each of these may be a constant, or a Schedule(final=, ramp=) for
+    # continuation during the initial inverse solve only. The steady-state `final`
+    # is the value RTO / posterior / sensitivity see, so all tasks target the same
+    # objective; only inverse.py honors the ramp. See GlacierConfig.at_iteration.
+    loss_scale:  LossWeight = 1e-4
+    lambda_s:    LossWeight = 2e-5
+    lambda_u:    LossWeight = 2e-5
+    lambda_e:    LossWeight = 2e-4
+    lambda_bed:  LossWeight = 2e-5
+    lambda_snow: LossWeight = 2e-4    # weight on the snowline (ELA) BCE term
     nu_s:   float = 1.0
     nu_u:   float = 1.0
     nu_bed: float = 1.0
@@ -138,12 +210,31 @@ class GlacierConfig:
     # by the prior curvature, so a domain that changes a prior typically has
     # to retune the corresponding lr. SGD on the field params, Adam on the
     # scalar / smooth params.
-    lr_z_bed:      float = 0.0325
+    lr_z_bed:      float = 0.5
     lr_z_bed_mean: float = 0.5
     lr_z_log_beta: float = 0.25
     lr_z_pbias:    float = 0.001
     lr_z_log_mf:   float = 0.01
     lr_z_log_rf:   float = 0.01
+
+    def at_iteration(self, iteration: int, level: int = 0, *,
+                     schedule: bool = False) -> "GlacierConfig":
+        """Return a copy with every schedulable loss weight resolved to a float
+        at `(iteration, level)`.
+
+        When `schedule` is False (the default, used by RTO / posterior /
+        sensitivity) constants pass through and any Schedule collapses to its
+        steady-state `final`, so every task targets the same objective. When
+        `schedule` is True (the initial inverse solve) Schedule ramps and bare
+        callables are evaluated as f(i, level) / f(i). Called per optimizer step
+        by GlacierProblem.compute_loss. A domain config may set e.g.
+        `lambda_snow=Schedule(final=2e-4, ramp=lambda i: 0.0 if i < 100 else 2e-4)`
+        or, level-aware, `ramp=lambda i, level: 0.0 if level > 0 else 2e-4`.
+        """
+        overrides = {name: resolve_weight(getattr(self, name), iteration, level,
+                                          schedule=schedule)
+                     for name in SCHEDULABLE_WEIGHTS}
+        return replace(self, **overrides)
 
     @property
     def output_dir(self) -> str:
