@@ -76,6 +76,11 @@ class SimResult:
     # restricted field actually fed to the ice dynamics. None if no step ran.
     smb_fine: Optional[torch.Tensor] = None
     smb_coarse: Optional[torch.Tensor] = None
+    # Second-to-last emitted thickness, coarse and prolonged to the fine grid.
+    # With `H`/`H_fine` and `config.dt` these give the model's dH/dt over the
+    # final step (`H_prev_fine` feeds the misfit; `H_prev` the coarse diagnostic).
+    H_prev: Optional[torch.Tensor] = None
+    H_prev_fine: Optional[torch.Tensor] = None
     # Volume checkpoints keyed by year — populated only when requested.
     volumes: dict = None
 
@@ -123,6 +128,9 @@ def simulate(
     volumes: dict = {}
     last_smb = None      # fine-grid SMB from the most recent step
     last_smb_ = None     # restricted SMB from the most recent step
+    # Penultimate emitted thickness (coarse). Seeded with the initial H_prev_ so
+    # a single-step run degrades to (final - seed)/dt instead of erroring.
+    H_penult = H_prev_
 
     t = cp.float32(t_start)
     t_end_c = cp.float32(t_end)
@@ -137,7 +145,7 @@ def simulate(
     while t < t_end_c:
         t_anomaly_0 = alpha_t2m * temperature_anomaly.sel(time=int(min(float(t), year_max))).temp_anomaly.item()
         t_anomaly_1 = alpha_t2m * temperature_anomaly.sel(time=int(min(float(t + dt_c), year_max))).temp_anomaly.item()
-        t_anomaly = 0.5 * (t_anomaly_0 + t_anomaly_1)
+        t_anomaly = t_anomaly_1#0.5 * (t_anomaly_0 + t_anomaly_1)
 
         if precip_anomaly is not None:
             p_anom_0 = precip_anomaly.sel(time=int(min(float(t), p_year_max))).precip_anomaly.item()
@@ -156,6 +164,10 @@ def simulate(
 
         u, v, H, active = glide_step(t, dt_c, model, level, H_prev_, bed_, beta_, smb_)
         t += dt_c
+        # `H_prev_` here is the thickness emitted by the previous step (the input
+        # to this one); capturing it before the reassignment leaves it holding
+        # the second-to-last emitted thickness once the loop ends.
+        H_penult = H_prev_
         H_prev_ = H
 
         # Record volumes at requested year boundaries (within a single dt).
@@ -173,6 +185,7 @@ def simulate(
     H_fine = differentiable_prolongation(H, level, grid_entity="cell")
     S_fine = differentiable_prolongation(S_coarse, level, grid_entity="cell")
     active_fine = differentiable_prolongation(active,level,grid_entity="cell")
+    H_prev_fine = differentiable_prolongation(H_penult, level, grid_entity="cell")
 
     return SimResult(
         u=u, v=v, H=H, active=active,
@@ -180,5 +193,6 @@ def simulate(
         u_fine=u_fine, v_fine=v_fine, H_fine=H_fine, S_fine=S_fine,
         active_fine=active_fine,
         smb_fine=last_smb, smb_coarse=last_smb_,
+        H_prev=H_penult, H_prev_fine=H_prev_fine,
         volumes=volumes,
     )

@@ -16,7 +16,7 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/st_elias"
+DOMAIN = "domains/delta"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir
@@ -37,17 +37,28 @@ optimizer_sgd = torch.optim.SGD([
     {"params": params.z_log_beta, "lr": config.lr_z_log_beta},
 ], momentum=0.5)
 
-optimizer_adam = torch.optim.Adam([
+adam_groups = [
     {"params": params.z_pbias,  "lr": config.lr_z_pbias},
     {"params": params.z_log_mf, "lr": config.lr_z_log_mf},
     {"params": params.z_log_rf, "lr": config.lr_z_log_rf},
-], betas=(0.5, 0.99))
+]
+if config.precip_lapse_enabled:
+    # Elevation-dependent precip depletion: learn tau/z0 in the Adam block.
+    adam_groups += [
+        {"params": params.z_tau, "lr": config.lr_z_tau},
+        {"params": params.z_z0,  "lr": config.lr_z_z0},
+    ]
+optimizer_adam = torch.optim.Adam(adam_groups, betas=(0.5, 0.99))
 
 def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     bed_mean_coarse = differentiable_restriction(physical.bed_mean, level)
     pbias_coarse = differentiable_restriction(physical.pbias, level)
+    pbias_total_coarse = differentiable_restriction(
+        problem.effective_log_pbias(physical), level)
     S_obs_coarse = differentiable_restriction(problem.observations.S_obs, level)
-    update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse, pbias_coarse)
+    dhdt_coarse = (sim.H - sim.H_prev) / config.dt
+    update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
+                             pbias_coarse, pbias_total_coarse, dhdt_coarse)
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
 

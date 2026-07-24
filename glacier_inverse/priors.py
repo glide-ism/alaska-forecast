@@ -59,3 +59,10 @@ class GlacierPriors:
         self.mu_log_mf = float(np.log(config.mu_mf))
         self.sigma_log_rf = config.sigma_log_rf
         self.sigma_log_mf = config.sigma_log_mf
+
+        # Elevation-dependent precip depletion scalars (normal priors, directly
+        # on tau and z0 — not log-normal; tau is itself a log length scale).
+        self.mu_tau = config.mu_tau
+        self.sigma_tau = config.sigma_tau
+        self.mu_z0 = config.mu_z0
+        self.sigma_z0 = config.sigma_z0

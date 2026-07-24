@@ -13,6 +13,7 @@ from typing import Callable, Union
 # The GlacierConfig fields that may be given as a schedule instead of a constant.
 SCHEDULABLE_WEIGHTS = (
     "loss_scale", "lambda_s", "lambda_u", "lambda_e", "lambda_bed", "lambda_snow",
+    "lambda_dhdt",
 )
 
 
@@ -110,7 +111,7 @@ class GlacierConfig:
     alpha_t2m: float = 2.2
     
     base_precip_year: int = 2012
-    alpha_precip: float = 0.2
+    alpha_precip: float = 0.0
 
     # Field priors (Matern)
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,  l=1000.0,  nu=1)
@@ -120,15 +121,32 @@ class GlacierConfig:
 
     # Scalar SMB priors (log-normal). mu_log_* is derived as log(mu_*).
     mu_rf: float = 50.0
-    mu_mf: float = 3.0
+    mu_mf: float = 1.0
     sigma_log_rf: float = 0.1
     sigma_log_mf: float = 0.1
-    debris_factor: float = 0.5 # Amount by which debris cover reduces melt of bare ice. 
+    debris_factor: float = 0.5 # Amount by which debris cover reduces melt of bare ice.
+
+    # Elevation-dependent precip depletion (optional). Adds a softplus ramp,
+    #   exp(-tau) * w * log(1 + exp((z - z0) / w)),
+    # that is *subtracted* from the log-precip bias, reducing precip above the
+    # onset elevation z0 to capture high-elevation moisture loss the climate
+    # forcing misses. tau (log of the depletion length scale) and z0 are two
+    # learnable scalars with normal priors N(mu, sigma) below; w is fixed. The
+    # term is gated off by default so already-tuned domains are unaffected until
+    # they set precip_lapse_enabled=True (and, since lr is coupled to the prior,
+    # retune lr_z_tau / lr_z_z0 if they change the prior widths).
+    precip_lapse_enabled: bool = False
+    precip_lapse_w: float = 300.0   # m, fixed transition sharpness
+    mu_tau:    float = 9.0          # prior mean of tau = log(depletion length scale [m])
+    sigma_tau: float = 1.0
+    mu_z0:     float = 2000.0       # m, prior mean of depletion-onset elevation
+    sigma_z0:  float = 500.0
 
     # Observation noise
     sigma_s: float = 10.0
     sigma_u: float = 10.0
     sigma_bed: float = 10.0
+    sigma_dhdt: float = 0.5
 
     # Loss weights. lambda_bed unified to 2e-5 (was 1e-5 in pre-refactor rto_sample.py).
     # Each of these may be a constant, or a Schedule(final=, ramp=) for
@@ -141,14 +159,17 @@ class GlacierConfig:
     lambda_e:    LossWeight = 2e-4
     lambda_bed:  LossWeight = 2e-5
     lambda_snow: LossWeight = 2e-4    # weight on the snowline (ELA) BCE term
+    lambda_dhdt: LossWeight = 2e-5    # weight on the dH/dt (elevation-change) term
     nu_s:   float = 1.0
     nu_u:   float = 1.0
     nu_bed: float = 1.0
+    nu_dhdt: float = 1.0
+
     s_H:    float = 10.0
+    s_smb:  float = 0.2
     # SMB -> logit scale for the snowline term. The model SMB (m ice-eq/yr)
     # is divided by this before the sigmoid, so sigmoid(SMB / s_smb) reads as
     # P(cell is above the ELA, i.e. in the accumulation area).
-    s_smb:  float = 0.2
 
     # Ice rheology
     rho_ice:  float = 917.0
@@ -173,6 +194,8 @@ class GlacierConfig:
     # ice-free state. Matters for tidewater hysteresis. Not differentiated.
     init_from_observed_geometry: bool = False
     init_H_floor: float = 0.1    # minimum/ice-free thickness used when seeding
+    use_avalanche_model: bool = False
+    surge_biased_likelihood: bool = False
 
     # Solver settings
     forward_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
@@ -188,6 +211,7 @@ class GlacierConfig:
     precip_anomaly_filename: str = "precip_anomaly.nc"  # optional; multiplicative
     snowline_filename:   str = "gridded_snowline.nc"  # optional; ELA proxy
     debris_filename:   str = "gridded_debris.nc"  # optional; ELA proxy
+    dhdt_filename:   str = "gridded_dhdt.nc"  # optional; surface elevation-change rate
 
     # Diagnostics
     vti_base_name: str = "glacier"
@@ -213,9 +237,14 @@ class GlacierConfig:
     lr_z_bed:      float = 0.5
     lr_z_bed_mean: float = 0.5
     lr_z_log_beta: float = 0.25
+
     lr_z_pbias:    float = 0.001
     lr_z_log_mf:   float = 0.01
     lr_z_log_rf:   float = 0.01
+    # Elevation-dependent precip depletion scalars (Adam block, only added to
+    # the optimizer when precip_lapse_enabled). See the prior widths above.
+    lr_z_tau:      float = 0.01
+    lr_z_z0:       float = 0.01
 
     def at_iteration(self, iteration: int, level: int = 0, *,
                      schedule: bool = False) -> "GlacierConfig":

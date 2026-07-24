@@ -6,12 +6,13 @@ Calls each per-variable build function in dependency order:
          ├─ velocity
          ├─ snowline
          ├─ debris
+         ├─ dhdt
          ├─ insolation    (needs year)
          ├─ climate CARRA  (needs year)
          └─ climate ERA5-Land (needs year)
     temperature anomaly  (independent)
     precip anomaly       (independent)
-    merged = DEM + velocity + snowline + debris + insolation
+    merged = DEM + velocity + snowline + debris + dhdt + insolation
              + climate (CARRA) + climate (ERA5-Land)
 
 Run as a script:
@@ -25,6 +26,7 @@ from make_bedradar import build_flightlines
 from make_velocity import build_velocity
 from make_snowline import build_snowline
 from make_debris import build_debris
+from make_dhdt import build_dhdt
 from make_insolation import build_insolation
 from make_pancarra_vars import build_climate as build_climate_carra
 from make_era5land_vars import build_climate as build_climate_era5land
@@ -55,6 +57,9 @@ def run_all(domain_path: str, year: int) -> None:
 
     _banner("Debris")
     build_debris(domain_path)
+
+    _banner("dH/dt")
+    build_dhdt(domain_path)
 
     _banner(f"Insolation (year={year})")
     build_insolation(domain_path, year=year)

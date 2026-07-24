@@ -34,7 +34,7 @@ from projection_dictionary import crs
 
 PANCARRA_BASE = Path('../common_data/climate/pancarra')
 MULTIYEAR_BASE = PANCARRA_BASE / '1986_2023'
-TEMPERATURE_LAPSE_RATE_K_PER_M = 0.003
+TEMPERATURE_LAPSE_RATE_K_PER_M = -0.0065
 ICE_DENSITY = 917.0
 DAYS_PER_YEAR = 365
 
@@ -183,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--precip-median-window", type=int, default=None,
                         help="Side length (grid cells) of an optional square "
                              "median filter applied to monthly precip.")
-    parser.add_argument("--multiyear", action="store_true", default=True,
+    parser.add_argument("--multiyear", action="store_true", default=False,
                         help="Use the multi-year CARRA file in "
                              "common_data/climate/pancarra/1986_2023, reduced "
                              "to a calendar-month climatology.")

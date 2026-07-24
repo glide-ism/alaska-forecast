@@ -24,6 +24,7 @@ import xarray as xr
 
 from glide.model import IceDynamics
 from glare.model import ImprovedTemperatureIndex
+from glare.avalanche import AvalancheOperator
 from ggapp.torch import GGaPPMap, GGaPPWhiten
 
 from .config import GlacierConfig, SolverConfig
@@ -43,6 +44,8 @@ class Observations:
     bed_obs: torch.Tensor
     bed_normed_coords: torch.Tensor
     rgi_mask: torch.Tensor      # 0/1 ice extent
+    rgi_label: torch.Tensor
+    surge_type: torch.Tensor
     obs_mask: torch.Tensor
     domain_mask: torch.Tensor   # 0/1 simulation domain
     # End-of-summer snowline (ELA proxy). Optional: domains without the
@@ -50,6 +53,11 @@ class Observations:
     snow_label: Optional[torch.Tensor] = None   # snow fraction in [0, 1]
     snow_mask: Optional[torch.Tensor] = None    # 0/1 valid (on-ice) cells
     debris: Optional[torch.Tensor] = None
+    # Surface elevation-change rate (Hugonnet dH/dt). Optional: domains without
+    # the product leave these None and the dH/dt loss term is skipped.
+    dhdt: Optional[torch.Tensor] = None         # dH/dt (m/yr)
+    dhdt_err: Optional[torch.Tensor] = None     # per-pixel 1-sigma uncertainty (m/yr)
+    dhdt_mask: Optional[torch.Tensor] = None    # 0/1 valid (finite, on-domain) cells
 
     def randomized(
         self,
@@ -84,31 +92,43 @@ class Observations:
             bed_obs=self.bed_obs + eps_bed * sigma_bed,
             bed_normed_coords=self.bed_normed_coords,
             rgi_mask=self.rgi_mask,
+            rgi_label=self.rgi_label,
+            surge_type=self.surge_type,
             obs_mask=self.obs_mask,
             domain_mask=self.domain_mask,
             # The snowline label is a categorical observation with no
             # Gaussian noise model, so RTO passes it through unperturbed.
             snow_label=self.snow_label,
             snow_mask=self.snow_mask,
-            debris=self.debris
-            
+            debris=self.debris,
+            # dH/dt has a Gaussian noise model, but RTO perturbation is added by
+            # the (not-yet-wired) loss term; pass it through unperturbed for now.
+            dhdt=self.dhdt,
+            dhdt_err=self.dhdt_err,
+            dhdt_mask=self.dhdt_mask,
         )
 
 
 class WhitenedParameters:
-    """The six tensors we optimize over: four whitened fields plus two whitened scalars."""
+    """The eight tensors we optimize over: four whitened fields plus four
+    whitened scalars (log melt/radiation factors and the precip-depletion
+    tau/z0). The depletion scalars are inert unless precip_lapse_enabled."""
 
-    def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_log_mf, z_log_rf):
+    def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_log_mf, z_log_rf,
+                 z_tau, z_z0):
         self.z_bed = z_bed
         self.z_bed_mean = z_bed_mean
         self.z_log_beta = z_log_beta
         self.z_pbias = z_pbias
         self.z_log_mf = z_log_mf
         self.z_log_rf = z_log_rf
+        self.z_tau = z_tau
+        self.z_z0 = z_z0
 
     def requires_grad_(self) -> "WhitenedParameters":
         for t in (self.z_bed, self.z_bed_mean, self.z_log_beta,
-                  self.z_pbias, self.z_log_mf, self.z_log_rf):
+                  self.z_pbias, self.z_log_mf, self.z_log_rf,
+                  self.z_tau, self.z_z0):
             t.requires_grad_()
         return self
 
@@ -120,6 +140,8 @@ class WhitenedParameters:
             z_pbias=self.z_pbias.detach().clone(),
             z_log_mf=self.z_log_mf.detach().clone(),
             z_log_rf=self.z_log_rf.detach().clone(),
+            z_tau=self.z_tau.detach().clone(),
+            z_z0=self.z_z0.detach().clone(),
         )
 
     @torch.no_grad()
@@ -132,6 +154,8 @@ class WhitenedParameters:
         self.z_pbias.copy_(other.z_pbias)
         self.z_log_mf.copy_(other.z_log_mf)
         self.z_log_rf.copy_(other.z_log_rf)
+        self.z_tau.copy_(other.z_tau)
+        self.z_z0.copy_(other.z_z0)
 
 
 def _apply_solver_settings(target_fas, cfg: SolverConfig) -> None:
@@ -190,6 +214,16 @@ class GlacierProblem:
                 xr.open_dataset(debris_path), 2 ** cfg.n_levels)
         else:
             self.debris_data = None
+
+        # Optional surface elevation-change rate (Hugonnet dH/dt). Built on the
+        # same DEM grid as GLIDE_inputs, so the identical centered crop keeps it
+        # aligned. Domains without the file simply skip the dH/dt loss.
+        dhdt_path = inputs_dir / cfg.dhdt_filename
+        if dhdt_path.exists():
+            self.dhdt_data = _crop_to_factor(
+                xr.open_dataset(dhdt_path), 2 ** cfg.n_levels)
+        else:
+            self.dhdt_data = None
 
         ny, nx = self.gridded_data.sizes["y"], self.gridded_data.sizes["x"]
         dx = (self.gridded_data.x[1] - self.gridded_data.x[0]).item()
@@ -270,12 +304,18 @@ class GlacierProblem:
         smb = ImprovedTemperatureIndex(ny=ny, nx=nx, nt=12,
                                        dx=dx, dt=1.0 / 12,
                                        x0=x0, y0=y0, crs=self.crs)
+
+        if self.config.use_avalanche_model:
+            smb.avalanche = AvalancheOperator(smb.grid,
+                    s_crit=30.0, w_trans=8.0, p=1.5, K=25)
+
         gd = self.gridded_data
         smb.grid.insolation.insol_mean.set(gd.monthly_solar_potential_mean)
         smb.grid.insolation.insol_cos.set(gd.monthly_solar_potential_cos)
         smb.grid.insolation.insol_sin.set(gd.monthly_solar_potential_sin)
         smb.grid.temperature.t2m.set(gd.monthly_t2m)
         smb.grid.precipitation.precip.set(gd.monthly_precip)
+        smb.grid.geometry.srf.set(gd.elevation)
         smb.grid.insolation.rf.set(self.config.mu_rf)
         smb.grid.temperature.mf.set(self.config.mu_mf)
         smb.grid.geometry.debris.set(1.0 - self.config.debris_factor*self.debris_data.debris_fraction)
@@ -286,7 +326,10 @@ class GlacierProblem:
         gd = self.gridded_data
         domain_mask = torch.tensor(gd.domain_mask.values, device="cuda")
         rgi_mask = torch.tensor(gd.rgi_mask.values, device="cuda")
-        obs_mask = rgi_mask#differentiable_prolongation((1 - (differentiable_restriction((~rgi_mask).to(torch.float32),3,method='avg') > 0.1).to(torch.float32) ),3,mode='nearest')
+        rgi_label = torch.tensor(gd.rgi_label.values, device="cuda",dtype=torch.long)
+        rgi_label[torch.isnan(rgi_label)] = -1
+        surge_type = torch.tensor(gd.surge_type.values,device="cuda",dtype=torch.long)
+        obs_mask = rgi_mask
 
         u_obs = torch.tensor(gd.vx.values, dtype=torch.float32, device="cuda") \
             .nan_to_num().masked_fill(~domain_mask, 0.0)
@@ -307,12 +350,15 @@ class GlacierProblem:
         bed_obs = flightlines[:, 2]
 
         snow_label, snow_mask = self._build_snowline(domain_mask)
+        dhdt, dhdt_err, dhdt_mask = self._build_dhdt(domain_mask)
 
         return Observations(
             u_obs=u_obs, v_obs=v_obs, v_mask=v_mask, S_obs=S_obs, dem=dem,
             bed_obs=bed_obs, bed_normed_coords=bed_normed_coords,
-            rgi_mask=rgi_mask, obs_mask=obs_mask, domain_mask=domain_mask,
+            rgi_mask=rgi_mask, rgi_label=rgi_label, surge_type=surge_type,
+            obs_mask=obs_mask, domain_mask=domain_mask,
             snow_label=snow_label, snow_mask=snow_mask,
+            dhdt=dhdt, dhdt_err=dhdt_err, dhdt_mask=dhdt_mask,
         )
 
     def _build_snowline(self, domain_mask: torch.Tensor):
@@ -345,6 +391,38 @@ class GlacierProblem:
         snow_mask = ((glacier_fraction > 0.0) & domain_mask).to(torch.float32)
         snow_label = snow_label.masked_fill(snow_mask == 0.0, 0.0)
         return snow_label, snow_mask
+
+    def _build_dhdt(self, domain_mask: torch.Tensor):
+        """Surface elevation-change rate, its uncertainty, and a validity mask
+        on the (cropped) grid.
+
+        The Hugonnet product only covers glacierized terrain, so cells are NaN
+        off-glacier. Valid cells are those with a finite rate *and* finite
+        uncertainty, intersected with the simulation domain; that intersection
+        is the mask the (future) dH/dt misfit will reduce over. Returns
+        (None, None, None) when the domain has no product.
+        """
+        dd = self.dhdt_data
+        if dd is None:
+            return None, None, None
+
+        expected = (self.ny, self.nx)
+        if dd.dhdt.shape != expected:
+            raise ValueError(
+                f"dhdt grid {tuple(dd.dhdt.shape)} does not match the cropped "
+                f"model grid {expected}; rebuild {self.config.dhdt_filename} "
+                f"on the DEM grid."
+            )
+
+        dhdt_raw = torch.tensor(
+            dd.dhdt.values, dtype=torch.float32, device="cuda")
+        dhdt_err_raw = torch.tensor(
+            dd.dhdt_err.values, dtype=torch.float32, device="cuda")
+        valid = torch.isfinite(dhdt_raw) & torch.isfinite(dhdt_err_raw)
+        dhdt_mask = (valid & domain_mask).to(torch.float32)
+        dhdt = dhdt_raw.nan_to_num().masked_fill(dhdt_mask == 0.0, 0.0)
+        dhdt_err = dhdt_err_raw.nan_to_num().masked_fill(dhdt_mask == 0.0, 0.0)
+        return dhdt, dhdt_err, dhdt_mask
 
     def _bed_obs_raster(self) -> torch.Tensor:
         """Scatter the scattered flightline bed picks onto the finest grid.
@@ -387,6 +465,10 @@ class GlacierProblem:
         if obs.snow_label is not None:
             scalars["snow_label"] = obs.snow_label
             scalars["snow_mask"] = obs.snow_mask
+        if obs.dhdt is not None:
+            scalars["dhdt"] = obs.dhdt
+            scalars["dhdt_err"] = obs.dhdt_err
+            scalars["dhdt_mask"] = obs.dhdt_mask
         if self.debris_data is not None:
             scalars["debris_fraction"] = torch.tensor(
                 self.debris_data.debris_fraction.values,
@@ -416,9 +498,16 @@ class GlacierProblem:
         z_log_mf = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
         z_log_rf = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
 
+        # Precip-depletion scalars start at the prior mean (z = 0). Inert unless
+        # precip_lapse_enabled, but always present so save/load and the prior
+        # term stay shape-consistent across tasks.
+        z_tau = torch.zeros((), dtype=torch.float32, device="cuda")
+        z_z0 = torch.zeros((), dtype=torch.float32, device="cuda")
+
         params = WhitenedParameters(
             z_bed=z_bed, z_bed_mean=z_bed_mean, z_log_beta=z_log_beta,
             z_pbias=z_pbias, z_log_mf=z_log_mf, z_log_rf=z_log_rf,
+            z_tau=z_tau, z_z0=z_z0,
         )
         params.requires_grad_()
         return params
@@ -427,19 +516,42 @@ class GlacierProblem:
 
     def physical_from(self, params: WhitenedParameters):
         """Map whitened parameters back to physical fields. Returns a namespace
-        with (bed, bed_mean, log_beta, pbias, log_mf, log_rf)."""
+        with (bed, bed_mean, log_beta, pbias, log_mf, log_rf, tau, z0)."""
         priors = self.priors
 
         bed_mean = GGaPPMap.apply(priors.mean_model, params.z_bed_mean)
-        bed = GGaPPMap.apply(priors.bed_model, params.z_bed)# * self.observations.obs_mask.to(torch.float) + self.observations.dem*(1.0 - self.observations.obs_mask.to(torch.float)) 
+        bed = GGaPPMap.apply(priors.bed_model, params.z_bed)# * self.observations.obs_mask.to(torch.float) + self.observations.dem*(1.0 - self.observations.obs_mask.to(torch.float))
         log_beta = GGaPPMap.apply(priors.log_beta_model, params.z_log_beta)
         pbias = GGaPPMap.apply(priors.pbias_model, params.z_pbias)
         log_mf = priors.mu_log_mf + priors.sigma_log_mf * params.z_log_mf
         log_rf = priors.mu_log_rf + priors.sigma_log_rf * params.z_log_rf
+        # Precip-depletion scalars: plain affine de-whitening of a normal prior.
+        tau = priors.mu_tau + priors.sigma_tau * params.z_tau
+        z0 = priors.mu_z0 + priors.sigma_z0 * params.z_z0
         return PhysicalParameters(
             bed=bed, bed_mean=bed_mean, log_beta=log_beta,
-            pbias=pbias, log_mf=log_mf, log_rf=log_rf,
+            pbias=pbias, log_mf=log_mf, log_rf=log_rf, tau=tau, z0=z0,
         )
+
+    def effective_log_pbias(self, physical: "PhysicalParameters") -> torch.Tensor:
+        """Joint log-precip bias field (fine grid): the Matern pbias field minus
+        the optional elevation-dependent depletion ramp. This is the quantity
+        that actually multiplies precip in the forward model
+        (precip = base * exp(this)); the diagnostic VTI writes it too.
+
+        z is the static observed DEM elevation, so this field is built once per
+        forward call (not per step), avoiding the per-step VRAM blowup the precip
+        multiplier dodges. With precip_lapse_enabled=False it is exactly the
+        Matern pbias field.
+        """
+        cfg = self.config
+        log_pbias = physical.pbias
+        if cfg.precip_lapse_enabled:
+            w = cfg.precip_lapse_w
+            depletion = torch.exp(-physical.tau) * w * torch.nn.functional.softplus(
+                (self.observations.dem - physical.z0) / w)
+            log_pbias = log_pbias - depletion
+        return log_pbias
 
     def _initial_thickness_from_geometry(self, bed: torch.Tensor) -> torch.Tensor:
         """Seed integration thickness from the observed surface and the current
@@ -508,7 +620,9 @@ class GlacierProblem:
         self.update_depth(physical.bed)
         self.reset_state(level)
 
-        precip_ = self.precip * torch.exp(physical.pbias)
+        # Joint log-precip bias (Matern field minus the optional elevation
+        # depletion ramp); see effective_log_pbias for why it is static.
+        precip_ = self.precip * torch.exp(self.effective_log_pbias(physical))
         mf = torch.exp(physical.log_mf)
         rf = torch.exp(physical.log_rf)
 
@@ -597,7 +711,7 @@ class GlacierProblem:
             mask = (observations.rgi_mask * observations.domain_mask).to(torch.float32)
 
         config = self.config.at_iteration(iteration, level, schedule=schedule)
-        J_srf, J_vel, J_extent, J_bed, J_snow = compute_data_loss(
+        J_srf, J_vel, J_extent, J_bed, J_snow, J_dhdt = compute_data_loss(
             config=config,
             sim_result=sim,
             physical=physical,
@@ -617,7 +731,7 @@ class GlacierProblem:
         )
         return LossTerms(
             J_srf=J_srf, J_vel=J_vel, J_extent=J_extent, J_bed=J_bed,
-            J_snow=J_snow,
+            J_snow=J_snow, J_dhdt=J_dhdt,
             J_prior_bed=J_prior_terms[0],
             J_prior_bed_mean=J_prior_terms[1],
             J_prior_beta=J_prior_terms[2],
@@ -634,3 +748,8 @@ class PhysicalParameters:
     pbias: torch.Tensor
     log_mf: torch.Tensor
     log_rf: torch.Tensor
+    # Precip-depletion scalars. Optional so physical-space callers (sensitivity)
+    # that predate the term still construct a valid object; only read when
+    # config.precip_lapse_enabled.
+    tau: Optional[torch.Tensor] = None
+    z0: Optional[torch.Tensor] = None

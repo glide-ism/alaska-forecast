@@ -19,11 +19,13 @@ class DiagnosticFields:
     delta: Field
     srf: Field
     bed_mean: Field
-    p_bias: Field
+    p_bias: Field          # spatial (Matern) log-precip bias only
+    p_bias_total: Field    # joint bias: spatial minus elevation-depletion ramp
+    dhdt: Field
 
 
 def make_diagnostic_fields(mg_level) -> DiagnosticFields:
-    """Allocate the four diagnostic Fields on a multigrid level."""
+    """Allocate the diagnostic Fields on a multigrid level."""
     def _empty():
         return Field(
             cp.zeros((mg_level.ny, mg_level.nx), dtype=cp.float32),
@@ -31,7 +33,8 @@ def make_diagnostic_fields(mg_level) -> DiagnosticFields:
             dx=mg_level.dx,
             grid=mg_level,
         )
-    return DiagnosticFields(delta=_empty(), srf=_empty(), bed_mean=_empty(), p_bias=_empty())
+    return DiagnosticFields(delta=_empty(), srf=_empty(), bed_mean=_empty(),
+                            p_bias=_empty(), p_bias_total=_empty(), dhdt=_empty())
 
 
 def make_loss_vti_writer(mg_level, output_dir: str, base: str, diag: DiagnosticFields) -> VTIWriter:
@@ -47,7 +50,9 @@ def make_loss_vti_writer(mg_level, output_dir: str, base: str, diag: DiagnosticF
             "srf": diag.srf,
             "delta": diag.delta,
             "p_bias": diag.p_bias,
+            "p_bias_total": diag.p_bias_total,
             "bed_mean": diag.bed_mean,
+            "dhdt": diag.dhdt,
             "smb": mg_level.forcing.smb,
         },
     )
@@ -101,12 +106,22 @@ def write_static_vti(mg_level, output_dir: str, base: str,
     writer.write_pvd()
 
 
-def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbias_) -> None:
-    """Copy detached tensors into the cupy-backed diagnostic Fields."""
+def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbias_,
+                             pbias_total_, dhdt_) -> None:
+    """Copy detached tensors into the cupy-backed diagnostic Fields.
+
+    `pbias_` is the spatial (Matern) log-precip bias; `pbias_total_` is the joint
+    bias actually applied to precip (spatial minus the elevation-depletion ramp),
+    equal to `pbias_` when precip_lapse_enabled is False. `dhdt_` is the model's
+    coarse-grid surface elevation-change rate (m/yr) for this iterate, i.e.
+    (H - H_prev) / dt at the current multigrid level.
+    """
     diag.delta.data[:, :] = cp.asarray(S_.detach() - S_obs_)
     diag.srf.data[:, :] = cp.asarray(S_.detach())
     diag.bed_mean.data[:, :] = cp.asarray(bed_mean_.detach())
     diag.p_bias.data[:, :] = cp.asarray(pbias_.detach())
+    diag.p_bias_total.data[:, :] = cp.asarray(pbias_total_.detach())
+    diag.dhdt.data[:, :] = cp.asarray(dhdt_.detach())
 
 
 def save_whitened_params(params, path: str, *, extras: dict = None) -> None:
@@ -123,6 +138,8 @@ def save_whitened_params(params, path: str, *, extras: dict = None) -> None:
         "precipitation_bias": params.z_pbias,
         "log_rf": params.z_log_rf,
         "log_mf": params.z_log_mf,
+        "tau": params.z_tau,
+        "z0": params.z_z0,
     }
     if extras:
         payload.update(extras)
@@ -140,3 +157,10 @@ def load_whitened_params_into(params, path: str) -> None:
     params.z_pbias = d["precipitation_bias"].requires_grad_()
     params.z_log_rf = d["log_rf"].requires_grad_()
     params.z_log_mf = d["log_mf"].requires_grad_()
+    # Precip-depletion scalars are newer than the original checkpoint format;
+    # keep the freshly-initialized values when warm-starting from a MAP that
+    # predates them.
+    if "tau" in d:
+        params.z_tau = d["tau"].requires_grad_()
+    if "z0" in d:
+        params.z_z0 = d["z0"].requires_grad_()

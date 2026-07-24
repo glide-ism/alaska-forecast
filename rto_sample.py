@@ -23,23 +23,23 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/delta"
+DOMAIN = "domains/st_elias"
 config = load_config(DOMAIN)
 
 
 INPUT_PATH = config.output_dir
-WARM_START_PATH = f"{INPUT_PATH}/level_2/torch_vars.p"
+WARM_START_PATH = f"{INPUT_PATH}/level_3/torch_vars.p"
 
-N_SAMPLES = 250
-LEVEL = 2
-ITERS_PER_SAMPLE = 50
+N_SAMPLES = 100
+LEVEL = 3
+ITERS_PER_SAMPLE = 100
 
 # Cosine learning-rate decay applied per-sample. Each parameter group's LR
 # anneals from its base value down to LR_FINAL_RATIO * base_lr over
 # ITERS_PER_SAMPLE iterations, which damps end-of-run oscillation around the
 # perturbed MAP. Set LR_FINAL_RATIO = 1.0 to disable; lower it (e.g. 0.001)
 # to settle harder.
-LR_FINAL_RATIO = 0.01
+LR_FINAL_RATIO = 1.0
 
 
 def cosine_ratio(step: int) -> float:
@@ -131,7 +131,7 @@ class InitScheme:
     """
     z_bed:      Init = Init.MAP
     z_bed_mean: Init = Init.MAP_PLUS_SAMPLE
-    z_log_beta: Init = Init.MAP_PLUS_SAMPLE
+    z_log_beta: Init = Init.MAP#_PLUS_SAMPLE
     z_pbias:    Init = Init.MAP_PLUS_SAMPLE
     z_log_mf:   Init = Init.MAP_PLUS_SAMPLE
     z_log_rf:   Init = Init.MAP_PLUS_SAMPLE
@@ -172,8 +172,12 @@ noise_source = NoiseSource(NOISE_SCHEME, sobol_dim=SOBOL_DIM, seed=SOBOL_SEED)
 def write_loss_vti(diag, vti_writer, sim, physical, observations, i):
     bed_mean_coarse = differentiable_restriction(physical.bed_mean, LEVEL)
     pbias_coarse = differentiable_restriction(physical.pbias, LEVEL)
+    pbias_total_coarse = differentiable_restriction(
+        problem.effective_log_pbias(physical), LEVEL)
     S_obs_coarse = differentiable_restriction(observations.S_obs, LEVEL)
-    update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse, pbias_coarse)
+    dhdt_coarse = (sim.H - sim.H_prev) / config.dt
+    update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
+                             pbias_coarse, pbias_total_coarse, dhdt_coarse)
     vti_writer.append(problem.mg[LEVEL], time=i)
     vti_writer.write_pvd()
 
@@ -184,7 +188,7 @@ for f in INIT_SCHEME.__dataclass_fields__:
 print(f"Noise scheme:  {NOISE_SCHEME.value}"
       + (f"  (Sobol d={noise_source.sobol_d})" if noise_source.engine else ""))
 
-for sample_idx in range(28,N_SAMPLES):
+for sample_idx in range(N_SAMPLES):
     output_path = f"{INPUT_PATH}/rto_lr_decay/rto_{sample_idx:04d}/"
     print(f"\n=== Sample {sample_idx + 1}/{N_SAMPLES}  →  rto_{sample_idx} ===")
 
@@ -221,17 +225,17 @@ for sample_idx in range(28,N_SAMPLES):
         initialize_param(name, params, warm_start, prior_means,
                          getattr(INIT_SCHEME, name))
 
-    fac = 2.0
+    fac = 1.0
     optimizer_sgd = torch.optim.SGD([
-        {"params": params.z_bed,      "lr": fac * 0.2},
-        {"params": params.z_bed_mean, "lr": fac * 1.0},
-        {"params": params.z_log_beta, "lr": fac * 0.75},
+        {"params": params.z_bed,      "lr": fac * config.lr_z_bed},
+        {"params": params.z_bed_mean, "lr": fac * config.lr_z_bed_mean},
+        {"params": params.z_log_beta, "lr": fac * config.lr_z_log_beta},
     ], momentum=0.5)
 
     optimizer_adam = torch.optim.Adam([
-        {"params": params.z_pbias,  "lr": fac * 0.0003},
-        {"params": params.z_log_mf, "lr": fac * 0.01},
-        {"params": params.z_log_rf, "lr": fac * 0.01},
+        {"params": params.z_pbias,  "lr": fac * config.lr_z_pbias},
+        {"params": params.z_log_mf, "lr": fac * config.lr_z_log_mf},
+        {"params": params.z_log_rf, "lr": fac * config.lr_z_log_rf},
     ], betas=(0.5, 0.99))
 
     # LambdaLR multiplies each param group's base LR by cosine_ratio(step),

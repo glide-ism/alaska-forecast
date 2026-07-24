@@ -16,7 +16,7 @@ from glacier_inverse import load_config
 from glacier_inverse.priors import GlacierPriors, domain_shape
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/delta"
+DOMAIN = "domains/st_elias"
 config = load_config(DOMAIN)
 
 
@@ -34,7 +34,7 @@ log_rfs = []
 
 for d in Path(f"{INPUT_PATH}/rto_lr_decay/").iterdir():
     try:
-        data = torch.load(f"{d}/level_2/torch_vars.p")
+        data = torch.load(f"{d}/level_3/torch_vars.p")
         beds.append(GGaPPMap.apply(priors.bed_model, data["bed"]).cpu().detach())
         pbiases.append(GGaPPMap.apply(priors.pbias_model, data["precipitation_bias"]).cpu().detach())
         log_betas.append(GGaPPMap.apply(priors.log_beta_model, data["log_beta"]).cpu().detach())
