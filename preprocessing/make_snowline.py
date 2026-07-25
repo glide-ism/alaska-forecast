@@ -38,6 +38,21 @@ NODATA_CODE = 0
 ICE_CODE = 1
 SNOW_CODE = 2
 
+# Fallback averaging window when it cannot be parsed from the source
+# directory name (e.g. '2018-2022-average'). The nominal time is the window
+# midpoint; the inverse model compares against its end-of-summer SMB there.
+DEFAULT_TIME_START = 2018.0
+DEFAULT_TIME_END = 2022.0
+
+
+def _window_from_dirname(snowline_dir: Path) -> tuple:
+    """Parse (time_start, time_end) from a 'YYYY-YYYY...' directory name."""
+    import re
+    m = re.match(r'^(\d{4})-(\d{4})', snowline_dir.name)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    return DEFAULT_TIME_START, DEFAULT_TIME_END
+
 
 def _intersecting_tiles(snowline_dir, bounds, target_crs):
     """Return the snowline tiles whose footprint intersects `bounds`.
@@ -147,6 +162,15 @@ def build_snowline(domain_path: str, snowline_dir: str = None) -> xr.Dataset:
         'long_name': 'Fraction of coarse cell with valid snowline classification',
         'units': 'dimensionless',
     }
+    t_start, t_end = _window_from_dirname(snowline_dir)
+    time_attrs = {
+        'time_nominal': 0.5 * (t_start + t_end),
+        'time_start': t_start,
+        'time_end': t_end,
+    }
+    for name in ('snow_ice', 'snow_fraction', 'ice_fraction',
+                 'glacier_fraction'):
+        snowline_ds[name].attrs.update(time_attrs)
     snowline_ds.attrs['snowline_source'] = str(snowline_dir)
     snowline_ds.attrs['snowline_tiles'] = len(tiles)
 

@@ -9,9 +9,14 @@ cheap consistency checks:
   3. GGaPPWhiten/GGaPPMap round-trip is approximate identity in both
      directions, for every field prior.
   4. Initial whitened parameters all live on CUDA with requires_grad=True.
-  5. Observations are on CUDA and have shapes matching the domain.
-  6. A single forward step at the coarsest level produces finite outputs and
-     is differentiable end-to-end (gradient flows back to z_bed).
+  5. The step scheduler snaps onto required times, extends the horizon, and
+     rejects impossible requests (pure CPU checks).
+  6. Observations built from the config specs are on CUDA, shaped to the
+     domain, and carry acquisition times (from file attrs or the t_end
+     fallback).
+  7. A short forward run at the coarsest level emits a state snapshot at
+     every required observation time, produces finite loss terms, and is
+     differentiable end-to-end — including through a non-final snapshot.
 
 Prints PASS/FAIL per check; exits non-zero on any failure.
 
@@ -28,6 +33,7 @@ import torch
 from ggapp.torch import GGaPPMap, GGaPPWhiten
 
 from glacier_inverse import GlacierProblem, load_config
+from glacier_inverse.scheduling import build_step_sequence, merge_times
 
 # Domain to smoke-test. Override at the call site if you want a different one.
 SMOKE_DOMAIN = "domains/wrangell"
@@ -73,9 +79,14 @@ def main() -> int:
     priors = problem.priors
 
     def _prior_matches(model, expected, label):
-        got_sigma = float(model.mg.parameters.sigma.value)
-        got_l = float(model.mg.parameters.l.value)
-        got_nu = float(model.mg.parameters.nu.value)
+        try:
+            got_sigma = float(model.mg.parameters.sigma.value)
+            got_l = float(model.mg.parameters.l.value)
+            got_nu = float(model.mg.parameters.nu.value)
+        except AttributeError:
+            print(f"  [SKIP] {label}: installed ggapp does not expose "
+                  f"mg.parameters.*.value; hyperparameters not introspectable")
+            return
         ok = (got_sigma == expected.sigma
               and got_l == expected.l
               and got_nu == float(expected.nu))
@@ -118,76 +129,150 @@ def main() -> int:
               tensor.is_cuda and tensor.requires_grad,
               f"device={tensor.device}, requires_grad={tensor.requires_grad}")
 
-    header("5. Observations")
-    obs = problem.observations
-    for name, tensor, expected_shape in [
-        ("u_obs",       obs.u_obs,       (problem.ny, problem.nx)),
-        ("v_obs",       obs.v_obs,       (problem.ny, problem.nx)),
-        ("S_obs",       obs.S_obs,       (problem.ny, problem.nx)),
-        ("rgi_mask",    obs.rgi_mask,    (problem.ny, problem.nx)),
-        ("domain_mask", obs.domain_mask, (problem.ny, problem.nx)),
-    ]:
-        check(f"{name} shape == {expected_shape} and on cuda",
-              tuple(tensor.shape) == expected_shape and tensor.is_cuda,
-              f"got shape={tuple(tensor.shape)}, device={tensor.device}")
-    check("bed_obs is 1-D on cuda",
-          obs.bed_obs.ndim == 1 and obs.bed_obs.is_cuda,
-          f"shape={tuple(obs.bed_obs.shape)}, device={obs.bed_obs.device}")
-    check("bed_normed_coords is (N, 2) on cuda",
-          obs.bed_normed_coords.ndim == 2
-          and obs.bed_normed_coords.shape[1] == 2
-          and obs.bed_normed_coords.is_cuda,
-          f"shape={tuple(obs.bed_normed_coords.shape)}")
+    header("5. Step scheduler")
+    steps = build_step_sequence(t_start=1012.0, t_end=2012.0, dt_max=20.0)
+    check("uniform legacy grid: 50 steps of dt=20 ending at 2012",
+          len(steps) == 50 and steps[-1] == (2012.0, 20.0),
+          f"n={len(steps)}, last={steps[-1]}")
 
-    if obs.snow_label is not None:
-        dom = (problem.ny, problem.nx)
+    req = [2000.0, 2013.0, 2015.0, 2020.0]
+    steps = build_step_sequence(t_start=1012.0, t_end=2012.0, dt_max=20.0,
+                                required_times=req)
+    times = [t for t, _ in steps]
+    check("required times snapped exactly; horizon extended past t_end",
+          all(r in times for r in req) and times[-1] == 2020.0,
+          f"tail={times[-5:]}")
+    check("all dt positive and <= dt_max",
+          all(0 < dt <= 20.0 + 1e-9 for _, dt in steps))
+
+    try:
+        build_step_sequence(t_start=1012.0, t_end=2012.0, dt_max=20.0,
+                            required_times=[1000.0])
+        check("required time <= t_start raises", False)
+    except ValueError:
+        check("required time <= t_start raises", True)
+
+    check("merge_times dedupes within eps",
+          merge_times([2000.0, 2000.0 + 1e-9], [2013.0], None)
+          == (2000.0, 2013.0))
+
+    header("6. Observations")
+    obs_names = [o.name for o in problem.observations]
+    print(f"  products: {obs_names}")
+    check("at least srf/vel/extent/bed present",
+          {"srf", "vel", "extent", "bed"} <= set(obs_names))
+
+    dom_shape = (problem.ny, problem.nx)
+    domain = problem.domain
+    for name, tensor in [("dem", domain.dem),
+                         ("rgi_mask", domain.rgi_mask),
+                         ("domain_mask", domain.domain_mask)]:
+        check(f"domain.{name} shape == {dom_shape} and on cuda",
+              tuple(tensor.shape) == dom_shape and tensor.is_cuda,
+              f"got shape={tuple(tensor.shape)}, device={tensor.device}")
+
+    srf = problem.get_observation("srf")
+    vel = problem.get_observation("vel")
+    check("S_obs shape == domain and on cuda",
+          tuple(srf.S_obs.shape) == dom_shape and srf.S_obs.is_cuda)
+    check("u_obs/v_obs shape == domain and on cuda",
+          tuple(vel.u_obs.shape) == dom_shape and vel.u_obs.is_cuda
+          and tuple(vel.v_obs.shape) == dom_shape)
+
+    bed = problem.get_observation("bed")
+    check("bed_obs is 1-D on cuda",
+          bed.bed_obs.ndim == 1 and bed.bed_obs.is_cuda,
+          f"shape={tuple(bed.bed_obs.shape)}")
+    check("bed_normed_coords is (N, 2) on cuda",
+          bed.bed_normed_coords.ndim == 2
+          and bed.bed_normed_coords.shape[1] == 2
+          and bed.bed_normed_coords.is_cuda,
+          f"shape={tuple(bed.bed_normed_coords.shape)}")
+    check("bed observation is time-independent", bed.required_times == ())
+
+    snow = problem.get_observation("snow")
+    if snow is not None:
         check("snow_label shape == domain, in [0,1], on cuda",
-              tuple(obs.snow_label.shape) == dom and obs.snow_label.is_cuda
-              and obs.snow_label.min() >= 0.0 and obs.snow_label.max() <= 1.0,
-              f"shape={tuple(obs.snow_label.shape)}, "
-              f"range=[{obs.snow_label.min():.3f}, {obs.snow_label.max():.3f}]")
+              tuple(snow.snow_label.shape) == dom_shape and snow.snow_label.is_cuda
+              and snow.snow_label.min() >= 0.0 and snow.snow_label.max() <= 1.0,
+              f"range=[{snow.snow_label.min():.3f}, {snow.snow_label.max():.3f}]")
         check("snow_mask is 0/1 with some valid cells",
-              tuple(obs.snow_mask.shape) == dom
-              and set(obs.snow_mask.unique().tolist()) <= {0.0, 1.0}
-              and obs.snow_mask.sum() > 0,
-              f"valid cells = {int(obs.snow_mask.sum())}")
+              set(snow.snow_mask.unique().tolist()) <= {0.0, 1.0}
+              and snow.snow_mask.sum() > 0,
+              f"valid cells = {int(snow.snow_mask.sum())}")
     else:
         print("  [SKIP] no snowline product for this domain")
 
-    header("6. Single forward step at coarsest level")
+    dhdt = problem.get_observation("dhdt")
+    if dhdt is not None:
+        mode = ("legacy final-step" if dhdt.legacy_final_step
+                else f"two-snapshot [{dhdt.t0}, {dhdt.t1}]")
+        print(f"  dhdt mode: {mode}")
+    else:
+        print("  [SKIP] no dhdt product for this domain")
+
+    required = problem.required_times
+    check("every timed observation's epoch is in required_times",
+          all(t in required for o in problem.observations
+              for t in o.required_times),
+          f"required_times={required}")
+
+    header("7. Short forward run at coarsest level")
     level = config.n_levels - 1  # 5 for default n_levels=6
     problem.model.set_top_level(level)
+    # Start a few coarse steps before the first observation epoch so the run
+    # covers every required time; also request one mid-run snapshot to test
+    # non-final-state emission even when all products sit at a single epoch.
+    t_first = min(required) if required else config.t_end
+    t_start = t_first - 3 * config.dt
+    t_probe = t_first - config.dt
     try:
         sim, physical = problem.simulate(
             level=level,
             params=params,
-            t_start=config.t_end - config.dt,   # exactly one step
-            t_end=config.t_end,
+            t_start=t_start,
+            record_states_at=list(required) + [t_probe],
         )
     except Exception as e:
         traceback.print_exc()
-        check("simulate() runs one step", False, str(e))
+        check("simulate() runs", False, str(e))
         return 1 if _failures else 0
 
-    H_finite = torch.isfinite(sim.H).all().item()
-    u_finite = torch.isfinite(sim.u).all().item()
-    v_finite = torch.isfinite(sim.v).all().item()
-    check("sim.H finite",  H_finite)
-    check("sim.u finite",  u_finite)
-    check("sim.v finite",  v_finite)
+    check("a state was recorded at every required time",
+          all(any(abs(ts - t) < 1e-6 for ts in sim.states) for t in required),
+          f"recorded={sorted(sim.states.keys())}")
+    check("run reached the horizon",
+          sim.final.t >= max([config.t_end] + list(required)) - 1e-6,
+          f"final t={sim.final.t}")
+    check("sim.H finite", torch.isfinite(sim.H).all().item())
+    check("sim.u finite", torch.isfinite(sim.u).all().item())
+    check("sim.v finite", torch.isfinite(sim.v).all().item())
+
+    # Gradient through a non-final snapshot only.
+    probe = sim.at(t_probe).H_fine.sum()
+    probe.backward(retain_graph=True)
+    check("gradient reaches z_bed through a NON-final snapshot",
+          params.z_bed.grad is not None
+          and torch.isfinite(params.z_bed.grad).all().item()
+          and params.z_bed.grad.abs().sum() > 0,
+          f"|grad|_1 = {params.z_bed.grad.abs().sum().item():.3e}"
+          if params.z_bed.grad is not None else "no grad")
+    params.z_bed.grad = None
 
     loss_terms = problem.compute_loss(
         sim=sim, physical=physical, params=params)
     J = loss_terms.J
-    check("loss is finite", torch.isfinite(J).item(),
-          f"J = {J.item():.4f}")
-    check("snowline term is finite",
-          torch.isfinite(torch.as_tensor(loss_terms.J_snow)).item(),
-          f"J_snow = {float(loss_terms.J_snow):.4f}")
-    if obs.snow_label is not None:
+    check("loss is finite", torch.isfinite(J).item(), f"J = {J.item():.4f}")
+    for name, term in loss_terms.data_terms.items():
+        check(f"{name} term is finite",
+              torch.isfinite(torch.as_tensor(term)).item(),
+              f"J_{name} = {float(term):.4f}")
+    if snow is not None:
         check("snowline term is active (non-zero)",
-              float(loss_terms.J_snow) != 0.0,
-              f"J_snow = {float(loss_terms.J_snow):.4f}")
+              float(loss_terms.data_terms["snow"]) != 0.0)
+    if dhdt is not None:
+        check("dhdt term is active (non-zero)",
+              float(loss_terms.data_terms["dhdt"]) != 0.0)
 
     J.backward()
     check("z_bed received a finite gradient",

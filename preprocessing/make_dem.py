@@ -54,6 +54,23 @@ NOAA_BAG_DIRECTORY = Path('../common_data/dem/bathy/bags')
 GRID_RESOLUTION_M = 90.0
 DEM_TYPE = 'COP90'
 
+# Acquisition epochs, written as variable-level attrs so the inverse model
+# compares each product against its state at the right calendar time.
+# COP90 (Copernicus GLO-90) derives from TanDEM-X acquisitions 2011-2015.
+DEM_TIME_ATTRS = {
+    'time_nominal': 2013.0,
+    'time_start': 2011.0,
+    'time_end': 2015.0,
+}
+# RGI v7 Alaska outlines derive from ~2000s Landsat imagery; the nominal year
+# below is an approximate regional median — refine per domain if needed (the
+# extent misfit is evaluated at this time).
+RGI_TIME_ATTRS = {
+    'time_nominal': 2008.0,
+    'time_start': 2000.0,
+    'time_end': 2013.0,
+}
+
 # Number of points sampled along each edge of the projected bbox when
 # back-projecting to lat/lon. 100 is plenty for Alaska Albers, where the
 # bbox edges are nearly straight in lat/lon space.
@@ -354,6 +371,12 @@ def build_dem(domain_path: str) -> xr.Dataset:
         dims=('glacier',),
         coords={'glacier': np.arange(len(glaciers_in_grid), dtype='int32')},
     )
+
+    # Acquisition-time attrs (variable-level so they survive xr.merge).
+    for name in ('elevation', 'topography'):
+        dem_ds[name].attrs.update(DEM_TIME_ATTRS)
+    for name in ('rgi_mask', 'rgi_label', 'surge_type'):
+        dem_ds[name].attrs.update(RGI_TIME_ATTRS)
 
     dem_ds.to_netcdf(output_path)
     return dem_ds

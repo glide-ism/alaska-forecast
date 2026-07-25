@@ -11,10 +11,9 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Union
 
 # The GlacierConfig fields that may be given as a schedule instead of a constant.
-SCHEDULABLE_WEIGHTS = (
-    "loss_scale", "lambda_s", "lambda_u", "lambda_e", "lambda_bed", "lambda_snow",
-    "lambda_dhdt",
-)
+# Per-observation weights are also schedulable, but live on the observation
+# specs (see observations.py) and are resolved by Observation.weight_at.
+SCHEDULABLE_WEIGHTS = ("loss_scale",)
 
 
 def _accepts_two_positional(fn: Callable) -> bool:
@@ -142,34 +141,22 @@ class GlacierConfig:
     mu_z0:     float = 2000.0       # m, prior mean of depletion-onset elevation
     sigma_z0:  float = 500.0
 
-    # Observation noise
-    sigma_s: float = 10.0
-    sigma_u: float = 10.0
-    sigma_bed: float = 10.0
-    sigma_dhdt: float = 0.5
+    # Observations. A tuple of frozen spec objects (SurfaceSpec, VelocitySpec,
+    # ExtentSpec, BedSpec, SnowlineSpec, DhdtSpec — see observations.py), each
+    # carrying its own noise sigma, loss weight (constant or Schedule), and
+    # optional acquisition-time override; acquisition times normally come from
+    # variable-level attrs on the input files. None selects the standard six
+    # products with library-default hyperparameters. GlacierProblem builds the
+    # loaded Observation objects from these specs; products whose input file
+    # is absent are skipped gracefully.
+    observations: tuple = None
 
-    # Loss weights. lambda_bed unified to 2e-5 (was 1e-5 in pre-refactor rto_sample.py).
-    # Each of these may be a constant, or a Schedule(final=, ramp=) for
-    # continuation during the initial inverse solve only. The steady-state `final`
-    # is the value RTO / posterior / sensitivity see, so all tasks target the same
-    # objective; only inverse.py honors the ramp. See GlacierConfig.at_iteration.
+    # Global loss scale. May be a constant, or a Schedule(final=, ramp=) for
+    # continuation during the initial inverse solve only. The steady-state
+    # `final` is the value RTO / posterior / sensitivity see, so all tasks
+    # target the same objective; only inverse.py honors the ramp. Per-product
+    # weights follow the same contract but live on the observation specs.
     loss_scale:  LossWeight = 1e-4
-    lambda_s:    LossWeight = 2e-5
-    lambda_u:    LossWeight = 2e-5
-    lambda_e:    LossWeight = 2e-4
-    lambda_bed:  LossWeight = 2e-5
-    lambda_snow: LossWeight = 2e-4    # weight on the snowline (ELA) BCE term
-    lambda_dhdt: LossWeight = 2e-5    # weight on the dH/dt (elevation-change) term
-    nu_s:   float = 1.0
-    nu_u:   float = 1.0
-    nu_bed: float = 1.0
-    nu_dhdt: float = 1.0
-
-    s_H:    float = 10.0
-    s_smb:  float = 0.2
-    # SMB -> logit scale for the snowline term. The model SMB (m ice-eq/yr)
-    # is divided by this before the sigmoid, so sigmoid(SMB / s_smb) reads as
-    # P(cell is above the ELA, i.e. in the accumulation area).
 
     # Ice rheology
     rho_ice:  float = 917.0
@@ -182,6 +169,7 @@ class GlacierConfig:
     # Sliding
     beta_init:   float = 2.0
     sliding_m:   float = 1.0 / 3.0
+    u_reg:       float = 1.0
     water_drag:  float = 0.01
 
     # Calving / geometry
@@ -195,7 +183,6 @@ class GlacierConfig:
     init_from_observed_geometry: bool = False
     init_H_floor: float = 0.1    # minimum/ice-free thickness used when seeding
     use_avalanche_model: bool = False
-    surge_biased_likelihood: bool = False
 
     # Solver settings
     forward_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
@@ -256,9 +243,10 @@ class GlacierConfig:
         steady-state `final`, so every task targets the same objective. When
         `schedule` is True (the initial inverse solve) Schedule ramps and bare
         callables are evaluated as f(i, level) / f(i). Called per optimizer step
-        by GlacierProblem.compute_loss. A domain config may set e.g.
-        `lambda_snow=Schedule(final=2e-4, ramp=lambda i: 0.0 if i < 100 else 2e-4)`
-        or, level-aware, `ramp=lambda i, level: 0.0 if level > 0 else 2e-4`.
+        by GlacierProblem.compute_loss. Per-observation weights follow the same
+        contract but are resolved by Observation.weight_at — a domain config may
+        set e.g. `SnowlineSpec(weight=Schedule(final=2e-4,
+        ramp=lambda i, level: 0.0 if level > 0 else 2e-4))`.
         """
         overrides = {name: resolve_weight(getattr(self, name), iteration, level,
                                           schedule=schedule)

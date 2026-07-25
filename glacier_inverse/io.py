@@ -113,8 +113,10 @@ def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbia
     `pbias_` is the spatial (Matern) log-precip bias; `pbias_total_` is the joint
     bias actually applied to precip (spatial minus the elevation-depletion ramp),
     equal to `pbias_` when precip_lapse_enabled is False. `dhdt_` is the model's
-    coarse-grid surface elevation-change rate (m/yr) for this iterate, i.e.
-    (H - H_prev) / dt at the current multigrid level.
+    coarse-grid surface elevation-change rate (m/yr) for this iterate over the
+    same interval the dhdt misfit uses — DhdtObservation.model_rate(sim,
+    "coarse"): the observation window (H(t1) - H(t0))/(t1 - t0) in two-snapshot
+    mode, or the true final step in legacy/no-product mode.
     """
     diag.delta.data[:, :] = cp.asarray(S_.detach() - S_obs_)
     diag.srf.data[:, :] = cp.asarray(S_.detach())

@@ -55,8 +55,18 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     pbias_coarse = differentiable_restriction(physical.pbias, level)
     pbias_total_coarse = differentiable_restriction(
         problem.effective_log_pbias(physical), level)
-    S_obs_coarse = differentiable_restriction(problem.observations.S_obs, level)
-    dhdt_coarse = (sim.H - sim.H_prev) / config.dt
+    S_obs_coarse = differentiable_restriction(
+        torch.clamp(problem.domain.dem, min=0.0), level)
+    # The model rate over the same interval the dhdt misfit uses (the
+    # observation window in two-snapshot mode, the true final step in legacy
+    # mode), so the VTI field is directly comparable to the observed raster.
+    # Without a dhdt product, fall back to the final-step rate as a
+    # near-steady-state diagnostic.
+    dhdt_obs = problem.get_observation("dhdt")
+    if dhdt_obs is not None:
+        dhdt_coarse = dhdt_obs.model_rate(sim, "coarse")
+    else:
+        dhdt_coarse = (sim.H - sim.H_prev) / sim.final.dt_step
     update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
                              pbias_coarse, pbias_total_coarse, dhdt_coarse)
     vti_writer.append(problem.mg[level], time=i)

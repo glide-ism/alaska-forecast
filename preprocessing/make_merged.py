@@ -31,6 +31,14 @@ def build_merged(domain_path: str) -> xr.Dataset:
 
     merged = xr.merge([geometry, velocity, snowline, debris, dhdt, insolation,
                        climate, climate_era5land])
+
+    # The inverse model reads acquisition times from variable-level attrs;
+    # guard against a future merge/encoding change silently dropping them.
+    for var in ('elevation', 'vx', 'rgi_mask', 'snow_fraction', 'dhdt'):
+        if var in merged and 'time_nominal' not in merged[var].attrs:
+            print(f"Warning: {var} lost its time attrs in the merge; "
+                  f"the inverse model will fall back to t_end for it.")
+
     merged.to_netcdf(output_path)
     return merged
 
