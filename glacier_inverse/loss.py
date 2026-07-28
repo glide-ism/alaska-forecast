@@ -38,6 +38,11 @@ class PriorMeans:
     # default to a zero mean — i.e. no per-sample perturbation.
     z_tau:        Optional[torch.Tensor] = None
     z_z0:         Optional[torch.Tensor] = None
+    # Enthalpy-model scalars: same status as tau/z0 — zero mean until the RTO
+    # migration wires them into sample_like (new draws appended AFTER the
+    # existing draw order).
+    z_log_H_atm:   Optional[torch.Tensor] = None
+    z_logit_cloud: Optional[torch.Tensor] = None
 
     @classmethod
     def zeros(cls) -> "PriorMeans":
@@ -64,7 +69,7 @@ class PriorMeans:
 # fall back to the raw key so custom observations still log.
 _LOG_LABELS = {
     "srf": "Srf", "vel": "U", "extent": "Ext",
-    "bed": "Bed", "snow": "Snow", "dhdt": "dHdt",
+    "bed": "Bed", "snow": "Snow", "dhdt": "dHdt", "divide": "Div",
 }
 
 
@@ -209,10 +214,13 @@ def compute_prior(
     J_prior_beta = scale * ((params.z_log_beta - prior_means.value("z_log_beta", params.z_log_beta)) ** 2).sum()
     J_prior_pbias = scale * ((params.z_pbias - prior_means.value("z_pbias", params.z_pbias)) ** 2).sum()
     # Standard-normal whitened priors on every scalar, including the precip-
-    # depletion tau/z0 (inert when the term is disabled: those z stay at 0).
+    # depletion tau/z0 and the enthalpy-model H_atm/cloud pair (each inert when
+    # its model/term is disabled: those z stay at 0).
     J_prior_smb = scale * ((params.z_log_rf - prior_means.value("z_log_rf", params.z_log_rf)) ** 2
                    + (params.z_log_mf - prior_means.value("z_log_mf", params.z_log_mf)) ** 2
                    + (params.z_tau - prior_means.value("z_tau", params.z_tau)) ** 2
-                   + (params.z_z0 - prior_means.value("z_z0", params.z_z0)) ** 2)
+                   + (params.z_z0 - prior_means.value("z_z0", params.z_z0)) ** 2
+                   + (params.z_log_H_atm - prior_means.value("z_log_H_atm", params.z_log_H_atm)) ** 2
+                   + (params.z_logit_cloud - prior_means.value("z_logit_cloud", params.z_logit_cloud)) ** 2)
 
     return J_prior_bed, J_prior_bed_mean, J_prior_beta, J_prior_pbias, J_prior_smb

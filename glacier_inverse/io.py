@@ -142,6 +142,8 @@ def save_whitened_params(params, path: str, *, extras: dict = None) -> None:
         "log_mf": params.z_log_mf,
         "tau": params.z_tau,
         "z0": params.z_z0,
+        "log_H_atm": params.z_log_H_atm,
+        "logit_cloud": params.z_logit_cloud,
     }
     if extras:
         payload.update(extras)
@@ -159,10 +161,14 @@ def load_whitened_params_into(params, path: str) -> None:
     params.z_pbias = d["precipitation_bias"].requires_grad_()
     params.z_log_rf = d["log_rf"].requires_grad_()
     params.z_log_mf = d["log_mf"].requires_grad_()
-    # Precip-depletion scalars are newer than the original checkpoint format;
-    # keep the freshly-initialized values when warm-starting from a MAP that
-    # predates them.
+    # Precip-depletion and enthalpy-model scalars are newer than the original
+    # checkpoint format; keep the freshly-initialized values (prior median)
+    # when warm-starting from a MAP that predates them.
     if "tau" in d:
         params.z_tau = d["tau"].requires_grad_()
     if "z0" in d:
         params.z_z0 = d["z0"].requires_grad_()
+    if "log_H_atm" in d:
+        params.z_log_H_atm = d["log_H_atm"].requires_grad_()
+    if "logit_cloud" in d:
+        params.z_logit_cloud = d["logit_cloud"].requires_grad_()

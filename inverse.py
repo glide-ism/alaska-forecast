@@ -5,6 +5,7 @@ Thin driver over glacier_inverse. All physical hyperparameters live in
 domains/<name>/config.py — per-task knobs (output path, max iters,
 learning rates) stay here.
 """
+import cupy as cp
 import torch
 import xarray as xr
 
@@ -16,7 +17,7 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/delta"
+DOMAIN = "domains/st_elias"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir
@@ -39,9 +40,19 @@ optimizer_sgd = torch.optim.SGD([
 
 adam_groups = [
     {"params": params.z_pbias,  "lr": config.lr_z_pbias},
-    {"params": params.z_log_mf, "lr": config.lr_z_log_mf},
-    {"params": params.z_log_rf, "lr": config.lr_z_log_rf},
 ]
+if config.smb_model == "enthalpy":
+    # Enthalpy SMB scalars replace the temperature-index mf/rf pair — the
+    # inactive model's z never enter the forward graph and get no gradient.
+    adam_groups += [
+        {"params": params.z_log_H_atm,   "lr": config.lr_z_log_H_atm},
+        {"params": params.z_logit_cloud, "lr": config.lr_z_logit_cloud},
+    ]
+else:
+    adam_groups += [
+        {"params": params.z_log_mf, "lr": config.lr_z_log_mf},
+        {"params": params.z_log_rf, "lr": config.lr_z_log_rf},
+    ]
 if config.precip_lapse_enabled:
     # Elevation-dependent precip depletion: learn tau/z0 in the Adam block.
     adam_groups += [
@@ -99,6 +110,18 @@ for level in range(config.max_level, config.min_level - 1, -1):
         loss_terms.J.backward()
         optimizer_sgd.step()
         optimizer_adam.step()
+
+        # Drop this iteration's snapshots/graph now: `sim` pins fine-grid
+        # tensors per observation epoch, and letting them survive into the
+        # next simulate() call doubles the snapshot footprint.
+        del sim, physical, loss_terms
+
+        # Return freed blocks to the driver: torch and cupy each hoard their
+        # own caching pool, and with the big transients interleaving between
+        # the two allocators either can OOM while the other sits on free
+        # memory. Costs milliseconds per iteration against a full solve.
+        cp.get_default_memory_pool().free_all_blocks()
+        torch.cuda.empty_cache()
 
     # Final evaluation (no backward) so the multigrid state matches the
     # converged parameters before we save it out.

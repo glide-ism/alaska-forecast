@@ -112,18 +112,73 @@ class GlacierConfig:
     base_precip_year: int = 2012
     alpha_precip: float = 0.0
 
+    # How the multi-year anomaly signal is integrated over each ice-dynamics
+    # step. The anomaly record is piecewise constant per calendar year and smb
+    # is an exogenous source, so the correct discrete forcing is its exact
+    # interval integral, not a point sample:
+    #   "end"          — legacy: sample the anomaly at the step's end time and
+    #                    hold it for the whole step. Aliases interannual
+    #                    variability and makes the forcing depend on how the
+    #                    scheduler partitions time; kept for comparison.
+    #   "mean_anomaly" — one SMB evaluation per step at the overlap-weighted
+    #                    interval-mean anomaly. Fixes aliasing and partition
+    #                    dependence; retains a small Jensen bias (smb is
+    #                    nonlinear in temperature). The default.
+    #   "annual"       — exact: one SMB evaluation per calendar year overlapped
+    #                    by the step, combined with overlap weights (years with
+    #                    identical clamped anomalies merge into one call). Cost
+    #                    scales with simulated years rather than steps.
+    # The precip-anomaly multiplier follows the same weights ("end" keeps its
+    # legacy endpoint trapezoid) and is held at its step mean in every mode.
+    anomaly_integration: str = "mean_anomaly"
+
     # Field priors (Matern)
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,  l=1000.0,  nu=1)
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0, l=10000.0, nu=1)
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,    l=1000.0,  nu=1)
     pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,    l=10000.0, nu=1)
 
+    # SMB backend: "temperature_index" (glare's ImprovedTemperatureIndex, the
+    # default) or "enthalpy" (glare's EnthalpyModel — an enthalpy formulation of
+    # annual snow dynamics; same forcing, same specific SMB, different
+    # parameters). Both models' parameters and priors live in this config
+    # simultaneously; only the active model's scalars enter the optimizer and
+    # the forward graph (the inactive model's whitened z stay at 0 = prior
+    # median, contributing exactly zero to the prior loss).
+    smb_model: str = "temperature_index"
+
     # Scalar SMB priors (log-normal). mu_log_* is derived as log(mu_*).
+    # These belong to the temperature-index model.
     mu_rf: float = 50.0
     mu_mf: float = 1.0
     sigma_log_rf: float = 0.1
     sigma_log_mf: float = 0.1
     debris_factor: float = 0.5 # Amount by which debris cover reduces melt of bare ice.
+
+    # Enthalpy-model inverted scalars. H_atm (lumped sensible/longwave heat
+    # transfer) is inferred as log(H_atm in W m-2 K-1); the effective normal
+    # shortwave is inferred as logit(f) of the cloud factor f in (0, 1), with
+    # q_sw_insol = f * q_sw_clear. Physical values passed to the model are
+    # converted to J m-2 yr-1 (K-1) via SECONDS_PER_YEAR.
+    mu_H_atm:          float = 20.0   # W m-2 K-1, prior median
+    sigma_log_H_atm:   float = 0.4
+    mu_cloud_factor:   float = 0.6    # prior median of f in (0, 1)
+    sigma_logit_cloud: float = 0.5
+
+    # Enthalpy-model fixed constants (not inverted; per-second SI units,
+    # converted by SECONDS_PER_YEAR where they are fluxes).
+    q_sw_clear:  float = 1000.0  # W m-2, direct normal shortwave at sea level
+    q_sw_bulk:   float = 0.0     # W m-2, insolation-independent shortwave
+    H_base0:     float = 0.6     # W m-2 K-1, basal conductance at zero snow mass
+    albedo_snow: float = 0.9
+    albedo_ice:  float = 0.4
+    M_albedo:    float = 20.0    # kg m-2, snow-cover albedo transition mass
+    # Sub-monthly stochastic temperature deviations: one seeded (12, n_substeps)
+    # realization is drawn once at problem build and reused for every time step,
+    # iteration, and checkpoint recomputation, keeping the objective (and the
+    # checkpointed adjoint) deterministic.
+    enthalpy_n_substeps: int = 30
+    enthalpy_seed:       int = 0
 
     # Elevation-dependent precip depletion (optional). Adds a softplus ramp,
     #   exp(-tau) * w * log(1 + exp((z - z0) / w)),
@@ -184,6 +239,40 @@ class GlacierConfig:
     init_H_floor: float = 0.1    # minimum/ice-free thickness used when seeding
     use_avalanche_model: bool = False
 
+    # Avalanche-operator hyperparameters (only read when use_avalanche_model).
+    # s_crit/w_trans set the deposition sigmoid (degrees), p the MFD flow
+    # concentration, K the number of routing passes (Neumann truncation). At
+    # K=12 the undeposited residual on St.-Elias-like terrain is ~5e-4 of the
+    # slab mass and is deposited in place, so larger K buys very little; the
+    # historical hard-coded value was 25.
+    avalanche_s_crit: float = 30.0
+    avalanche_w_trans: float = 8.0
+    avalanche_p: float = 1.5
+    avalanche_K: int = 12
+
+    # avalanche_hoisted — READ THIS BEFORE ENABLING.
+    #
+    # When True, the avalanche redistribution R is applied ONCE per forward
+    # call, to the iteration's precip field (via glare's AvalancheStep),
+    # instead of inside every per-step SMB evaluation (~150 applications per
+    # inversion iteration once checkpoint recomputes and adjoint rebuilds are
+    # counted — ~20 s/iteration on a St. Elias-sized grid). This is exactly
+    # equivalent — not an approximation — while BOTH of the following hold:
+    #
+    #   1. smb_model == "enthalpy". The enthalpy core consumes *total* precip
+    #      and partitions rain/snow internally, so R acts on a field that the
+    #      per-step temperature shift never touches. Under ETIM the snow/rain
+    #      partition sits UPSTREAM of R and depends on the (anomaly-shifted)
+    #      per-step t2m, so hoisting is invalid there — GlacierProblem raises.
+    #
+    #   2. The per-step precip variation is a SCALAR multiplier (the annual
+    #      precip-anomaly ratio). R is linear, so R(c*P) = c*R(P). If the
+    #      precip forcing ever varies per step by more than a scalar multiple
+    #      (e.g. monthly anomaly *fields*, storm-track reweighting), hoisting
+    #      becomes silently WRONG — no runtime check can catch it. Revisit
+    #      this flag whenever the precip pipeline changes.
+    avalanche_hoisted: bool = False
+
     # Solver settings
     forward_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
         relative_tolerance=1e-2, absolute_tolerance=10.0))
@@ -228,6 +317,10 @@ class GlacierConfig:
     lr_z_pbias:    float = 0.001
     lr_z_log_mf:   float = 0.01
     lr_z_log_rf:   float = 0.01
+    # Enthalpy-model scalars (Adam block, used in place of z_log_mf/z_log_rf
+    # when smb_model == "enthalpy").
+    lr_z_log_H_atm:   float = 0.01
+    lr_z_logit_cloud: float = 0.01
     # Elevation-dependent precip depletion scalars (Adam block, only added to
     # the optimizer when precip_lapse_enabled). See the prior widths above.
     lr_z_tau:      float = 0.01

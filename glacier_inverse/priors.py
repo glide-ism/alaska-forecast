@@ -60,6 +60,14 @@ class GlacierPriors:
         self.sigma_log_rf = config.sigma_log_rf
         self.sigma_log_mf = config.sigma_log_mf
 
+        # Enthalpy-model scalars: log-normal on H_atm (in W m-2 K-1) and
+        # logit-normal on the cloud factor f (q_sw_insol = f * q_sw_clear).
+        self.mu_log_H_atm = float(np.log(config.mu_H_atm))
+        self.sigma_log_H_atm = config.sigma_log_H_atm
+        self.mu_logit_cloud = float(
+            np.log(config.mu_cloud_factor / (1.0 - config.mu_cloud_factor)))
+        self.sigma_logit_cloud = config.sigma_logit_cloud
+
         # Elevation-dependent precip depletion scalars (normal priors, directly
         # on tau and z0 — not log-normal; tau is itself a log length scale).
         self.mu_tau = config.mu_tau

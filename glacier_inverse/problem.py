@@ -31,6 +31,24 @@ from glare.model import ImprovedTemperatureIndex
 from glare.avalanche import AvalancheOperator
 from ggapp.torch import GGaPPMap, GGaPPWhiten
 
+# The enthalpy SMB core is newer than some installed glare versions; import it
+# defensively so temperature-index-only setups keep working. Selecting
+# smb_model="enthalpy" against an old glare raises a clear error at build time.
+try:
+    from glare.enthalpy import (
+        EnthalpyModel, SECONDS_PER_YEAR, generate_temp_deviations,
+    )
+except ImportError:
+    EnthalpyModel = None
+    SECONDS_PER_YEAR = 365 * 24 * 3600
+
+# AvalancheStep (hoisted once-per-iteration redistribution) is newer than some
+# installed glare versions; only needed when config.avalanche_hoisted.
+try:
+    from glare.torch import AvalancheStep
+except ImportError:
+    AvalancheStep = None
+
 from .config import GlacierConfig, SolverConfig
 from .forward import simulate, differentiable_restriction, differentiable_prolongation
 from .loss import LossTerms, PriorMeans, compute_prior
@@ -42,12 +60,15 @@ from .scheduling import merge_times
 
 
 class WhitenedParameters:
-    """The eight tensors we optimize over: four whitened fields plus four
-    whitened scalars (log melt/radiation factors and the precip-depletion
-    tau/z0). The depletion scalars are inert unless precip_lapse_enabled."""
+    """The tensors we optimize over: four whitened fields plus the whitened
+    scalars (log melt/radiation factors, the precip-depletion tau/z0, and the
+    enthalpy-model log H_atm / logit cloud factor). The depletion scalars are
+    inert unless precip_lapse_enabled; the mf/rf pair and the H_atm/cloud pair
+    are mutually exclusive per config.smb_model (the inactive pair stays at
+    z = 0 = prior median and never enters the forward graph)."""
 
     def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_log_mf, z_log_rf,
-                 z_tau, z_z0):
+                 z_tau, z_z0, z_log_H_atm, z_logit_cloud):
         self.z_bed = z_bed
         self.z_bed_mean = z_bed_mean
         self.z_log_beta = z_log_beta
@@ -56,11 +77,13 @@ class WhitenedParameters:
         self.z_log_rf = z_log_rf
         self.z_tau = z_tau
         self.z_z0 = z_z0
+        self.z_log_H_atm = z_log_H_atm
+        self.z_logit_cloud = z_logit_cloud
 
     def requires_grad_(self) -> "WhitenedParameters":
         for t in (self.z_bed, self.z_bed_mean, self.z_log_beta,
                   self.z_pbias, self.z_log_mf, self.z_log_rf,
-                  self.z_tau, self.z_z0):
+                  self.z_tau, self.z_z0, self.z_log_H_atm, self.z_logit_cloud):
             t.requires_grad_()
         return self
 
@@ -74,6 +97,8 @@ class WhitenedParameters:
             z_log_rf=self.z_log_rf.detach().clone(),
             z_tau=self.z_tau.detach().clone(),
             z_z0=self.z_z0.detach().clone(),
+            z_log_H_atm=self.z_log_H_atm.detach().clone(),
+            z_logit_cloud=self.z_logit_cloud.detach().clone(),
         )
 
     @torch.no_grad()
@@ -88,6 +113,8 @@ class WhitenedParameters:
         self.z_log_rf.copy_(other.z_log_rf)
         self.z_tau.copy_(other.z_tau)
         self.z_z0.copy_(other.z_z0)
+        self.z_log_H_atm.copy_(other.z_log_H_atm)
+        self.z_logit_cloud.copy_(other.z_logit_cloud)
 
 
 def _apply_solver_settings(target_fas, cfg: SolverConfig) -> None:
@@ -166,6 +193,11 @@ class GlacierProblem:
         self.model = self._build_ice_dynamics(ny, nx, dx, x0, y0)
         self.mg = self.model.mg
 
+        # Set by _build_enthalpy_smb_model when config.avalanche_hoisted: the
+        # redistribution operator applied once per simulate_physical call
+        # instead of inside every per-step SMB evaluation (see the loud
+        # discussion on GlacierConfig.avalanche_hoisted).
+        self.avalanche_op = None
         self.smb_model = self._build_smb_model(ny, nx, dx, x0, y0)
         self.mg.forcing.smb.set(self.smb_model.grid.state.smb.data.mean(axis=0))
 
@@ -211,8 +243,33 @@ class GlacierProblem:
         self.H_prev = torch.tensor(self.mg[0].state.H_prev.data,
                                    device="cuda")
 
-        self.debris = torch.tensor(self.smb_model.grid.geometry.debris.data,
-                                   device="cuda")
+        if cfg.smb_model == "enthalpy":
+            self.debris = torch.tensor(
+                self.smb_model.grid.geometry.debris.data, device="cuda")
+            self.insol_mean = torch.tensor(
+                self.smb_model.grid.radiation.insol_mean.data, device="cuda")
+            self.t_base = torch.tensor(
+                self.smb_model.grid.geometry.t_base.data, device="cuda")
+            # Fixed (non-inverted) enthalpy constants as 0-dim tensors —
+            # EnthalpyStep consumes scalars via .item(); no gradients kept.
+            spy = SECONDS_PER_YEAR
+
+            def _const(v):
+                return torch.tensor(float(v), dtype=torch.float32, device="cuda")
+            self.enthalpy_consts = {
+                "H_base0": _const(cfg.H_base0 * spy),
+                "q_sw_bulk": _const(cfg.q_sw_bulk * spy),
+                "albedo_snow": _const(cfg.albedo_snow),
+                "albedo_ice": _const(cfg.albedo_ice),
+                "M_albedo": _const(cfg.M_albedo),
+            }
+        else:
+            self.debris = torch.tensor(
+                self.smb_model.grid.geometry.debris.data, device="cuda")
+            self.insol_mean = None
+            self.t_base = None
+            self.enthalpy_consts = None
+            self.temp_dev = None
     # ----------------------------------------------------------------- builders
 
     def _build_ice_dynamics(self, ny, nx, dx, x0, y0) -> IceDynamics:
@@ -246,14 +303,32 @@ class GlacierProblem:
             cp.float32(cfg.ssa_damping))
         return model
 
-    def _build_smb_model(self, ny, nx, dx, x0, y0) -> ImprovedTemperatureIndex:
+    def _build_smb_model(self, ny, nx, dx, x0, y0):
+        cfg = self.config
+        if cfg.smb_model == "enthalpy":
+            return self._build_enthalpy_smb_model(ny, nx, dx, x0, y0)
+        if cfg.smb_model != "temperature_index":
+            raise ValueError(
+                f"unknown smb_model {cfg.smb_model!r}; "
+                "expected 'temperature_index' or 'enthalpy'")
+
+        if cfg.avalanche_hoisted:
+            raise ValueError(
+                "avalanche_hoisted is only valid with smb_model='enthalpy': "
+                "the ETIM snow/rain partition sits upstream of the avalanche "
+                "operator and depends on the per-step (anomaly-shifted) t2m, "
+                "so the redistribution input genuinely changes every step — "
+                "see GlacierConfig.avalanche_hoisted.")
+
         smb = ImprovedTemperatureIndex(ny=ny, nx=nx, nt=12,
                                        dx=dx, dt=1.0 / 12,
                                        x0=x0, y0=y0, crs=self.crs)
 
-        if self.config.use_avalanche_model:
-            smb.avalanche = AvalancheOperator(smb.grid,
-                    s_crit=30.0, w_trans=8.0, p=1.5, K=25)
+        if cfg.use_avalanche_model:
+            smb.avalanche = AvalancheOperator(
+                smb.grid, s_crit=cfg.avalanche_s_crit,
+                w_trans=cfg.avalanche_w_trans, p=cfg.avalanche_p,
+                K=cfg.avalanche_K)
 
         gd = self.gridded_data
         smb.grid.insolation.insol_mean.set(gd.monthly_solar_potential_mean)
@@ -262,10 +337,79 @@ class GlacierProblem:
         smb.grid.temperature.t2m.set(gd.monthly_t2m)
         smb.grid.precipitation.precip.set(gd.monthly_precip)
         smb.grid.geometry.srf.set(gd.elevation)
-        smb.grid.insolation.rf.set(self.config.mu_rf)
-        smb.grid.temperature.mf.set(self.config.mu_mf)
-        smb.grid.geometry.debris.set(1.0 - self.config.debris_factor*self.debris_data.debris_fraction)
+        smb.grid.insolation.rf.set(cfg.mu_rf)
+        smb.grid.temperature.mf.set(cfg.mu_mf)
+        if self.debris_data is not None:
+            smb.grid.geometry.debris.set(
+                1.0 - cfg.debris_factor * self.debris_data.debris_fraction)
+        else:
+            smb.grid.geometry.debris.set(1.0)
         smb.forward()
+        return smb
+
+    def _build_enthalpy_smb_model(self, ny, nx, dx, x0, y0):
+        """Build glare's EnthalpyModel, initialized at the prior-median
+        parameters, with one fixed seeded weather realization (`self.temp_dev`)
+        reused by every forward call so the checkpointed objective is
+        deterministic."""
+        cfg = self.config
+        if EnthalpyModel is None:
+            raise ImportError(
+                "smb_model='enthalpy' requires a glare version providing "
+                "glare.enthalpy.EnthalpyModel")
+        smb = EnthalpyModel(ny=ny, nx=nx, nt=12, dx=dx, dt=1.0 / 12,
+                            x0=x0, y0=y0, crs=self.crs,
+                            n_substeps=cfg.enthalpy_n_substeps)
+        if cfg.use_avalanche_model:
+            op = AvalancheOperator(
+                smb.grid, s_crit=cfg.avalanche_s_crit,
+                w_trans=cfg.avalanche_w_trans, p=cfg.avalanche_p,
+                K=cfg.avalanche_K)
+            if cfg.avalanche_hoisted:
+                # Hoisted mode: R is applied once per simulate_physical call
+                # (simulate_physical redistributes precip_ up front) and the
+                # model itself runs bare — _prepare_effective_precip reduces
+                # to a copy and the adjoint's R^T pull-back to identity. Only
+                # valid because the enthalpy core takes total precip and the
+                # per-step variation is a scalar multiplier — see the loud
+                # note on GlacierConfig.avalanche_hoisted.
+                if AvalancheStep is None:
+                    raise ImportError(
+                        "avalanche_hoisted=True requires a glare version "
+                        "providing glare.torch.AvalancheStep")
+                self.avalanche_op = op
+            else:
+                smb.avalanche = op
+
+        gd = self.gridded_data
+        smb.grid.temperature.t2m.set(gd.monthly_t2m)
+        smb.grid.precipitation.precip.set(gd.monthly_precip)
+        smb.grid.radiation.insol_mean.set(gd.monthly_solar_potential_mean)
+        smb.grid.geometry.srf.set(gd.elevation)
+        # Same debris attenuation as the ETIM branch: from glare's perspective
+        # a field multiplying bare-ice melt fluxes (1 = clean ice).
+        if self.debris_data is not None:
+            smb.grid.geometry.debris.set(
+                1.0 - cfg.debris_factor * self.debris_data.debris_fraction)
+        # Static substrate temperature: annual-mean air temperature, capped at
+        # the melting point (a permafrost-style proxy; not anomaly-shifted).
+        smb.grid.geometry.t_base.set(
+            cp.minimum(cp.asarray(gd.monthly_t2m.values).mean(axis=0), 0.0))
+
+        spy = SECONDS_PER_YEAR
+        smb.grid.thermodynamics.H_atm.set(cfg.mu_H_atm * spy)
+        smb.grid.thermodynamics.H_base0.set(cfg.H_base0 * spy)
+        smb.grid.radiation.q_sw_bulk.set(cfg.q_sw_bulk * spy)
+        smb.grid.radiation.q_sw_insol.set(cfg.mu_cloud_factor * cfg.q_sw_clear * spy)
+        smb.grid.radiation.albedo_snow.set(cfg.albedo_snow)
+        smb.grid.radiation.albedo_ice.set(cfg.albedo_ice)
+        smb.grid.radiation.M_albedo.set(cfg.M_albedo)
+
+        sigma_t2m = float(cp.asnumpy(smb.grid.temperature.sigma_t2m.value))
+        self.temp_dev = generate_temp_deviations(
+            12, cfg.enthalpy_n_substeps, sigma_t2m,
+            np.random.default_rng(cfg.enthalpy_seed))
+        smb.forward(temp_deviations=self.temp_dev)
         return smb
 
     def _build_domain_data(self) -> DomainData:
@@ -348,21 +492,30 @@ class GlacierProblem:
 
         z_pbias = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
 
-        log_mf = torch.tensor(cp.log(self.smb_model.grid.temperature.mf.value), device="cuda")
-        log_rf = torch.tensor(cp.log(self.smb_model.grid.insolation.rf.value), device="cuda")
-        z_log_mf = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
-        z_log_rf = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
+        if self.config.smb_model == "enthalpy":
+            # The enthalpy grid carries no mf/rf; the inactive temperature-
+            # index scalars sit at their prior median (z = 0).
+            z_log_mf = torch.zeros((), dtype=torch.float32, device="cuda")
+            z_log_rf = torch.zeros((), dtype=torch.float32, device="cuda")
+        else:
+            log_mf = torch.tensor(cp.log(self.smb_model.grid.temperature.mf.value), device="cuda")
+            log_rf = torch.tensor(cp.log(self.smb_model.grid.insolation.rf.value), device="cuda")
+            z_log_mf = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
+            z_log_rf = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
 
-        # Precip-depletion scalars start at the prior mean (z = 0). Inert unless
-        # precip_lapse_enabled, but always present so save/load and the prior
-        # term stay shape-consistent across tasks.
+        # Precip-depletion and enthalpy-model scalars start at the prior mean
+        # (z = 0). The inactive ones are inert, but always present so save/load
+        # and the prior term stay shape-consistent across tasks.
         z_tau = torch.zeros((), dtype=torch.float32, device="cuda")
         z_z0 = torch.zeros((), dtype=torch.float32, device="cuda")
+        z_log_H_atm = torch.zeros((), dtype=torch.float32, device="cuda")
+        z_logit_cloud = torch.zeros((), dtype=torch.float32, device="cuda")
 
         params = WhitenedParameters(
             z_bed=z_bed, z_bed_mean=z_bed_mean, z_log_beta=z_log_beta,
             z_pbias=z_pbias, z_log_mf=z_log_mf, z_log_rf=z_log_rf,
             z_tau=z_tau, z_z0=z_z0,
+            z_log_H_atm=z_log_H_atm, z_logit_cloud=z_logit_cloud,
         )
         params.requires_grad_()
         return params
@@ -383,9 +536,14 @@ class GlacierProblem:
         # Precip-depletion scalars: plain affine de-whitening of a normal prior.
         tau = priors.mu_tau + priors.sigma_tau * params.z_tau
         z0 = priors.mu_z0 + priors.sigma_z0 * params.z_z0
+        # Enthalpy-model scalars: log H_atm (in W m-2 K-1) and logit of the
+        # cloud factor. Exponentiation/sigmoid happens in simulate_physical.
+        log_H_atm = priors.mu_log_H_atm + priors.sigma_log_H_atm * params.z_log_H_atm
+        logit_cloud = priors.mu_logit_cloud + priors.sigma_logit_cloud * params.z_logit_cloud
         return PhysicalParameters(
             bed=bed, bed_mean=bed_mean, log_beta=log_beta,
             pbias=pbias, log_mf=log_mf, log_rf=log_rf, tau=tau, z0=z0,
+            log_H_atm=log_H_atm, logit_cloud=logit_cloud,
         )
 
     def effective_log_pbias(self, physical: "PhysicalParameters") -> torch.Tensor:
@@ -483,8 +641,25 @@ class GlacierProblem:
         # Joint log-precip bias (Matern field minus the optional elevation
         # depletion ramp); see effective_log_pbias for why it is static.
         precip_ = self.precip * torch.exp(self.effective_log_pbias(physical))
-        mf = torch.exp(physical.log_mf)
-        rf = torch.exp(physical.log_rf)
+        if self.avalanche_op is not None:
+            # Hoisted avalanche (config.avalanche_hoisted): apply R here, once
+            # per forward call, instead of ~150 times inside the per-step SMB
+            # (forward steps + checkpoint recomputes + adjoint rebuilds).
+            # Exactly equivalent ONLY because the enthalpy core takes total
+            # precip and each step scales it by a scalar — R(c*P) = c*R(P).
+            precip_ = AvalancheStep.apply(self.avalanche_op, precip_)
+        if cfg.smb_model == "enthalpy":
+            mf = rf = None
+            # Physical scalars in the model's J m-2 yr-1 (K-1) units:
+            # H_atm from its log in W m-2 K-1, q_sw_insol from the cloud
+            # factor times the clear-sky direct normal shortwave.
+            H_atm = torch.exp(physical.log_H_atm) * SECONDS_PER_YEAR
+            q_sw_insol = (torch.sigmoid(physical.logit_cloud)
+                          * cfg.q_sw_clear * SECONDS_PER_YEAR)
+        else:
+            mf = torch.exp(physical.log_mf)
+            rf = torch.exp(physical.log_rf)
+            H_atm = q_sw_insol = None
 
         bed_ = differentiable_restriction(physical.bed, level, method='avg')
         if cfg.init_from_observed_geometry:
@@ -498,6 +673,7 @@ class GlacierProblem:
         return simulate(
             model=self.model,
             smb_model=self.smb_model,
+            smb_kind=cfg.smb_model,
             level=level,
             t_start=cfg.t_start if t_start is None else t_start,
             t_end=cfg.t_end if t_end is None else t_end,
@@ -510,6 +686,13 @@ class GlacierProblem:
             debris=self.debris,
             mf=mf,
             rf=rf,
+            insol_mean=self.insol_mean,
+            t_base=self.t_base,
+            H_atm=H_atm,
+            q_sw_insol=q_sw_insol,
+            enthalpy_consts=self.enthalpy_consts,
+            temp_dev=self.temp_dev,
+            anomaly_integration=cfg.anomaly_integration,
             domain_mask=self.domain.domain_mask,
             temperature_anomaly=self.temperature_anomaly,
             base_anomaly=self.base_anomaly,
@@ -618,3 +801,6 @@ class PhysicalParameters:
     # config.precip_lapse_enabled.
     tau: Optional[torch.Tensor] = None
     z0: Optional[torch.Tensor] = None
+    # Enthalpy-model scalars; only read when config.smb_model == "enthalpy".
+    log_H_atm: Optional[torch.Tensor] = None
+    logit_cloud: Optional[torch.Tensor] = None

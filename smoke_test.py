@@ -17,6 +17,9 @@ cheap consistency checks:
   7. A short forward run at the coarsest level emits a state snapshot at
      every required observation time, produces finite loss terms, and is
      differentiable end-to-end — including through a non-final snapshot.
+  8. The enthalpy SMB backend (smb_model="enthalpy") builds, runs, is
+     deterministic (fixed weather realization), and is differentiable w.r.t.
+     its two whitened scalars (skipped if the installed glare predates it).
 
 Prints PASS/FAIL per check; exits non-zero on any failure.
 
@@ -33,6 +36,7 @@ import torch
 from ggapp.torch import GGaPPMap, GGaPPWhiten
 
 from glacier_inverse import GlacierProblem, load_config
+from glacier_inverse.forward import year_overlap_weights
 from glacier_inverse.scheduling import build_step_sequence, merge_times
 
 # Domain to smoke-test. Override at the call site if you want a different one.
@@ -124,6 +128,8 @@ def main() -> int:
         ("z_pbias",    params.z_pbias),
         ("z_log_mf",   params.z_log_mf),
         ("z_log_rf",   params.z_log_rf),
+        ("z_log_H_atm",   params.z_log_H_atm),
+        ("z_logit_cloud", params.z_logit_cloud),
     ]:
         check(f"{name} on cuda + requires_grad",
               tensor.is_cuda and tensor.requires_grad,
@@ -155,6 +161,24 @@ def main() -> int:
     check("merge_times dedupes within eps",
           merge_times([2000.0, 2000.0 + 1e-9], [2013.0], None)
           == (2000.0, 2013.0))
+
+    # Anomaly-integration quadrature weights (pure CPU).
+    w = year_overlap_weights(1992.0, 2012.0)
+    check("year weights: 20 uniform years over a 20-yr step",
+          len(w) == 20 and w[0] == (1992, 0.05) and w[-1] == (2011, 0.05)
+          and abs(sum(x for _, x in w) - 1.0) < 1e-12)
+    w = year_overlap_weights(2011.5, 2013.0)
+    check("year weights: partial-year overlap",
+          [y for y, _ in w] == [2011, 2012]
+          and abs(w[0][1] - 0.5 / 1.5) < 1e-12
+          and abs(w[1][1] - 1.0 / 1.5) < 1e-12)
+    sub = {y: wt * 8.0 for y, wt in year_overlap_weights(1995.25, 2003.25)}
+    for y, wt in year_overlap_weights(2003.25, 2012.75):
+        sub[y] = sub.get(y, 0.0) + wt * 9.5
+    whole = dict(year_overlap_weights(1995.25, 2012.75))
+    check("year weights: sub-partitions recombine (partition independence)",
+          set(sub) == set(whole)
+          and all(abs(sub[y] / 17.5 - whole[y]) < 1e-12 for y in whole))
 
     header("6. Observations")
     obs_names = [o.name for o in problem.observations]
@@ -280,6 +304,102 @@ def main() -> int:
           and torch.isfinite(params.z_bed.grad).all().item(),
           f"grad norm = {params.z_bed.grad.norm().item():.3e}"
           if params.z_bed.grad is not None else "no grad")
+
+    header("8. Enthalpy SMB backend")
+    try:
+        from glare.enthalpy import EnthalpyModel  # noqa: F401
+        enthalpy_available = True
+    except ImportError:
+        enthalpy_available = False
+    if not enthalpy_available:
+        print("  [SKIP] installed glare does not provide EnthalpyModel")
+    else:
+        # Free the temperature-index problem's graph/state before standing up
+        # a second full problem on the same GPU.
+        del sim, physical, loss_terms, probe, J
+        del problem, params, srf, vel, bed, snow, dhdt, domain, priors
+        torch.cuda.empty_cache()
+
+        import dataclasses
+        econfig = dataclasses.replace(config, smb_model="enthalpy")
+        try:
+            eproblem = GlacierProblem(econfig)
+        except Exception as e:
+            traceback.print_exc()
+            check("enthalpy GlacierProblem builds", False, str(e))
+            print()
+            print(f"FAILED: {_failures} check(s) did not pass")
+            return 1
+        check("smb model is EnthalpyModel",
+              type(eproblem.smb_model).__name__ == "EnthalpyModel")
+        check("initial enthalpy smb finite",
+              bool(torch.isfinite(torch.tensor(
+                  eproblem.smb_model.grid.state.smb.data)).all()))
+
+        eparams = eproblem.params
+        elevel = econfig.n_levels - 1
+        eproblem.model.set_top_level(elevel)
+        erequired = eproblem.required_times
+        et_first = min(erequired) if erequired else econfig.t_end
+        et_start = et_first - 3 * econfig.dt
+        try:
+            esim, ephys = eproblem.simulate(level=elevel, params=eparams,
+                                            t_start=et_start)
+        except Exception as e:
+            traceback.print_exc()
+            check("enthalpy simulate() runs", False, str(e))
+            print()
+            print(f"FAILED: {_failures} check(s) did not pass")
+            return 1
+        check("enthalpy sim.H finite", torch.isfinite(esim.H).all().item())
+        check("enthalpy smb_fine finite",
+              torch.isfinite(esim.final.smb_fine).all().item())
+
+        # The fixed weather realization: the grid must hold exactly the seeded
+        # deviation sequence after a run (an unseeded redraw would differ), and
+        # a re-run with the same physical parameters must reproduce smb to well
+        # under the O(0.1 m/yr) a redraw would cause. Bitwise equality is only
+        # spoiled by the avalanche operator's atomicAdd deposits (~1e-5,
+        # order-nondeterministic, pre-existing on the ETIM path too); without
+        # the avalanche model the re-run is exact.
+        import cupy as _cp
+        import numpy as _np
+        check("grid.temp_dev holds the fixed seeded realization",
+              _np.array_equal(_cp.asnumpy(eproblem.smb_model.grid.temp_dev),
+                              eproblem.temp_dev))
+        with torch.no_grad():
+            esim2 = eproblem.simulate_physical(level=elevel, physical=ephys,
+                                               t_start=et_start)
+        smb_diff = (esim.final.smb_fine - esim2.final.smb_fine).abs().max()
+        exact = torch.equal(esim.final.smb_fine, esim2.final.smb_fine)
+        check("re-run smb matches (fixed realization, no redraw)",
+              exact or (econfig.use_avalanche_model
+                        and smb_diff.item() < 1e-3),
+              f"max |Δsmb| = {smb_diff.item():.3e}"
+              + ("" if exact else " (avalanche atomicAdd jitter)"))
+        del esim2
+
+        eloss = eproblem.compute_loss(sim=esim, physical=ephys, params=eparams)
+        eJ = eloss.J
+        check("enthalpy loss finite", torch.isfinite(eJ).item(),
+              f"J = {eJ.item():.4f}")
+        eJ.backward()
+        for name, tensor in [("z_log_H_atm", eparams.z_log_H_atm),
+                             ("z_logit_cloud", eparams.z_logit_cloud),
+                             ("z_bed", eparams.z_bed)]:
+            check(f"gradient reaches {name}",
+                  tensor.grad is not None
+                  and torch.isfinite(tensor.grad).all().item()
+                  and tensor.grad.abs().sum() > 0,
+                  f"|grad|_1 = {tensor.grad.abs().sum().item():.3e}"
+                  if tensor.grad is not None else "no grad")
+        # The inactive model's scalar sits at z = 0, so its only gradient path
+        # (the prior term) contributes exactly zero — no data-loss leakage.
+        check("z_log_mf gradient is exactly zero (inactive model)",
+              eparams.z_log_mf.grad is None
+              or float(eparams.z_log_mf.grad.abs()) == 0.0,
+              f"grad = {float(eparams.z_log_mf.grad):.3e}"
+              if eparams.z_log_mf.grad is not None else "no grad")
 
     print()
     if _failures:

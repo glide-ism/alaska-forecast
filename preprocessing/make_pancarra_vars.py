@@ -183,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--precip-median-window", type=int, default=None,
                         help="Side length (grid cells) of an optional square "
                              "median filter applied to monthly precip.")
-    parser.add_argument("--multiyear", action="store_true", default=False,
+    parser.add_argument("--multiyear", action="store_true", default=True,
                         help="Use the multi-year CARRA file in "
                              "common_data/climate/pancarra/1986_2023, reduced "
                              "to a calendar-month climatology.")
