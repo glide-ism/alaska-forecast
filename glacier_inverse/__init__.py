@@ -1,7 +1,8 @@
 import importlib.util
 from pathlib import Path
 
-from .config import GlacierConfig, PriorHyperparams, Schedule, SolverConfig
+from .config import (BedConditioningConfig, GlacierConfig, PriorHyperparams,
+                     Schedule, SolverConfig)
 from .priors import GlacierPriors
 from .problem import GlacierProblem, WhitenedParameters
 from .loss import LossTerms, PriorMeans
@@ -23,6 +24,7 @@ def load_config(domain_dir):
 
 
 __all__ = [
+    "BedConditioningConfig",
     "GlacierConfig",
     "PriorHyperparams",
     "Schedule",

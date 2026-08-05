@@ -96,6 +96,58 @@ class SolverConfig:
 
 
 @dataclass(frozen=True)
+class BedConditioningConfig:
+    """GP-posterior-as-prior for the bed: condition the Matern bed prior on
+    the flightline picks and (optionally) bed=DEM over every ice-free /
+    out-of-domain pixel, so z_bed parametrizes the CONDITIONAL field
+    (Matheron's rule: bed = bed_mean + Map(z_bed) + (Q+D)^-1 D (b - ...)).
+
+    Enabling this CHANGES THE BED PARAMETRIZATION:
+      - checkpoints carry a "bed_parametrization" tag and are converted
+        exactly on load (io.load_whitened_params_into needs `priors=`);
+      - the BedObservation soft likelihood must carry weight 0 (the data is
+        already in the map — GlacierProblem warns loudly otherwise);
+      - lr_z_bed generally needs per-domain retuning: the conditional map has
+        different curvature near data. Start from the legacy value and watch
+        the first level.
+
+    The correction is solved matrix-free by flexible PCG (preconditioned with
+    the prior multigrid solve); cold iteration counts scale like
+    sigma_prior/sigma_obs, so keep the sigmas ~10 m — conditioning at +-10 m
+    already pins the bed far harder than the old soft anchor did (do NOT port
+    a sigma_dem=1.0 soft-anchor experiment here; it only buys PCG iterations).
+    """
+    enabled: bool = False
+    sigma_picks: float = 10.0    # m, per-pick noise (BedSpec.sigma semantics)
+    sigma_dem: float = 10.0      # m, off-ice bed=DEM noise (BedSpec.sigma_dem)
+    include_off_ice: bool = True
+    # Cells where the DEM is exactly 0.0 are void fill at the land-DEM /
+    # bathymetry seam (nearshore, fjord heads), not real bed — anchoring them
+    # pins fjord bottoms at sea level. Excluded by default: the conditional
+    # field there is interpolated from the surrounding anchored pixels, and a
+    # spurious sill near a terminus gets corrected by the surface misfit
+    # (ice overrides it -> surface too high -> bed pushed down). Real land at
+    # exactly 0.0f is essentially nonexistent in float composites.
+    exclude_zero_dem: bool = True
+    pcg_rtol: float = 1e-4
+    # Backward-pass tolerance: a ~1% gradient is ample for SGD, and rough
+    # loss cotangents stall float32 PCG well before 1e-4 (burning maxiter
+    # every iteration — the dominant cost otherwise).
+    pcg_rtol_adjoint: float = 1e-2
+    # "shifted" (default): precondition with the diagonally shifted factor
+    # (L + d)^-2, d = (tau/dx)sqrt(D) — O(10) iterations for every solve,
+    # independent of the sigma ratio and rhs roughness, at one extra
+    # multigrid hierarchy of memory. "prior": the original C preconditioner
+    # (kept for comparison/fallback; iterations ~ sigma_prior/sigma_obs).
+    pcg_preconditioner: str = "shifted"
+    # Cold solves at sigma_prior/sigma_obs = 25 land around 250-500 iterations
+    # (rough right-hand sides are the worst); warm-started solves during
+    # optimization take a handful.
+    pcg_maxiter: int = 800
+    warm_start: bool = True
+
+
+@dataclass(frozen=True)
 class GlacierConfig:
     base_dir: str
 
@@ -136,7 +188,30 @@ class GlacierConfig:
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,  l=1000.0,  nu=1)
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0, l=10000.0, nu=1)
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,    l=1000.0,  nu=1)
-    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,    l=10000.0, nu=1)
+    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.05,    l=10000.0, nu=1)
+    tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=1.0,     l=10000.0, nu=1)
+
+    # Optional additive temperature bias field (units: K). A Matern GP field
+    # added to the monthly t2m before the anomaly shift — the spatial,
+    # time-constant complement of the (uniform, time-varying) anomaly record.
+    # Its natural role is absorbing error in the preprocessing lapse
+    # correction (fixed 6.5 K/km against a fixed DEM) and the DEM-vs-model-
+    # surface mismatch. Unlike pbias it is not logarithmized: it acts
+    # additively and may be negative. Gated off by default so already-tuned
+    # domains are bit-identical: when disabled, z_tbias stays at 0 (= prior
+    # median = 0 K), never enters the optimizer or the forward graph, and no
+    # Matern hierarchy is built for it. Caveats when enabling:
+    #   * lr_z_tbias is coupled to tbias_prior like every other lr/prior pair;
+    #   * t2m becomes a differentiable SMB input, so each checkpoint-segment
+    #     backward transiently copies a (12, ny, nx) t2m gradient off the
+    #     glare grid;
+    #   * the spatially uniform component is degenerate with the anomaly
+    #     scaling (alpha_t2m) over the calibration window — the GP prior is
+    #     what pins it, exactly as for pbias;
+    #   * under the enthalpy backend, tbias shifts t2m ONLY: t_base (the
+    #     static substrate proxy) deliberately stays at the unbiased
+    #     climatology, matching how the temperature anomaly is treated.
+    tbias_enabled: bool = False
 
     # SMB backend: "temperature_index" (glare's ImprovedTemperatureIndex, the
     # default) or "enthalpy" (glare's EnthalpyModel — an enthalpy formulation of
@@ -160,7 +235,7 @@ class GlacierConfig:
     # shortwave is inferred as logit(f) of the cloud factor f in (0, 1), with
     # q_sw_insol = f * q_sw_clear. Physical values passed to the model are
     # converted to J m-2 yr-1 (K-1) via SECONDS_PER_YEAR.
-    mu_H_atm:          float = 20.0   # W m-2 K-1, prior median
+    mu_H_atm:          float = 10.0   # W m-2 K-1, prior median
     sigma_log_H_atm:   float = 0.4
     mu_cloud_factor:   float = 0.6    # prior median of f in (0, 1)
     sigma_logit_cloud: float = 0.5
@@ -179,6 +254,14 @@ class GlacierConfig:
     # checkpointed adjoint) deterministic.
     enthalpy_n_substeps: int = 30
     enthalpy_seed:       int = 0
+
+    # Keep glare's six diagnostic state cubes (M, E, runoff, ice_melt,
+    # t_surface, albedo) individually resident. The inversion only consumes
+    # smb, so by default they share one scratch buffer (~5 x (12, ny, nx) of
+    # VRAM back); flip this on — or call
+    # problem.smb_model.grid.materialize_state_fields() + one forward — when
+    # the diagnostics are wanted. Ignored by glare versions predating the flag.
+    enthalpy_materialize_state: bool = False
 
     # Elevation-dependent precip depletion (optional). Adds a softplus ramp,
     #   exp(-tau) * w * log(1 + exp((z - z0) / w)),
@@ -280,6 +363,10 @@ class GlacierConfig:
         relative_tolerance=1e-3, absolute_tolerance=1e-6))
     ssa_damping: float = 1.0
 
+    # Bed GP conditioning (posterior-as-prior). See BedConditioningConfig.
+    bed_conditioning: BedConditioningConfig = field(
+        default_factory=BedConditioningConfig)
+
     # Input filenames (relative to base_dir/model_inputs/)
     gridded_filename:    str = "GLIDE_inputs.nc"
     flightline_filename: str = "flightlines.gpkg"
@@ -312,15 +399,16 @@ class GlacierConfig:
     # scalar / smooth params.
     lr_z_bed:      float = 0.5
     lr_z_bed_mean: float = 0.5
-    lr_z_log_beta: float = 0.25
+    lr_z_log_beta: float = 0.05
 
     lr_z_pbias:    float = 0.001
+    lr_z_tbias:    float = 0.001
     lr_z_log_mf:   float = 0.01
     lr_z_log_rf:   float = 0.01
     # Enthalpy-model scalars (Adam block, used in place of z_log_mf/z_log_rf
     # when smb_model == "enthalpy").
-    lr_z_log_H_atm:   float = 0.01
-    lr_z_logit_cloud: float = 0.01
+    lr_z_log_H_atm:   float = 0.05
+    lr_z_logit_cloud: float = 0.05
     # Elevation-dependent precip depletion scalars (Adam block, only added to
     # the optimizer when precip_lapse_enabled). See the prior widths above.
     lr_z_tau:      float = 0.01

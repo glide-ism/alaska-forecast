@@ -157,7 +157,7 @@ problem = GlacierProblem(config)
 params = problem.params
 
 if WARM_START_PATH is not None:
-    load_whitened_params_into(params, WARM_START_PATH)
+    load_whitened_params_into(params, WARM_START_PATH, priors=problem.priors)
 
 # Snapshot the warm-start state. Each sample resets params in-place to this
 # before perturbing — keeps tensor identities stable so per-sample optimizers
@@ -204,11 +204,33 @@ for sample_idx in range(N_SAMPLES):
     eps_z_bed_mean = noise_source.randn_like(params.z_bed_mean)
     eps_z_log_beta = noise_source.randn_like(params.z_log_beta)
     eps_z_pbias    = noise_source.randn_like(params.z_pbias)
+    # NOTE: when this script is migrated to the time-stamped-observation API,
+    # a tbias-enabled domain also needs an eps_z_tbias draw — appended AFTER
+    # the existing draw order (like eps_bed_cond below) so QMC dimension
+    # assignment stays stable — plus PriorMeans(z_tbias=...), the init loop,
+    # and an Adam group gated on config.tbias_enabled.
     eps_u_obs      = noise_source.randn_like(problem.observations.u_obs)
     eps_v_obs      = noise_source.randn_like(problem.observations.v_obs)
     eps_S_obs      = noise_source.randn_like(problem.observations.S_obs)
     mask_uniform   = noise_source.rand_like(
         problem.observations.rgi_mask.to(torch.float32))
+
+    # Bed-conditioning data perturbation (Matheron's rule). Appended AFTER the
+    # pre-existing draw order so QMC dimension assignment stays stable. The
+    # precision-weighted per-cell datum has variance 1/D_ii, and the perturbed
+    # data must reach the conditioning MAP (not a loss term) — hence the
+    # problem-level override rather than obs.randomized().
+    eps_bed_cond = None
+    if problem.priors.bed_conditioner is not None:
+        cond = problem.priors.bed_conditioner
+        b_data = torch.tensor(cond.data)
+        D_prec = torch.tensor(cond.precision)
+        eps_bed_cond = noise_source.randn_like(b_data)
+        observed = D_prec > 0
+        sigma_cell = torch.where(observed, D_prec,
+                                 torch.ones_like(D_prec)).rsqrt()
+        problem.set_bed_data_override(
+            b_data + observed.to(b_data.dtype) * sigma_cell * eps_bed_cond)
 
     observations = problem.observations.randomized(
         sigma_u=config.sigma_u, sigma_s=config.sigma_s, sigma_bed=config.sigma_s,
@@ -294,8 +316,11 @@ for sample_idx in range(N_SAMPLES):
         "prior_mean_z_log_mf":   eps_z_log_mf,
         "prior_mean_z_log_rf":   eps_z_log_rf,
         "mask_uniform":      mask_uniform,
+        "eps_bed_cond":      eps_bed_cond,
     }
     save_whitened_params(
         params, f"{output_path}/level_{LEVEL}/torch_vars.p",
         extras=noise_extras,
+        bed_parametrization=problem.priors.bed_parametrization,
     )
+    problem.set_bed_data_override(None)

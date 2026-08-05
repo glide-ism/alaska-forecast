@@ -39,7 +39,8 @@ def _banner(step: str) -> None:
     print(f"\n=== {step} ===", flush=True)
 
 
-def run_all(domain_path: str, year: int) -> None:
+def run_all(domain_path: str, year: int,
+            precip_elevation_factor: float = 0.0) -> None:
     """Execute every preprocessing step for `domain_path` in dependency order."""
     Path(domain_path, 'model_inputs').mkdir(parents=True, exist_ok=True)
 
@@ -65,10 +66,12 @@ def run_all(domain_path: str, year: int) -> None:
     build_insolation(domain_path, year=year)
 
     _banner(f"Climate: CARRA (year={year})")
-    build_climate_carra(domain_path, year=year)
+    build_climate_carra(domain_path, year=year,
+                        precip_elevation_factor=precip_elevation_factor)
 
     _banner(f"Climate: ERA5-Land (year={year})")
-    build_climate_era5land(domain_path, year=year)
+    build_climate_era5land(domain_path, year=year,
+                           precip_elevation_factor=precip_elevation_factor)
 
     _banner("Temperature anomaly")
     build_temperature_anomaly(domain_path)
@@ -86,5 +89,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--domain-path", type=str, required=True)
     parser.add_argument("--year", type=int, default=2012)
+    parser.add_argument("--precip-elevation-factor", type=float, default=0.0,
+                        help="Elevation-based precip scaling in %% per metre, "
+                             "forwarded to both climate builders. "
+                             "0 disables it.")
     args = parser.parse_args()
-    run_all(args.domain_path, args.year)
+    run_all(args.domain_path, args.year,
+            precip_elevation_factor=args.precip_elevation_factor)

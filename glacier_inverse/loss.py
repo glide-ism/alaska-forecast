@@ -31,6 +31,10 @@ class PriorMeans:
     z_bed_mean:   Optional[torch.Tensor] = None
     z_log_beta:   Optional[torch.Tensor] = None
     z_pbias:      Optional[torch.Tensor] = None
+    # Temperature bias field: zero mean until the RTO migration wires it into
+    # sample_like (its draw must be appended AFTER the existing draw order so
+    # QMC dimension assignment stays stable).
+    z_tbias:      Optional[torch.Tensor] = None
     z_log_mf:     Optional[torch.Tensor] = None
     z_log_rf:     Optional[torch.Tensor] = None
     # Precip-depletion scalars. Present so compute_prior can ask for their mean
@@ -87,6 +91,7 @@ class LossTerms:
     J_prior_bed_mean: torch.Tensor = None
     J_prior_beta:     torch.Tensor = None
     J_prior_pbias:    torch.Tensor = None
+    J_prior_tbias:    torch.Tensor = None
     J_prior_smb:      torch.Tensor = None
 
     def _term(self, name: str):
@@ -115,7 +120,7 @@ class LossTerms:
     @property
     def J_prior(self):
         return (self.J_prior_bed + self.J_prior_bed_mean + self.J_prior_beta
-                + self.J_prior_pbias + self.J_prior_smb)
+                + self.J_prior_pbias + self.J_prior_tbias + self.J_prior_smb)
 
     @property
     def J(self):
@@ -133,7 +138,8 @@ class LossTerms:
         print(f"Bed Prior: {float(self.J_prior_bed):.2f}, "
               f"Bed Mean Prior: {float(self.J_prior_bed_mean):.2f}, "
               f"Beta Prior: {float(self.J_prior_beta):.2f}, "
-              f"Pbias Prior: {float(self.J_prior_pbias):.2f}")
+              f"Pbias Prior: {float(self.J_prior_pbias):.2f}, "
+              f"Tbias Prior: {float(self.J_prior_tbias):.2f}")
         print(bar)
 
 
@@ -198,6 +204,7 @@ def compute_prior(
     log_rf: torch.Tensor,
     log_mf: torch.Tensor,
     prior_means: PriorMeans,
+    physical_bed_uncond: Optional[torch.Tensor] = None,
 ) -> tuple:
     """Whitened-space Gaussian prior terms.
 
@@ -208,11 +215,22 @@ def compute_prior(
     """
     scale = config.loss_scale
 
-    z_bed_recomputed = GGaPPWhiten.apply(priors.bed_model, physical_bed - physical_bed_mean)
+    # The bed_mean hierarchy: re-whiten the UNCONDITIONAL bed fluctuation
+    # about the mean field. Under bed conditioning, `physical_bed_uncond`
+    # (= Map(z_bed), before the kriging correction) must be used here — the
+    # correction is data-driven and must not be penalized by the prior, and
+    # the mean stays out of the conditioning map so its curvature (and its
+    # tuned learning rate) is identical in both parametrizations.
+    base_bed = physical_bed if physical_bed_uncond is None else physical_bed_uncond
+    z_bed_recomputed = GGaPPWhiten.apply(priors.bed_model, base_bed - physical_bed_mean)
     J_prior_bed = scale * ((z_bed_recomputed - prior_means.value("z_bed", z_bed_recomputed)) ** 2).sum()
     J_prior_bed_mean = scale * ((params.z_bed_mean - prior_means.value("z_bed_mean", params.z_bed_mean)) ** 2).sum()
     J_prior_beta = scale * ((params.z_log_beta - prior_means.value("z_log_beta", params.z_log_beta)) ** 2).sum()
     J_prior_pbias = scale * ((params.z_pbias - prior_means.value("z_pbias", params.z_pbias)) ** 2).sum()
+    # Temperature bias: whitened-space term, so it needs no Matern model and
+    # is computed unconditionally — exactly zero while the term is disabled
+    # (z_tbias stays at 0 and out of the optimizer).
+    J_prior_tbias = scale * ((params.z_tbias - prior_means.value("z_tbias", params.z_tbias)) ** 2).sum()
     # Standard-normal whitened priors on every scalar, including the precip-
     # depletion tau/z0 and the enthalpy-model H_atm/cloud pair (each inert when
     # its model/term is disabled: those z stay at 0).
@@ -223,4 +241,5 @@ def compute_prior(
                    + (params.z_log_H_atm - prior_means.value("z_log_H_atm", params.z_log_H_atm)) ** 2
                    + (params.z_logit_cloud - prior_means.value("z_logit_cloud", params.z_logit_cloud)) ** 2)
 
-    return J_prior_bed, J_prior_bed_mean, J_prior_beta, J_prior_pbias, J_prior_smb
+    return (J_prior_bed, J_prior_bed_mean, J_prior_beta, J_prior_pbias,
+            J_prior_tbias, J_prior_smb)

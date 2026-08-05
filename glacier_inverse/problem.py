@@ -15,6 +15,7 @@ times during every forward run, so each product is compared against the model
 at its own epoch. `compute_loss` accepts a substitute observation list so RTO
 can pass randomized copies without rebuilding the problem.
 """
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -60,19 +61,21 @@ from .scheduling import merge_times
 
 
 class WhitenedParameters:
-    """The tensors we optimize over: four whitened fields plus the whitened
+    """The tensors we optimize over: five whitened fields plus the whitened
     scalars (log melt/radiation factors, the precip-depletion tau/z0, and the
     enthalpy-model log H_atm / logit cloud factor). The depletion scalars are
-    inert unless precip_lapse_enabled; the mf/rf pair and the H_atm/cloud pair
-    are mutually exclusive per config.smb_model (the inactive pair stays at
+    inert unless precip_lapse_enabled, and the z_tbias field is inert unless
+    tbias_enabled; the mf/rf pair and the H_atm/cloud pair are mutually
+    exclusive per config.smb_model (every inactive tensor stays at
     z = 0 = prior median and never enters the forward graph)."""
 
-    def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_log_mf, z_log_rf,
-                 z_tau, z_z0, z_log_H_atm, z_logit_cloud):
+    def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_tbias,
+                 z_log_mf, z_log_rf, z_tau, z_z0, z_log_H_atm, z_logit_cloud):
         self.z_bed = z_bed
         self.z_bed_mean = z_bed_mean
         self.z_log_beta = z_log_beta
         self.z_pbias = z_pbias
+        self.z_tbias = z_tbias
         self.z_log_mf = z_log_mf
         self.z_log_rf = z_log_rf
         self.z_tau = z_tau
@@ -82,7 +85,7 @@ class WhitenedParameters:
 
     def requires_grad_(self) -> "WhitenedParameters":
         for t in (self.z_bed, self.z_bed_mean, self.z_log_beta,
-                  self.z_pbias, self.z_log_mf, self.z_log_rf,
+                  self.z_pbias, self.z_tbias, self.z_log_mf, self.z_log_rf,
                   self.z_tau, self.z_z0, self.z_log_H_atm, self.z_logit_cloud):
             t.requires_grad_()
         return self
@@ -93,6 +96,7 @@ class WhitenedParameters:
             z_bed_mean=self.z_bed_mean.detach().clone(),
             z_log_beta=self.z_log_beta.detach().clone(),
             z_pbias=self.z_pbias.detach().clone(),
+            z_tbias=self.z_tbias.detach().clone(),
             z_log_mf=self.z_log_mf.detach().clone(),
             z_log_rf=self.z_log_rf.detach().clone(),
             z_tau=self.z_tau.detach().clone(),
@@ -109,6 +113,7 @@ class WhitenedParameters:
         self.z_bed_mean.copy_(other.z_bed_mean)
         self.z_log_beta.copy_(other.z_log_beta)
         self.z_pbias.copy_(other.z_pbias)
+        self.z_tbias.copy_(other.z_tbias)
         self.z_log_mf.copy_(other.z_log_mf)
         self.z_log_rf.copy_(other.z_log_rf)
         self.z_tau.copy_(other.z_tau)
@@ -216,6 +221,22 @@ class GlacierProblem:
             else default_observation_specs(cfg)
         self.observations = [obs for spec in specs
                              if (obs := spec.build(build_ctx)) is not None]
+
+        # RTO hook: per-sample perturbed conditioning data (Matheron's rule)
+        # consumed by physical_from until reset. Stale PCG warm-start caches
+        # across a swap are just initial guesses — always correct.
+        self._bed_data_override = None
+        if self.priors.bed_conditioner is not None:
+            bed_obs = next((o for o in self.observations if o.name == "bed"), None)
+            if bed_obs is not None and \
+                    bed_obs.weight_at(0, 0, schedule=False) != 0.0:
+                warnings.warn(
+                    "bed_conditioning is enabled but the BedObservation "
+                    "likelihood has nonzero weight — the bed data is counted "
+                    "twice (once in the conditioned prior map, once in the "
+                    "soft loss). Set BedSpec(weight=0.0) in the domain "
+                    "config; the observation is kept only for diagnostics.")
+
         self.params = self._build_initial_parameters()
 
         self.base_anomaly = self.temperature_anomaly.sel(
@@ -357,9 +378,16 @@ class GlacierProblem:
             raise ImportError(
                 "smb_model='enthalpy' requires a glare version providing "
                 "glare.enthalpy.EnthalpyModel")
+        import inspect
+        kwargs = {}
+        if "materialize_state" in inspect.signature(EnthalpyModel).parameters:
+            # Older glare versions predate the flag; with a current one, the
+            # six diagnostic state cubes share one scratch buffer unless the
+            # domain asks for them (config.enthalpy_materialize_state).
+            kwargs["materialize_state"] = cfg.enthalpy_materialize_state
         smb = EnthalpyModel(ny=ny, nx=nx, nt=12, dx=dx, dt=1.0 / 12,
                             x0=x0, y0=y0, crs=self.crs,
-                            n_substeps=cfg.enthalpy_n_substeps)
+                            n_substeps=cfg.enthalpy_n_substeps, **kwargs)
         if cfg.use_avalanche_model:
             op = AvalancheOperator(
                 smb.grid, s_crit=cfg.avalanche_s_crit,
@@ -491,6 +519,9 @@ class GlacierProblem:
         z_bed_mean = GGaPPWhiten.apply(priors.mean_model, bed_mean)
 
         z_pbias = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
+        # Temperature bias field: always allocated (shape-consistent save/load
+        # across tasks), but inert at 0 K unless config.tbias_enabled.
+        z_tbias = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
 
         if self.config.smb_model == "enthalpy":
             # The enthalpy grid carries no mf/rf; the inactive temperature-
@@ -513,7 +544,8 @@ class GlacierProblem:
 
         params = WhitenedParameters(
             z_bed=z_bed, z_bed_mean=z_bed_mean, z_log_beta=z_log_beta,
-            z_pbias=z_pbias, z_log_mf=z_log_mf, z_log_rf=z_log_rf,
+            z_pbias=z_pbias, z_tbias=z_tbias,
+            z_log_mf=z_log_mf, z_log_rf=z_log_rf,
             z_tau=z_tau, z_z0=z_z0,
             z_log_H_atm=z_log_H_atm, z_logit_cloud=z_logit_cloud,
         )
@@ -522,15 +554,27 @@ class GlacierProblem:
 
     # -------------------------------------------------------------------- core
 
+    def set_bed_data_override(self, data) -> None:
+        """RTO hook: substitute per-sample perturbed bed-conditioning data
+        (b + eps, Matheron's rule) for subsequent physical_from calls. Pass
+        None to restore the conditioner's stored data. No-op relevance unless
+        config.bed_conditioning.enabled."""
+        self._bed_data_override = data
+
     def physical_from(self, params: WhitenedParameters):
         """Map whitened parameters back to physical fields. Returns a namespace
-        with (bed, bed_mean, log_beta, pbias, log_mf, log_rf, tau, z0)."""
+        with (bed, bed_mean, log_beta, pbias, tbias, log_mf, log_rf, tau, z0)."""
         priors = self.priors
 
-        bed_mean = GGaPPMap.apply(priors.mean_model, params.z_bed_mean)
-        bed = GGaPPMap.apply(priors.bed_model, params.z_bed)# * self.observations.obs_mask.to(torch.float) + self.observations.dem*(1.0 - self.observations.obs_mask.to(torch.float))
+        bed, bed_mean, bed_uncond = priors.bed_from_whitened(
+            params.z_bed, params.z_bed_mean,
+            data_override=self._bed_data_override)
         log_beta = GGaPPMap.apply(priors.log_beta_model, params.z_log_beta)
         pbias = GGaPPMap.apply(priors.pbias_model, params.z_pbias)
+        # Additive temperature bias (K): mapped only when the term is enabled
+        # (no Matern hierarchy exists otherwise); None keeps t2m untouched.
+        tbias = (GGaPPMap.apply(priors.tbias_model, params.z_tbias)
+                 if priors.tbias_model is not None else None)
         log_mf = priors.mu_log_mf + priors.sigma_log_mf * params.z_log_mf
         log_rf = priors.mu_log_rf + priors.sigma_log_rf * params.z_log_rf
         # Precip-depletion scalars: plain affine de-whitening of a normal prior.
@@ -544,6 +588,7 @@ class GlacierProblem:
             bed=bed, bed_mean=bed_mean, log_beta=log_beta,
             pbias=pbias, log_mf=log_mf, log_rf=log_rf, tau=tau, z0=z0,
             log_H_atm=log_H_atm, logit_cloud=logit_cloud,
+            bed_uncond=bed_uncond, tbias=tbias,
         )
 
     def effective_log_pbias(self, physical: "PhysicalParameters") -> torch.Tensor:
@@ -641,6 +686,15 @@ class GlacierProblem:
         # Joint log-precip bias (Matern field minus the optional elevation
         # depletion ramp); see effective_log_pbias for why it is static.
         precip_ = self.precip * torch.exp(self.effective_log_pbias(physical))
+        # The optional additive temperature bias is NOT pre-added to t2m here
+        # (unlike the precip line above, whose retained (12, ny, nx) cost is
+        # tolerable for a single field): the (ny, nx) tbias is threaded into
+        # the checkpointed SMB fn, which adds it per step alongside the scalar
+        # anomaly — the biased t2m is recomputed in backward instead of
+        # retained, and only an (ny, nx) gradient leaves each segment (see
+        # compute_smb). t_base (enthalpy substrate proxy) deliberately stays
+        # unbiased, matching the anomaly's treatment.
+        tbias = getattr(physical, "tbias", None)
         if self.avalanche_op is not None:
             # Hoisted avalanche (config.avalanche_hoisted): apply R here, once
             # per forward call, instead of ~150 times inside the per-step SMB
@@ -683,6 +737,7 @@ class GlacierProblem:
             H_prev_=H_prev_,
             t2m=self.t2m,
             precip_=precip_,
+            tbias=tbias,
             debris=self.debris,
             mf=mf,
             rf=rf,
@@ -777,6 +832,7 @@ class GlacierProblem:
             log_rf=physical.log_rf,
             log_mf=physical.log_mf,
             prior_means=prior_means,
+            physical_bed_uncond=getattr(physical, "bed_uncond", None),
         )
         return LossTerms(
             data_terms=data_terms,
@@ -784,7 +840,8 @@ class GlacierProblem:
             J_prior_bed_mean=J_prior_terms[1],
             J_prior_beta=J_prior_terms[2],
             J_prior_pbias=J_prior_terms[3],
-            J_prior_smb=J_prior_terms[4],
+            J_prior_tbias=J_prior_terms[4],
+            J_prior_smb=J_prior_terms[5],
         )
 
 
@@ -804,3 +861,11 @@ class PhysicalParameters:
     # Enthalpy-model scalars; only read when config.smb_model == "enthalpy".
     log_H_atm: Optional[torch.Tensor] = None
     logit_cloud: Optional[torch.Tensor] = None
+    # The unconditional bed field Map(z_bed), before the bed-conditioning
+    # kriging correction. None (or equal to bed) in the legacy
+    # parametrization; the prior term re-whitens THIS field, never the
+    # conditioned one. Optional so physical-space callers (sensitivity)
+    # still construct a valid object.
+    bed_uncond: Optional[torch.Tensor] = None
+    # Additive temperature bias field (K); None unless config.tbias_enabled.
+    tbias: Optional[torch.Tensor] = None

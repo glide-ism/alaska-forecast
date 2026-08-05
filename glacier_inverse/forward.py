@@ -68,12 +68,20 @@ def _finish_smb(smb, domain_mask, level, want_fine):
     return smb_coarse
 
 
-def compute_smb(smb_model, t2m, anomaly_terms, base_anomaly, precip_,
+def compute_smb(smb_model, t2m, tbias, anomaly_terms, base_anomaly, precip_,
                 precip_multiplier, debris, mf, rf, domain_mask,
                 level=0, want_fine=False):
     # `precip_multiplier` is a scalar applied here, inside the checkpoint, so the
     # full (12, ny, nx) scaled precip field is recomputed in backward rather than
     # stored per time step (otherwise ~50 full-grid copies are retained).
+    #
+    # `tbias` is the optional (ny, nx) additive temperature bias, added here
+    # inside the checkpoint for the same VRAM reason: the biased (12, ny, nx)
+    # t2m is recomputed in backward instead of retained for the whole run, and
+    # the broadcast-add reduces the full-rank g_t2m to an (ny, nx) gradient
+    # INSIDE each segment backward, so only the small field accumulates across
+    # the ~50 segments (otherwise two extra full-rank tensors are held:
+    # t2m + tbias and its gradient accumulation buffer). None means no bias.
     #
     # `anomaly_terms` is a tuple of (anomaly, weight) pairs: the smb source over
     # the step is the weighted mean of the smb at each anomaly (weights sum to
@@ -90,31 +98,37 @@ def compute_smb(smb_model, t2m, anomaly_terms, base_anomaly, precip_,
     precip_step = precip_ * precip_multiplier
     smb = None
     for a, w in anomaly_terms:
-        s = glare_step(smb_model, t2m + (a - base_anomaly), precip_step,
+        # Fold the scalar anomaly into the (ny, nx) bias first so the sum
+        # allocates a single (12, ny, nx) temporary.
+        shift = (a - base_anomaly) if tbias is None else tbias + (a - base_anomaly)
+        s = glare_step(smb_model, t2m + shift, precip_step,
                        mf, rf, debris).mean(axis=0)
         smb = w * s if smb is None else smb + w * s
     return _finish_smb(smb, domain_mask, level, want_fine)
 
 
-def compute_smb_enthalpy(smb_model, t2m, anomaly_terms, base_anomaly, precip_,
-                         precip_multiplier, insol_mean, t_base,
+def compute_smb_enthalpy(smb_model, t2m, tbias, anomaly_terms, base_anomaly,
+                         precip_, precip_multiplier, insol_mean, t_base,
                          H_atm, H_base0, q_sw_bulk, q_sw_insol,
                          albedo_snow, albedo_ice, M_albedo, debris, temp_dev,
                          domain_mask, level=0, want_fine=False):
     # Same contract as compute_smb (annual-mean smb, -10 fill outside the
     # domain, weighted mean over `anomaly_terms`, level restriction inside the
     # checkpoint), with the enthalpy core in place of the temperature index.
-    # The precip multiplier is applied inside the checkpoint for the same VRAM
-    # reason; `temp_dev` is the fixed weather realization, so the checkpointed
-    # re-execution during backprop reproduces the same forward. The
-    # air-temperature anomaly shifts t2m only; t_base and debris are static.
+    # The precip multiplier and the optional (ny, nx) additive temperature
+    # bias `tbias` are applied inside the checkpoint for the same VRAM reason
+    # (see compute_smb); `temp_dev` is the fixed weather realization, so the
+    # checkpointed re-execution during backprop reproduces the same forward.
+    # The air-temperature anomaly and tbias shift t2m only; t_base and debris
+    # are static.
     # Note the precip multiplier is deliberately per-step (not per-term): all
     # terms share one effective-precip field, which the glare adjoints
     # re-derive from the raw inputs each backward.
     precip_step = precip_ * precip_multiplier
     smb = None
     for a, w in anomaly_terms:
-        s = enthalpy_step(smb_model, t2m + (a - base_anomaly), precip_step,
+        shift = (a - base_anomaly) if tbias is None else tbias + (a - base_anomaly)
+        s = enthalpy_step(smb_model, t2m + shift, precip_step,
                           insol_mean, t_base, H_atm, H_base0, q_sw_bulk,
                           q_sw_insol, albedo_snow, albedo_ice, M_albedo, debris,
                           temp_dev).mean(axis=0)
@@ -289,6 +303,7 @@ def simulate(
     H_prev_,
     t2m,
     precip_,
+    tbias=None,
     debris=None,
     mf=None,
     rf=None,
@@ -323,6 +338,11 @@ def simulate(
 
     All field inputs (bed_, beta_, H_prev_) are expected at the coarse grid;
     full-grid quantities (t2m, precip_, domain_mask) are restricted internally.
+
+    `tbias` is an optional (ny, nx) additive temperature bias (K), applied to
+    t2m per step INSIDE the checkpointed SMB fn (never pre-add it to t2m —
+    doing so retains the biased (12, ny, nx) field plus a full-rank gradient
+    accumulation buffer for the whole run; see compute_smb).
 
     `smb_kind` selects the SMB backend. Both consume the static `debris`
     melt-attenuation field; "temperature_index" additionally consumes
@@ -428,7 +448,7 @@ def simulate(
         if smb_kind == "enthalpy":
             ec = enthalpy_consts
             out = checkpoint(compute_smb_enthalpy, smb_model,
-                             t2m, anomaly_terms, base_anomaly, precip_, precip_multiplier,
+                             t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
                              insol_mean, t_base,
                              H_atm, ec["H_base0"], ec["q_sw_bulk"], q_sw_insol,
                              ec["albedo_snow"], ec["albedo_ice"], ec["M_albedo"],
@@ -436,7 +456,7 @@ def simulate(
                              use_reentrant=False)
         else:
             out = checkpoint(compute_smb, smb_model,
-                             t2m, anomaly_terms, base_anomaly, precip_, precip_multiplier,
+                             t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
                              debris,
                              mf, rf, domain_mask, level, want_fine,
                              use_reentrant=False)

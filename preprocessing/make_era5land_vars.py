@@ -9,8 +9,9 @@ live side by side in the merged dataset.
 ERA5-Land ships no orography, so the CARRA lapse correction
 (lapse * (z_dem - z_model_orog)) is reproduced with a smoothed-DEM proxy:
 the project DEM is low-pass filtered to ~ERA5-Land's grid scale to stand in
-for the model surface, t2m is reduced to that surface, then a 3 K/km lapse
-rate is re-applied to the full-resolution DEM.
+for the model surface, t2m is reduced to that surface, then a 6.5 K/km lapse
+rate is re-applied to the full-resolution DEM. The same smoothed-DEM surface
+anchors the optional elevation-based precip scaling (percent per metre).
 
 Output: {domain_path}/model_inputs/gridded_climate_era5land.nc
 """
@@ -28,7 +29,8 @@ from projection_dictionary import crs
 
 ERA5LAND_PATH = Path('../common_data/climate/era5land/era5.nc')
 
-TEMPERATURE_LAPSE_RATE_K_PER_M = 0.003
+TEMPERATURE_LAPSE_RATE_K_PER_M = -0.0065
+PRECIP_ELEVATION_FACTOR_PCT_PER_M = 0.0
 ICE_DENSITY = 917.0
 WATER_DENSITY = 1000.0
 DAYS_PER_YEAR = 365
@@ -47,8 +49,17 @@ def _interpolate_to_grid(field_lat_lon, lat_asc, lon, lat_q, lon_q, method):
     return interpolant((lat_q, lon_q))
 
 
-def build_climate(domain_path: str, year: int) -> xr.Dataset:
-    """Build the gridded climate dataset for `domain_path`, `year` and write to disk."""
+def build_climate(domain_path: str, year: int,
+                  precip_elevation_factor: float =
+                      PRECIP_ELEVATION_FACTOR_PCT_PER_M) -> xr.Dataset:
+    """Build the gridded climate dataset for `domain_path`, `year` and write to disk.
+
+    `precip_elevation_factor`: elevation-based precip scaling in % per metre,
+    applied as P * max(0, 1 + 0.01*factor*(elevation - z_model)) about the
+    smoothed-DEM model surface (same reference as the temperature lapse
+    correction). 0 disables it. Overlaps with the inverse's learnable
+    depletion ramp (GlacierConfig.precip_lapse_enabled) — don't enable both.
+    """
     domain_path = Path(domain_path)
     dem_path = domain_path / 'model_inputs' / 'gridded_dem.nc'
     output_path = domain_path / 'model_inputs' / 'gridded_climate_era5land.nc'
@@ -107,6 +118,13 @@ def build_climate(domain_path: str, year: int) -> xr.Dataset:
         axis=0,
     ).astype('float32')
 
+    if precip_elevation_factor:
+        print(f"Applying elevation-based precip scaling "
+              f"({precip_elevation_factor} %/m about the smoothed-DEM surface)")
+        factor = np.maximum(
+            1.0 + 0.01 * precip_elevation_factor * (elevation - z_model), 0.0)
+        precip_fields = precip_fields * factor[None].astype('float32')
+
     months = np.arange(0, 12, dtype=np.float32) / 12
     coords = {"t": months, "y": dem.y, "x": dem.x}
     dims = ['t', 'y', 'x']
@@ -123,6 +141,7 @@ def build_climate(domain_path: str, year: int) -> xr.Dataset:
         attrs={
             "units": "m ice equivalent / yr",
             "long_name": "Precipitation rate derived from ERA5-Land at monthly time steps",
+            "precip_elevation_factor_pct_per_m": float(precip_elevation_factor),
         },
     )
 
@@ -143,5 +162,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--domain-path", type=str, required=True)
     parser.add_argument("--year", type=int, required=True)
+    parser.add_argument("--precip-elevation-factor", type=float,
+                        default=PRECIP_ELEVATION_FACTOR_PCT_PER_M,
+                        help="Elevation-based precip scaling in %% per metre, "
+                             "P * max(0, 1 + 0.01*factor*(z - z_model)). "
+                             "0 disables it.")
     args = parser.parse_args()
-    build_climate(args.domain_path, args.year)
+    build_climate(args.domain_path, args.year,
+                  precip_elevation_factor=args.precip_elevation_factor)

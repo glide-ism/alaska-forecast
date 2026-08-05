@@ -21,13 +21,14 @@ DOMAIN = "domains/st_elias"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir
-WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
+#WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
+WARM_START_PATH = f"{DOMAIN}/inverse_tbias/level_2/torch_vars.p"
 
 problem = GlacierProblem(config)
 params = problem.params
 
 if WARM_START_PATH is not None:
-    load_whitened_params_into(params, WARM_START_PATH)
+    load_whitened_params_into(params, WARM_START_PATH, priors=problem.priors)
 
 # Dump the observational products once, alongside the finest-level diagnostics.
 problem.write_observations(f"{OUTPUT_PATH}/level_{config.min_level}/vti")
@@ -41,6 +42,11 @@ optimizer_sgd = torch.optim.SGD([
 adam_groups = [
     {"params": params.z_pbias,  "lr": config.lr_z_pbias},
 ]
+if config.tbias_enabled:
+    # Additive temperature bias field; inert (z = 0) when disabled.
+    adam_groups += [
+        {"params": params.z_tbias, "lr": config.lr_z_tbias},
+    ]
 if config.smb_model == "enthalpy":
     # Enthalpy SMB scalars replace the temperature-index mf/rf pair — the
     # inactive model's z never enter the forward graph and get no gradient.
@@ -66,6 +72,8 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     pbias_coarse = differentiable_restriction(physical.pbias, level)
     pbias_total_coarse = differentiable_restriction(
         problem.effective_log_pbias(physical), level)
+    tbias_coarse = (differentiable_restriction(physical.tbias, level)
+                    if physical.tbias is not None else None)
     S_obs_coarse = differentiable_restriction(
         torch.clamp(problem.domain.dem, min=0.0), level)
     # The model rate over the same interval the dhdt misfit uses (the
@@ -79,7 +87,8 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     else:
         dhdt_coarse = (sim.H - sim.H_prev) / sim.final.dt_step
     update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
-                             pbias_coarse, pbias_total_coarse, dhdt_coarse)
+                             pbias_coarse, pbias_total_coarse, dhdt_coarse,
+                             tbias_=tbias_coarse)
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
 
@@ -96,7 +105,7 @@ for level in range(config.max_level, config.min_level - 1, -1):
 
         # Periodically emit a per-time-step VTI series.
         time_writer = (make_time_vti_writer(problem.mg[level], level_dir)
-                       if i % 20 == 0 else None)
+                       if i % 10 == 0 else None)
 
         sim, physical = problem.simulate(
             level=level, params=params, time_writer=time_writer)
@@ -137,4 +146,5 @@ for level in range(config.max_level, config.min_level - 1, -1):
         mg_lvl.forcing.smb.to_dataarray(),
     ])
     ds.to_netcdf(f"{OUTPUT_PATH}/level_{level}/inverse_soln.nc")
-    save_whitened_params(params, f"{OUTPUT_PATH}/level_{level}/torch_vars.p")
+    save_whitened_params(params, f"{OUTPUT_PATH}/level_{level}/torch_vars.p",
+                         bed_parametrization=problem.priors.bed_parametrization)

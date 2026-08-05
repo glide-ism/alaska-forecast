@@ -1,13 +1,14 @@
 """Build the gridded monthly climatology (T2M, precip) for a domain.
 
 Regrids pan-Arctic CARRA2 reanalysis fields onto the project DEM grid using
-GLARE's PanCarraBase for the projection/interpolation, then applies a 3 K/km
-lapse rate to temperature.
+GLARE's PanCarraBase for the projection/interpolation, then applies a
+6.5 K/km lapse rate to temperature and an optional elevation-based scaling
+(percent per metre) to precipitation.
 
-The temperature lapse correction uses a smoothed-DEM proxy for the model
-surface (the project DEM low-pass filtered to ~CARRA's grid scale) rather
-than CARRA's topo.grib orography. This matches make_era5land_vars.py so the
-two climatologies differ only in their source data, not in how they are
+Both elevation corrections use a smoothed-DEM proxy for the model surface
+(the project DEM low-pass filtered to ~CARRA's grid scale) rather than
+CARRA's topo.grib orography. This matches make_era5land_vars.py so the two
+climatologies differ only in their source data, not in how they are
 downscaled.
 
 An optional per-month median filter can be applied to precipitation to damp
@@ -35,6 +36,7 @@ from projection_dictionary import crs
 PANCARRA_BASE = Path('../common_data/climate/pancarra')
 MULTIYEAR_BASE = PANCARRA_BASE / '1986_2023'
 TEMPERATURE_LAPSE_RATE_K_PER_M = -0.0065
+PRECIP_ELEVATION_FACTOR_PCT_PER_M = 0.0
 ICE_DENSITY = 917.0
 DAYS_PER_YEAR = 365
 
@@ -61,7 +63,9 @@ def _calendar_month_climatology(ds: xr.Dataset, varname: str) -> xr.Dataset:
 
 def build_climate(domain_path: str, year: int,
                   precip_median_window: int = None,
-                  multiyear: bool = False) -> xr.Dataset:
+                  multiyear: bool = False,
+                  precip_elevation_factor: float =
+                      PRECIP_ELEVATION_FACTOR_PCT_PER_M) -> xr.Dataset:
     """Build the gridded climate dataset for `domain_path`, `year` and write to disk.
 
     `precip_median_window`: if set (> 1), the side length in grid cells of a
@@ -69,6 +73,12 @@ def build_climate(domain_path: str, year: int,
 
     `multiyear`: if True, replace the single-year CARRA fields with a
     calendar-month climatology from common_data/climate/pancarra/1986_2023.
+
+    `precip_elevation_factor`: elevation-based precip scaling in % per metre,
+    applied as P * max(0, 1 + 0.01*factor*(elevation - z_model)) about the
+    smoothed-DEM model surface (same reference as the temperature lapse
+    correction). 0 disables it. Overlaps with the inverse's learnable
+    depletion ramp (GlacierConfig.precip_lapse_enabled) — don't enable both.
     """
     domain_path = Path(domain_path)
     dem_path = domain_path / 'model_inputs' / 'gridded_dem.nc'
@@ -139,6 +149,13 @@ def build_climate(domain_path: str, year: int,
             axis=0,
         )
 
+    if precip_elevation_factor:
+        print(f"Applying elevation-based precip scaling "
+              f"({precip_elevation_factor} %/m about the smoothed-DEM surface)")
+        factor = np.maximum(
+            1.0 + 0.01 * precip_elevation_factor * (elevation - z_model), 0.0)
+        precip_fields = precip_fields * factor[None].astype('float32')
+
     months = np.arange(0, 12, dtype=np.float32) / 12
     coords = {"t": months, "y": dem.y, "x": dem.x}
     dims = ['t', 'y', 'x']
@@ -160,6 +177,7 @@ def build_climate(domain_path: str, year: int,
             "units": "m ice equivalent / yr",
             "long_name": "Precipitation rate derived from pan-arctic CARRA2 at monthly time steps",
             "median_filter_window": precip_median_window or 0,
+            "precip_elevation_factor_pct_per_m": float(precip_elevation_factor),
             "source": source_tag,
         },
     )
@@ -187,7 +205,13 @@ if __name__ == "__main__":
                         help="Use the multi-year CARRA file in "
                              "common_data/climate/pancarra/1986_2023, reduced "
                              "to a calendar-month climatology.")
+    parser.add_argument("--precip-elevation-factor", type=float,
+                        default=PRECIP_ELEVATION_FACTOR_PCT_PER_M,
+                        help="Elevation-based precip scaling in %% per metre, "
+                             "P * max(0, 1 + 0.01*factor*(z - z_model)). "
+                             "0 disables it.")
     args = parser.parse_args()
     build_climate(args.domain_path, args.year,
                   precip_median_window=args.precip_median_window,
-                  multiyear=args.multiyear)
+                  multiyear=args.multiyear,
+                  precip_elevation_factor=args.precip_elevation_factor)
