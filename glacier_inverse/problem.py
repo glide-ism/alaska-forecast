@@ -766,6 +766,7 @@ class GlacierProblem:
             alpha_precip=self.alpha_precip,
             dx_fine=self.dx,
             n_glen=float(cfg.n_glen),
+            grad_start_time=cfg.grad_start_time,
             flotation_factor=1.0 - cfg.rho_ice / cfg.rho_water,
             record_states_at=record_states_at,
             record_volumes_at=record_volumes_at,

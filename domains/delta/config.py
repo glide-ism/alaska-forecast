@@ -19,27 +19,28 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="delta",
-    results_subdir="inverse_tbias",
+    results_subdir="inverse_working",
     smb_model = "enthalpy",
     anomaly_integration="mean_anomaly",
+    stress_scheme='molho',
+    grad_start_time=1812,
     observations=(
         SurfaceSpec(weight=2.0e-6),
         VelocitySpec(weight=2.0e-6, surge_biased=True),
         ExtentSpec(weight=2e-5, s_H=10.0),
-        BedSpec(weight=0.0e-6),
+        BedSpec(weight=2.0e-6),
         SnowlineSpec(weight=Schedule(final=1e-5, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1e-5),
                      s_smb=0.5),
         DhdtSpec(weight=Schedule(final=1e-5, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1e-5)),
     ),
     loss_scale=1e-3,
     bed_conditioning=BedConditioningConfig(
-                         enabled=True,
+                         enabled=False,
                          sigma_picks=25,
                          sigma_dem=25,
                          pcg_rtol=1e-3,
                          pcg_rtol_adjoint=1e-2),
-    ssa_damping=1.0,
-    sliding_m=1/3.,
+    sliding_m=1.0,
     u_reg=1.0,
     beta_init=1.0,
     init_from_observed_geometry = True,
@@ -51,8 +52,7 @@ CONFIG = GlacierConfig(
     #lr_z_bed=0.025,
     alpha_t2m=2.5,
     dt=20.0,
-    tbias_enabled=True
- 
+    tbias_enabled=True,
 )
 
 """

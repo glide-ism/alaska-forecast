@@ -264,6 +264,10 @@ class SimResult:
     final: ModelState
     volumes: dict = field(default_factory=dict)
     H_prev: Optional[torch.Tensor] = None
+    # Truncated-backprop diagnostic (grad_start_time runs only): the thickness
+    # handed across the no-grad boundary, with requires_grad. After backward,
+    # H_boundary.grad is the gradient the truncation discarded.
+    H_boundary: Optional[torch.Tensor] = None
     _H_prev_fine: Optional[torch.Tensor] = None
 
     def at(self, t: float, atol: float = 1e-6) -> ModelState:
@@ -355,6 +359,7 @@ def simulate(
     base_precip: Optional[float] = None,
     alpha_precip=None,
     n_glen: float = 3.0,
+    grad_start_time: Optional[float] = None,
     flotation_factor: float = 0.0,
     record_states_at: Optional[Sequence[float]] = None,
     record_volumes_at: Optional[Sequence[float]] = None,
@@ -389,6 +394,14 @@ def simulate(
     default of 0.0 reduces the bound to a sea-level floor (inert for grounded
     ice); callers pass the physical value derived from the config.
 
+    `grad_start_time` enables truncated backpropagation through time: steps
+    ending at or before it run under torch.no_grad (identical physics, no
+    adjoint solves or retained state in backward), and the thickness handed
+    across the boundary is exposed as SimResult.H_boundary so its .grad
+    (populated by backward) measures the discarded gradient. Recorded
+    state/volume times inside the no-grad window raise. None differentiates
+    the whole run. See GlacierConfig.grad_start_time.
+
     `anomaly_integration` selects how the multi-year anomaly signal is
     integrated over each step (see GlacierConfig.anomaly_integration): "end"
     samples at the step's end time (legacy), "mean_anomaly" uses the
@@ -404,6 +417,22 @@ def simulate(
         t_start=t_start, t_end=t_end, dt_max=dt,
         required_times=merge_times(record_states_at, record_volumes_at),
     )
+
+    if grad_start_time is not None:
+        # A misfit evaluated against a no-grad snapshot silently contributes
+        # zero gradient - refuse rather than fail quietly.
+        bad = [t for t in merge_times(record_states_at, record_volumes_at)
+               if t <= grad_start_time + 1e-6]
+        if bad:
+            raise ValueError(
+                f"grad_start_time={grad_start_time} truncates gradients "
+                f"through recorded times {bad}; every recorded state/volume "
+                "time must lie strictly after it")
+        if steps[-1][0] <= grad_start_time + 1e-6:
+            raise ValueError(
+                f"grad_start_time={grad_start_time} covers the whole run "
+                f"(final step ends at {steps[-1][0]}); nothing would be "
+                "differentiated")
 
     states: dict = {}
     volumes: dict = {}
@@ -438,7 +467,19 @@ def simulate(
 
     t_prev = float(t_start)
     state = None
+    # Truncated backpropagation: H_boundary is the (detached, grad-requiring)
+    # thickness handed from the last no-grad step to the first differentiable
+    # one. After backward, its .grad is exactly the gradient the truncation
+    # discarded - the online check that grad_start_time is early enough.
+    H_boundary = None
+    prev_no_grad = False
     for t_next, dt_step in steps:
+        no_grad_step = (grad_start_time is not None
+                        and t_next <= grad_start_time + 1e-6)
+        if prev_no_grad and not no_grad_step:
+            H_prev_ = H_prev_.detach().requires_grad_()
+            H_boundary = H_prev_
+        prev_no_grad = no_grad_step
         # Anomaly terms for this step: (anomaly, weight) pairs consumed by the
         # checkpointed smb fn as a weighted mean of smb fields (weights sum
         # to 1). Raw annual values are merged before scaling so years beyond
@@ -479,24 +520,36 @@ def simulate(
             abs(t_next - tt) < 1e-6 for tt in record_states_at)
         if smb_kind == "enthalpy":
             ec = enthalpy_consts
-            out = checkpoint(compute_smb_enthalpy, smb_model,
-                             t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
-                             insol_mean, t_base,
-                             H_atm, ec["H_base0"], ec["q_sw_bulk"], q_sw_insol,
-                             ec["albedo_snow"], ec["albedo_ice"], ec["M_albedo"],
-                             debris, temp_dev, domain_mask, level, want_fine,
-                             use_reentrant=False)
+            smb_fn = compute_smb_enthalpy
+            smb_args = (smb_model,
+                        t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
+                        insol_mean, t_base,
+                        H_atm, ec["H_base0"], ec["q_sw_bulk"], q_sw_insol,
+                        ec["albedo_snow"], ec["albedo_ice"], ec["M_albedo"],
+                        debris, temp_dev, domain_mask, level, want_fine)
         else:
-            out = checkpoint(compute_smb, smb_model,
-                             t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
-                             debris,
-                             mf, rf, domain_mask, level, want_fine,
-                             use_reentrant=False)
-        smb_, smb = out if want_fine else (out, None)
+            smb_fn = compute_smb
+            smb_args = (smb_model,
+                        t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
+                        debris,
+                        mf, rf, domain_mask, level, want_fine)
 
-        u, v, ud, vd, H, active = glide_step(
-            cp.float32(t_prev), cp.float32(dt_step),
-            model, level, H_prev_, bed_, beta_, smb_)
+        if no_grad_step:
+            # Truncated-backprop spin-up: full physics, no graph - so no
+            # checkpoint (it would only warn about grad-free inputs), no
+            # adjoint solve in backward, no retained per-step state.
+            with torch.no_grad():
+                out = smb_fn(*smb_args)
+                smb_, smb = out if want_fine else (out, None)
+                u, v, ud, vd, H, active = glide_step(
+                    cp.float32(t_prev), cp.float32(dt_step),
+                    model, level, H_prev_, bed_, beta_, smb_)
+        else:
+            out = checkpoint(smb_fn, *smb_args, use_reentrant=False)
+            smb_, smb = out if want_fine else (out, None)
+            u, v, ud, vd, H, active = glide_step(
+                cp.float32(t_prev), cp.float32(dt_step),
+                model, level, H_prev_, bed_, beta_, smb_)
         # `H_prev_` here is the thickness emitted by the previous step (the input
         # to this one); capturing it before the reassignment leaves it holding
         # the second-to-last emitted thickness once the loop ends.
@@ -530,4 +583,5 @@ def simulate(
         final=state,
         volumes=volumes,
         H_prev=H_penult,
+        H_boundary=H_boundary,
     )

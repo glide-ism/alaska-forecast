@@ -8,7 +8,7 @@ share the same physical model by construction.
 """
 import inspect
 from dataclasses import dataclass, field, replace
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 # The GlacierConfig fields that may be given as a schedule instead of a constant.
 # Per-observation weights are also schedulable, but live on the observation
@@ -158,6 +158,31 @@ class GlacierConfig:
     dt: float = 20.0
     t_start: float = 1012.0
     t_end: float = 2012.0
+
+    # Truncated backpropagation through time: steps ending at or before this
+    # time run under torch.no_grad - full spin-up physics (J is unchanged),
+    # no adjoint solves, no checkpointed state. None (default) differentiates
+    # the whole run.
+    #
+    # CAUTION - the misfit forcing decaying to nothing backward in time does
+    # NOT mean the deep-time chain contributes nothing: for time-constant
+    # parameters (beta, bed) the per-step contributions accumulate coherently
+    # over the glacier response time, and an FD test on delta (level 2,
+    # dt=20) confirms the deep content is real gradient signal. The cutoff
+    # must precede the first observation epoch by several response times.
+    # Measured gradient error on delta (epochs 2000-2020): cutoff 1500 ->
+    # 0.5% (beta) / 0.2% (bed) at ~45% backward savings; 1700 -> 7%/3%;
+    # 1850 -> 31%/13%; 1950 -> 82%/31%. Rerun that sweep (vary this value,
+    # compare grads against None) when adopting it on a new domain.
+    #
+    # Guards: simulate() raises if any recorded state/volume time falls in
+    # the no-grad window, and SimResult.H_boundary.grad (populated by
+    # backward) is the adjoint seed of everything discarded - it tracks the
+    # error monotonically (delta: |.|~2e-5 at 0.5% error, ~9e-4 at 30%), so
+    # watch it drift as the optimizer moves the state. Shared by all
+    # gradient-computing tasks (MAP, RTO, sensitivity) so they optimize the
+    # same objective approximation.
+    grad_start_time: Optional[float] = None
     base_anomaly_year: int = 2012
     alpha_t2m: float = 2.2
     
