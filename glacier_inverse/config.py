@@ -303,6 +303,15 @@ class GlacierConfig:
     n_glen:   int   = 3
     A_glen:   float = 1e-16    # Pa^-n s^-1
     eps_reg:  float = 1e-5
+    H_reg:    float = 25.0
+
+    # Stress balance approximation: "ssa" (membrane stresses only, the
+    # historical physics of this repo) or "molho" (adds vertical shear; the
+    # velocity splits into a depth-averaged part u and a deformational part
+    # ud, with surface velocity u + ud/(n+1)). SSA is the exact ud == 0
+    # restriction of MOLHO, so downstream code is scheme-agnostic: ud/vd are
+    # simply zero fields under "ssa". MOLHO costs roughly 2x per solve.
+    stress_scheme: str = "ssa"
 
     # Sliding
     beta_init:   float = 2.0
@@ -358,10 +367,9 @@ class GlacierConfig:
 
     # Solver settings
     forward_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
-        relative_tolerance=1e-2, absolute_tolerance=10.0))
+        relative_tolerance=1e-2, absolute_tolerance=10.0, report_norms=False,finest_steps=50))
     adjoint_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
-        relative_tolerance=1e-3, absolute_tolerance=1e-6))
-    ssa_damping: float = 1.0
+        relative_tolerance=1e-2, absolute_tolerance=1e-5, report_norms=False,post_steps=50,finest_steps=50))
 
     # Bed GP conditioning (posterior-as-prior). See BedConditioningConfig.
     bed_conditioning: BedConditioningConfig = field(

@@ -17,7 +17,7 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/wrangell"
+DOMAIN = "domains/delta"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir
@@ -140,6 +140,8 @@ for level in range(config.max_level, config.min_level - 1, -1):
     ds = xr.merge([
         mg_lvl.state.u.to_dataarray(),
         mg_lvl.state.v.to_dataarray(),
+        mg_lvl.state.ud.to_dataarray(),
+        mg_lvl.state.vd.to_dataarray(),
         mg_lvl.state.H.to_dataarray(),
         mg_lvl.geometry.bed.to_dataarray(),
         mg_lvl.sliding.beta.to_dataarray(),

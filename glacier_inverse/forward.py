@@ -171,13 +171,21 @@ class ModelState:
     snapshot that a loss term never touches never pays for prolongation.
     """
 
-    def __init__(self, *, t: float, dt_step: float, level: int, u, v, H, active,
-                 smb_fine, smb_coarse, bed_coarse, flotation_factor: float):
+    def __init__(self, *, t: float, dt_step: float, level: int, u, v, ud, vd,
+                 H, active, smb_fine, smb_coarse, bed_coarse,
+                 flotation_factor: float, n_glen: float):
         self.t = t
         self.dt_step = dt_step   # length of the step that emitted this state
         self.level = level
+        # u/v are the depth-averaged velocity components; ud/vd the MOLHO
+        # deformational parts (identically zero under stress_scheme="ssa",
+        # so everything downstream is scheme-agnostic). Surface velocity —
+        # what feature-tracked mosaics observe — is u + ud/(n+1).
         self.u = u
         self.v = v
+        self.ud = ud
+        self.vd = vd
+        self.n_glen = n_glen
         self.H = H
         self.active = active
         # The SMB step runs on the fine grid and is restricted for the
@@ -209,6 +217,21 @@ class ModelState:
     def v_fine(self):
         return self._lazy("v_fine", lambda: differentiable_prolongation(
             self.v, self.level, grid_entity="hfacet"))
+
+    # Surface velocity u + ud/(n+1): summed at the coarse level so only one
+    # prolongation runs (prolongation is linear). Under SSA this equals u/v
+    # exactly (ud == 0) but costs one extra add per accessed snapshot.
+    @property
+    def u_surf_fine(self):
+        return self._lazy("u_surf_fine", lambda: differentiable_prolongation(
+            self.u + self.ud / (self.n_glen + 1.0), self.level,
+            grid_entity="vfacet"))
+
+    @property
+    def v_surf_fine(self):
+        return self._lazy("v_surf_fine", lambda: differentiable_prolongation(
+            self.v + self.vd / (self.n_glen + 1.0), self.level,
+            grid_entity="hfacet"))
 
     @property
     def H_fine(self):
@@ -267,6 +290,10 @@ class SimResult:
     @property
     def v(self): return self.final.v
     @property
+    def ud(self): return self.final.ud
+    @property
+    def vd(self): return self.final.vd
+    @property
     def H(self): return self.final.H
     @property
     def active(self): return self.final.active
@@ -278,6 +305,10 @@ class SimResult:
     def u_fine(self): return self.final.u_fine
     @property
     def v_fine(self): return self.final.v_fine
+    @property
+    def u_surf_fine(self): return self.final.u_surf_fine
+    @property
+    def v_surf_fine(self): return self.final.v_surf_fine
     @property
     def H_fine(self): return self.final.H_fine
     @property
@@ -323,6 +354,7 @@ def simulate(
     precip_anomaly=None,
     base_precip: Optional[float] = None,
     alpha_precip=None,
+    n_glen: float = 3.0,
     flotation_factor: float = 0.0,
     record_states_at: Optional[Sequence[float]] = None,
     record_volumes_at: Optional[Sequence[float]] = None,
@@ -462,8 +494,9 @@ def simulate(
                              use_reentrant=False)
         smb_, smb = out if want_fine else (out, None)
 
-        u, v, H, active = glide_step(cp.float32(t_prev), cp.float32(dt_step),
-                                     model, level, H_prev_, bed_, beta_, smb_)
+        u, v, ud, vd, H, active = glide_step(
+            cp.float32(t_prev), cp.float32(dt_step),
+            model, level, H_prev_, bed_, beta_, smb_)
         # `H_prev_` here is the thickness emitted by the previous step (the input
         # to this one); capturing it before the reassignment leaves it holding
         # the second-to-last emitted thickness once the loop ends.
@@ -472,9 +505,10 @@ def simulate(
         t_prev = t_next
 
         state = ModelState(
-            t=t_next, dt_step=dt_step, level=level, u=u, v=v, H=H, active=active,
+            t=t_next, dt_step=dt_step, level=level, u=u, v=v, ud=ud, vd=vd,
+            H=H, active=active,
             smb_fine=smb, smb_coarse=smb_, bed_coarse=bed_,
-            flotation_factor=flotation_factor,
+            flotation_factor=flotation_factor, n_glen=n_glen,
         )
 
         # Record snapshots/volumes keyed by the caller's exact requested floats.

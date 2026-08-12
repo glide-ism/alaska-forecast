@@ -296,7 +296,8 @@ class GlacierProblem:
     def _build_ice_dynamics(self, ny, nx, dx, x0, y0) -> IceDynamics:
         cfg = self.config
         model = IceDynamics(n_levels=cfg.n_levels, ny=ny, nx=nx, dx=dx,
-                            x0=x0, y0=y0, crs=self.crs)
+                            x0=x0, y0=y0, crs=self.crs,
+                            stress_scheme=cfg.stress_scheme)
         mg = model.mg
 
         mg.state.H.set(0.1)
@@ -310,6 +311,7 @@ class GlacierProblem:
         mg.rheology.B.set(cfg.B_rate)
         mg.rheology.eps_reg.set(cfg.eps_reg)
         mg.rheology.n.set(float(cfg.n_glen))
+        mg.rheology.H_reg.set(float(cfg.H_reg))
 
         mg.sliding.beta.set(cfg.beta_init)
         mg.sliding.m.set(cfg.sliding_m)
@@ -320,8 +322,11 @@ class GlacierProblem:
 
         _apply_solver_settings(model.forward_solver.fas_options, cfg.forward_solver)
         _apply_solver_settings(model.adjoint_solver.fas_options, cfg.adjoint_solver)
-        model.adjoint_solver.vanka_options.newton_options.ssa_damping.set(
-            cp.float32(cfg.ssa_damping))
+        model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(
+            cp.float32(0.1))
+        model.adjoint_solver.vanka_options.omega.set(0.25)
+        #model.forward_solver.vanka_options.newton_options.momentum_damping.set(
+        #    cp.float32(1.0))
         return model
 
     def _build_smb_model(self, ny, nx, dx, x0, y0):
@@ -641,11 +646,15 @@ class GlacierProblem:
         mg = self.mg
         mg.state.u.set(0.0, start_level=level)
         mg.state.v.set(0.0, start_level=level)
+        mg.state.ud.set(0.0, start_level=level)
+        mg.state.vd.set(0.0, start_level=level)
         mg.state.H.set(0.1, start_level=level)
         mg.state.H_prev.set(0.1, start_level=level)
         mg.state.mask.set(0.0, start_level=level)
         mg.adjoint.lambda_u.set(0.0, start_level=level)
         mg.adjoint.lambda_v.set(0.0, start_level=level)
+        mg.adjoint.lambda_ud.set(0.0, start_level=level)
+        mg.adjoint.lambda_vd.set(0.0, start_level=level)
         mg.adjoint.lambda_H.set(0.0, start_level=level)
 
     def update_depth(self, bed: torch.Tensor) -> None:
@@ -756,6 +765,7 @@ class GlacierProblem:
             base_precip=self.base_precip,
             alpha_precip=self.alpha_precip,
             dx_fine=self.dx,
+            n_glen=float(cfg.n_glen),
             flotation_factor=1.0 - cfg.rho_ice / cfg.rho_water,
             record_states_at=record_states_at,
             record_volumes_at=record_volumes_at,

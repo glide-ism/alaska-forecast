@@ -186,8 +186,10 @@ class VelocityObservation(Observation):
 
         scale = config.loss_scale * dx ** 2
         state = sim.at(self.time)
-        u_fine = state.u_fine
-        v_fine = state.v_fine
+        # Feature-tracked mosaics observe the SURFACE velocity, u + ud/(n+1)
+        # under MOLHO (identical to the depth-averaged u under SSA, ud == 0).
+        u_fine = state.u_surf_fine
+        v_fine = state.v_surf_fine
         u_pred = (u_fine[:, 1:] + u_fine[:, :-1]) / 2.0
         v_pred = (v_fine[1:, :] + v_fine[:-1, :]) / 2.0
 
@@ -512,6 +514,8 @@ class DivideFluxObservation(Observation):
 
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
         state = sim.at(self.time)
+        # Deliberately the depth-AVERAGED velocity (not surface): ice flux is
+        # exactly u_bar * H in both stress schemes.
         u = (state.u_fine[:, 1:] + state.u_fine[:, :-1]) / 2.0
         v = (state.v_fine[1:, :] + state.v_fine[:-1, :]) / 2.0
         q = state.H_fine * torch.sqrt(u ** 2 + v ** 2 + 1e-6)
