@@ -68,10 +68,6 @@ if config.precip_lapse_enabled:
 optimizer_adam = torch.optim.Adam(adam_groups, betas=(0.5, 0.99))
 
 def write_loss_vti(diag, vti_writer, sim, physical, level, i):
-    # Physical-space bed gradient dJ/d(bed): present only when called after
-    # backward on a graph where physical.bed.retain_grad() was set.
-    bed_grad_coarse = (differentiable_restriction(physical.bed.grad, level)
-                      if physical.bed.grad is not None else None)
     bed_mean_coarse = differentiable_restriction(physical.bed_mean, level)
     pbias_coarse = differentiable_restriction(physical.pbias, level)
     pbias_total_coarse = differentiable_restriction(
@@ -92,7 +88,7 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
         dhdt_coarse = (sim.H - sim.H_prev) / sim.final.dt_step
     update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
                              pbias_coarse, pbias_total_coarse, dhdt_coarse,
-                             tbias_=tbias_coarse, bed_grad_=bed_grad_coarse)
+                             tbias_=tbias_coarse)
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
 
@@ -113,17 +109,14 @@ for level in range(config.max_level, config.min_level - 1, -1):
 
         sim, physical = problem.simulate(
             level=level, params=params, time_writer=time_writer)
-        # Keep the physical bed's gradient so the VTI diagnostics can show
-        # dJ/d(bed) (a non-leaf tensor; autograd discards it otherwise).
-        physical.bed.retain_grad()
         loss_terms = problem.compute_loss(
             sim=sim, physical=physical, params=params,
             iteration=i, level=level, schedule=True)
         loss_terms.log(i)
 
-        loss_terms.J.backward()
-        # After backward so the gradient diagnostics are this iteration's.
         write_loss_vti(diag, vti_writer, sim, physical, level, i)
+        
+        loss_terms.J.backward()
         optimizer_sgd.step()
         optimizer_adam.step()
 

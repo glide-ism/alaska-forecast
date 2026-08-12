@@ -23,7 +23,6 @@ class DiagnosticFields:
     p_bias_total: Field    # joint bias: spatial minus elevation-depletion ramp
     t_bias: Field          # additive temperature bias (K); zeros when disabled
     dhdt: Field
-    bed_grad: Field        # dJ/d(bed), physical space; zeros before backward
 
 
 def make_diagnostic_fields(mg_level) -> DiagnosticFields:
@@ -37,7 +36,7 @@ def make_diagnostic_fields(mg_level) -> DiagnosticFields:
         )
     return DiagnosticFields(delta=_empty(), srf=_empty(), bed_mean=_empty(),
                             p_bias=_empty(), p_bias_total=_empty(),
-                            t_bias=_empty(), dhdt=_empty(), bed_grad=_empty())
+                            t_bias=_empty(), dhdt=_empty())
 
 
 def make_loss_vti_writer(mg_level, output_dir: str, base: str, diag: DiagnosticFields) -> VTIWriter:
@@ -58,7 +57,6 @@ def make_loss_vti_writer(mg_level, output_dir: str, base: str, diag: DiagnosticF
             "t_bias": diag.t_bias,
             "bed_mean": diag.bed_mean,
             "dhdt": diag.dhdt,
-            "bed_grad": diag.bed_grad,
             "smb": mg_level.forcing.smb,
         },
     )
@@ -113,8 +111,7 @@ def write_static_vti(mg_level, output_dir: str, base: str,
 
 
 def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbias_,
-                             pbias_total_, dhdt_, tbias_=None,
-                             bed_grad_=None) -> None:
+                             pbias_total_, dhdt_, tbias_=None) -> None:
     """Copy detached tensors into the cupy-backed diagnostic Fields.
 
     `pbias_` is the spatial (Matern) log-precip bias; `pbias_total_` is the joint
@@ -125,9 +122,7 @@ def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbia
     coarse-grid surface elevation-change rate (m/yr) for this iterate over the
     same interval the dhdt misfit uses — DhdtObservation.model_rate(sim,
     "coarse"): the observation window (H(t1) - H(t0))/(t1 - t0) in two-snapshot
-    mode, or the true final step in legacy/no-product mode. `bed_grad_` is the
-    physical-space bed gradient dJ/d(bed) restricted to the writer's level
-    (available only after backward; None writes zeros).
+    mode, or the true final step in legacy/no-product mode.
     """
     diag.delta.data[:, :] = cp.asarray(S_.detach() - S_obs_)
     diag.srf.data[:, :] = cp.asarray(S_.detach())
@@ -139,10 +134,6 @@ def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbia
     else:
         diag.t_bias.data[:, :] = cp.asarray(tbias_.detach())
     diag.dhdt.data[:, :] = cp.asarray(dhdt_.detach())
-    if bed_grad_ is None:
-        diag.bed_grad.data[:, :] = 0.0
-    else:
-        diag.bed_grad.data[:, :] = cp.asarray(bed_grad_.detach())
 
 
 def save_whitened_params(params, path: str, *, extras: dict = None,
