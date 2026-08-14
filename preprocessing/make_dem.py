@@ -35,6 +35,7 @@ import requests
 import rioxarray
 import xarray as xr
 from bmi_topography import Topography
+from scipy.ndimage import gaussian_filter
 
 from projection_dictionary import crs
 
@@ -317,6 +318,7 @@ def build_dem(domain_path: str) -> xr.Dataset:
         dem_ds.topography,
         dem_ds.bathymetry,
     )
+    #dem_ds.data[:,:] = gaussian_filter(dem_ds.elevation.data[:,:],2)
     dem_ds['bathymetry_mask'] = xr.where(dem_ds.topography > 0, False, True)
     dem_ds['x'] = dem_ds['x'].astype('float32')
     dem_ds['y'] = dem_ds['y'].astype('float32')
@@ -386,4 +388,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--domain-path", type=str, required=True)
     args = parser.parse_args()
-    build_dem(args.domain_path)
+    dat = build_dem(args.domain_path)

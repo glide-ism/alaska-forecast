@@ -213,8 +213,8 @@ class GlacierConfig:
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,  l=1000.0,  nu=1)
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0, l=10000.0, nu=1)
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,    l=1000.0,  nu=1)
-    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.05,    l=10000.0, nu=1)
-    tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=1.0,     l=10000.0, nu=1)
+    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.025,    l=10000.0, nu=1)
+    tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.25,     l=20000.0, nu=1)
 
     # Optional additive temperature bias field (units: K). A Matern GP field
     # added to the monthly t2m before the anomaly shift — the spatial,
@@ -327,8 +327,8 @@ class GlacierConfig:
     gravity:  float = 9.81
     n_glen:   int   = 3
     A_glen:   float = 1e-16    # Pa^-n s^-1
-    eps_reg:  float = 1e-5
-    H_reg:    float = 25.0
+    eps_reg:  float = 1e-6
+    H_reg:    float = 50.0
 
     # Stress balance approximation: "ssa" (membrane stresses only, the
     # historical physics of this repo) or "molho" (adds vertical shear; the
@@ -434,8 +434,8 @@ class GlacierConfig:
     lr_z_bed_mean: float = 0.5
     lr_z_log_beta: float = 0.05
 
-    lr_z_pbias:    float = 0.001
-    lr_z_tbias:    float = 0.001
+    lr_z_pbias:    float = 0.002
+    lr_z_tbias:    float = 0.002
     lr_z_log_mf:   float = 0.01
     lr_z_log_rf:   float = 0.01
     # Enthalpy-model scalars (Adam block, used in place of z_log_mf/z_log_rf

@@ -368,8 +368,8 @@ class SnowlineObservation(Observation):
         smb = sim.at(self.time).smb_fine
         logits = smb / self.s_smb
         y = torch.nn.functional.sigmoid(logits)
-#        brier = (self.snow_mask * ((y - self.snow_label) / 0.25) ** 2).sum()
-        brier = (self.snow_mask * self.snow_label * ((1.0 - y) / 0.25)**2).sum()
+        brier = (self.snow_mask * ((y - self.snow_label) / 0.25) ** 2).sum()
+        #brier = (self.snow_mask * self.snow_label * ((1.0 - y) / 0.25)**2).sum()
         return config.loss_scale * weight * dx ** 2 * brier
 
     def diagnostics(self):

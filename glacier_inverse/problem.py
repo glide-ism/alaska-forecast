@@ -312,6 +312,7 @@ class GlacierProblem:
         mg.rheology.eps_reg.set(cfg.eps_reg)
         mg.rheology.n.set(float(cfg.n_glen))
         mg.rheology.H_reg.set(float(cfg.H_reg))
+        #mg.rheology.slope_sat.set(float(0.15))
 
         mg.sliding.beta.set(cfg.beta_init)
         mg.sliding.m.set(cfg.sliding_m)
@@ -322,9 +323,10 @@ class GlacierProblem:
 
         _apply_solver_settings(model.forward_solver.fas_options, cfg.forward_solver)
         _apply_solver_settings(model.adjoint_solver.fas_options, cfg.adjoint_solver)
-        model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(
-            cp.float32(0.1))
-        model.adjoint_solver.vanka_options.omega.set(0.25)
+        model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.01))
+        model.adjoint_solver.vanka_options.newton_options.shear_damping.set(cp.float32(0.01))
+        #model.adjoint_solver._fas_config.maximum_vcycles=5
+        #model.adjoint_solver.fas_options.maximum_vcycle.set(3)
         #model.forward_solver.vanka_options.newton_options.momentum_damping.set(
         #    cp.float32(1.0))
         return model
