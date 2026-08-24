@@ -273,6 +273,8 @@ class ExtentObservation(Observation):
         p_extent = p_extent_dyn * (1 - active_fine) + p_extent_smb * active_fine
         return config.loss_scale * weight * dx ** 2 * (
             mask * ((1 - p_extent) / 0.5) ** 2).sum()
+        #return config.loss_scale * weight * dx ** 2 * (
+        #    ((mask - p_extent) / 0.5) ** 2).sum()
 
 
 class BedObservation(Observation):
@@ -368,8 +370,8 @@ class SnowlineObservation(Observation):
         smb = sim.at(self.time).smb_fine
         logits = smb / self.s_smb
         y = torch.nn.functional.sigmoid(logits)
-        brier = (self.snow_mask * ((y - self.snow_label) / 0.25) ** 2).sum()
-        #brier = (self.snow_mask * self.snow_label * ((1.0 - y) / 0.25)**2).sum()
+        #brier = (self.snow_mask * ((y - self.snow_label) / 0.25) ** 2).sum()
+        brier = (self.snow_mask * self.snow_label * ((1.0 - y) / 0.25)**2).sum()
         return config.loss_scale * weight * dx ** 2 * brier
 
     def diagnostics(self):
@@ -525,6 +527,79 @@ class DivideFluxObservation(Observation):
 
     def diagnostics(self):
         return {"divide_mask": self.divide_mask}
+
+
+class BedSlopeObservation(Observation):
+    """Flow-aligned bed-slope penalty: J = sum mask * |u . grad(B) / s_scale|^p.
+
+    A prior-style pseudo-observation (like DivideFluxObservation), not a data
+    product: it penalizes the bed for having slopes transverse to the flow —
+    riegel-like ramps whose gradient points along the velocity — encoding the
+    expectation that the bed under flowing ice varies little along flowlines
+    (equivalently, that flow follows bed contours). u . grad(B) is exactly the
+    bed-parallel-flow vertical velocity at the base, so the penalty also reads
+    as "sliding ice should not be forced up/down bed steps". Whether this is a
+    *sensible* prior is an open question — it fights real overdeepenings and
+    riegels — hence opt-in with its own weight.
+
+    `velocity` selects which model velocity weights the gradient: "base"
+    (u - ud, glide's sliding velocity — the default, and the physically
+    natural choice since only sliding ice feels the bed), "surface", or
+    "average" (depth-averaged). Under SSA all three coincide.
+
+    The dot product is formed in geographic coordinates: `col_sign`/`row_sign`
+    map the raster's index axes onto +x/+y (build() derives them from the
+    input file's coordinate ordering, so north-up rasters get row_sign = -1).
+    `s0` is a deadband (m/yr of u.grad(B)) below which no penalty accrues;
+    `s_scale` normalizes the excess before the exponent `p`; `eps` (m/yr)
+    smooths |.| at zero so p <= 1 keeps finite gradients. `randomized` is the
+    identity: there is no observational noise to perturb.
+    """
+
+    name = "bedslope"
+
+    def __init__(self, *, time: float, p: float, s0: float, s_scale: float,
+                 eps: float, velocity: str, col_sign: float, row_sign: float,
+                 weight: LossWeight):
+        super().__init__(weight=weight)
+        if velocity not in ("base", "surface", "average"):
+            raise ValueError(
+                f"velocity must be 'base', 'surface' or 'average', got "
+                f"{velocity!r}")
+        self.time = time
+        self.p = p
+        self.s0 = s0
+        self.s_scale = s_scale
+        self.eps = eps
+        self.velocity = velocity
+        self.col_sign = col_sign
+        self.row_sign = row_sign
+
+    @property
+    def required_times(self):
+        return (self.time,)
+
+    def flow_aligned_slope(self, state, bed, dx) -> torch.Tensor:
+        """Cell-centered u . grad(B) (m/yr) — the quantity the loss penalizes.
+        Exposed so drivers can dump it as a per-iteration diagnostic."""
+        if self.velocity == "base":
+            u_f, v_f = state.u_base_fine, state.v_base_fine
+        elif self.velocity == "surface":
+            u_f, v_f = state.u_surf_fine, state.v_surf_fine
+        else:
+            u_f, v_f = state.u_fine, state.v_fine
+        u = (u_f[:, 1:] + u_f[:, :-1]) / 2.0
+        v = (v_f[1:, :] + v_f[:-1, :]) / 2.0
+        dB_drow, dB_dcol = torch.gradient(bed, spacing=dx)
+        return u * self.col_sign * dB_dcol + v * self.row_sign * dB_drow
+
+    def loss(self, *, sim, physical, config, domain, mask, dx, weight):
+        state = sim.at(self.time)
+        dot = self.flow_aligned_slope(state, physical.bed, dx)
+        r = torch.sqrt(torch.relu(dot) ** 2) / self.s_scale
+        #mag = torch.sqrt(dot ** 2 + self.eps ** 2)
+        #r = torch.relu(mag - self.s0) / self.s_scale
+        return config.loss_scale * weight * dx ** 2 * (mask * r ** self.p).sum()
 
 
 # --------------------------------------------------------------------------- #
@@ -758,6 +833,39 @@ class DivideFluxSpec:
         return DivideFluxObservation(
             divide_mask=divide_mask, time=time, q0=self.q0,
             q_scale=self.q_scale, weight=self.weight)
+
+
+@dataclass(frozen=True)
+class BedSlopeSpec:
+    """Opt-in flow-aligned bed-slope penalty (see BedSlopeObservation).
+
+    Scaling: `s_scale` sets the m/yr of u.grad(B) that costs O(1) per cell
+    (before `weight`); the default corresponds to e.g. 100 m/yr of sliding
+    across a 10% bed slope. `s0` is a free allowance below which nothing is
+    penalized; `p` is the exponent (p = 2 quadratic, p = 1 an L1-like penalty
+    smoothed by `eps`). `velocity` picks base/surface/average model velocity.
+    """
+    weight: LossWeight = 1e-5
+    p: float = 2.0
+    s0: float = 0.0                 # deadband on |u.grad(B)| (m/yr)
+    s_scale: float = 10.0           # normalization of the excess (m/yr)
+    eps: float = 1e-3               # |.| smoothing near zero (m/yr)
+    velocity: str = "base"          # "base" | "surface" | "average"
+    time: Optional[float] = None    # evaluation epoch; None -> t_end
+
+    def build(self, ctx: ObservationBuildContext) -> "BedSlopeObservation":
+        cfg = ctx.config
+        gd = ctx.gridded_data
+        # Map raster index axes onto geographic +x/+y so the dot product uses
+        # the same velocity convention the vx/vy misfit does (north-up files
+        # have descending y, hence row_sign = -1).
+        col_sign = 1.0 if float(gd.x.values[1] - gd.x.values[0]) > 0 else -1.0
+        row_sign = 1.0 if float(gd.y.values[1] - gd.y.values[0]) > 0 else -1.0
+        time = float(self.time) if self.time is not None else float(cfg.t_end)
+        return BedSlopeObservation(
+            time=time, p=self.p, s0=self.s0, s_scale=self.s_scale,
+            eps=self.eps, velocity=self.velocity, col_sign=col_sign,
+            row_sign=row_sign, weight=self.weight)
 
 
 def default_observation_specs(config=None) -> tuple:

@@ -73,7 +73,12 @@ coordinates is set by prior curvature), so changing a prior usually means retuni
 prior-style `DivideFluxSpec` — a quadratic penalty on ice flux across RGI drainage
 divides, the anti-basin-piracy term; its mask drops confluences where the velocity
 mosaic shows real cross-boundary flow, and it dumps a `divide_mask` diagnostic for
-validation) via
+validation, and the opt-in prior-style `BedSlopeSpec` — a penalty
+`sum mask * |u . grad(B) / s_scale|^p` on flow-aligned bed slope, with `velocity=`
+selecting the basal (`u - ud`, default)/surface/depth-averaged model velocity, plus
+`p`, an `s0` deadband, and an `eps` smoothing of |.|; its
+`BedSlopeObservation.flow_aligned_slope(state, bed, dx)` exposes the penalized field
+for diagnostics) via
 `GlacierConfig(observations=(...))`; `GlacierProblem` calls `spec.build(ctx)` to load the
 data on the cropped grid (specs return `None` when the product file is absent — the term
 simply doesn't exist). Acquisition times come from **variable-level NetCDF attrs**

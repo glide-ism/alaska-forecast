@@ -233,6 +233,19 @@ class ModelState:
             self.v + self.vd / (self.n_glen + 1.0), self.level,
             grid_entity="hfacet"))
 
+    # Basal (sliding) velocity u - ud: glide's drag rows act on u_b = u - ud
+    # (see glide residuals.cu). Under SSA ud == 0 so this equals u/v exactly.
+    # Differenced at the coarse level so only one prolongation runs.
+    @property
+    def u_base_fine(self):
+        return self._lazy("u_base_fine", lambda: differentiable_prolongation(
+            self.u - self.ud, self.level, grid_entity="vfacet"))
+
+    @property
+    def v_base_fine(self):
+        return self._lazy("v_base_fine", lambda: differentiable_prolongation(
+            self.v - self.vd, self.level, grid_entity="hfacet"))
+
     @property
     def H_fine(self):
         return self._lazy("H_fine", lambda: differentiable_prolongation(

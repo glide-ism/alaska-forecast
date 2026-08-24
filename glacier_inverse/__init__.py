@@ -7,8 +7,9 @@ from .priors import GlacierPriors
 from .problem import GlacierProblem, WhitenedParameters
 from .loss import LossTerms, PriorMeans
 from .observations import (
-    BedSpec, DhdtSpec, DivideFluxSpec, DomainData, ExtentSpec, Observation,
-    SnowlineSpec, SurfaceSpec, VelocitySpec, default_observation_specs,
+    BedSlopeSpec, BedSpec, DhdtSpec, DivideFluxSpec, DomainData, ExtentSpec,
+    Observation, SnowlineSpec, SurfaceSpec, VelocitySpec,
+    default_observation_specs,
 )
 from .scheduling import build_step_sequence, merge_times
 
@@ -43,6 +44,7 @@ __all__ = [
     "SnowlineSpec",
     "DhdtSpec",
     "DivideFluxSpec",
+    "BedSlopeSpec",
     "default_observation_specs",
     "build_step_sequence",
     "merge_times",

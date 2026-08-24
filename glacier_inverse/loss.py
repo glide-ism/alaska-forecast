@@ -74,6 +74,7 @@ class PriorMeans:
 _LOG_LABELS = {
     "srf": "Srf", "vel": "U", "extent": "Ext",
     "bed": "Bed", "snow": "Snow", "dhdt": "dHdt", "divide": "Div",
+    "bedslope": "BSlope",
 }
 
 
