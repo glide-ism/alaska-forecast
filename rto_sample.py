@@ -23,23 +23,23 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/delta"
+DOMAIN = "domains/st_elias"
 config = load_config(DOMAIN)
 
 
 INPUT_PATH = config.output_dir
-WARM_START_PATH = f"{INPUT_PATH}/level_2/torch_vars.p"
+WARM_START_PATH = f"{INPUT_PATH}/level_3/torch_vars.p"
 
-N_SAMPLES = 250
-LEVEL = 2
-ITERS_PER_SAMPLE = 50
+N_SAMPLES = 100
+LEVEL = 3
+ITERS_PER_SAMPLE = 100
 
 # Cosine learning-rate decay applied per-sample. Each parameter group's LR
 # anneals from its base value down to LR_FINAL_RATIO * base_lr over
 # ITERS_PER_SAMPLE iterations, which damps end-of-run oscillation around the
 # perturbed MAP. Set LR_FINAL_RATIO = 1.0 to disable; lower it (e.g. 0.001)
 # to settle harder.
-LR_FINAL_RATIO = 0.01
+LR_FINAL_RATIO = 1.0
 
 
 def cosine_ratio(step: int) -> float:
@@ -131,7 +131,7 @@ class InitScheme:
     """
     z_bed:      Init = Init.MAP
     z_bed_mean: Init = Init.MAP_PLUS_SAMPLE
-    z_log_beta: Init = Init.MAP_PLUS_SAMPLE
+    z_log_beta: Init = Init.MAP#_PLUS_SAMPLE
     z_pbias:    Init = Init.MAP_PLUS_SAMPLE
     z_log_mf:   Init = Init.MAP_PLUS_SAMPLE
     z_log_rf:   Init = Init.MAP_PLUS_SAMPLE
@@ -157,7 +157,7 @@ problem = GlacierProblem(config)
 params = problem.params
 
 if WARM_START_PATH is not None:
-    load_whitened_params_into(params, WARM_START_PATH)
+    load_whitened_params_into(params, WARM_START_PATH, priors=problem.priors)
 
 # Snapshot the warm-start state. Each sample resets params in-place to this
 # before perturbing — keeps tensor identities stable so per-sample optimizers
@@ -172,8 +172,12 @@ noise_source = NoiseSource(NOISE_SCHEME, sobol_dim=SOBOL_DIM, seed=SOBOL_SEED)
 def write_loss_vti(diag, vti_writer, sim, physical, observations, i):
     bed_mean_coarse = differentiable_restriction(physical.bed_mean, LEVEL)
     pbias_coarse = differentiable_restriction(physical.pbias, LEVEL)
+    pbias_total_coarse = differentiable_restriction(
+        problem.effective_log_pbias(physical), LEVEL)
     S_obs_coarse = differentiable_restriction(observations.S_obs, LEVEL)
-    update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse, pbias_coarse)
+    dhdt_coarse = (sim.H - sim.H_prev) / config.dt
+    update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
+                             pbias_coarse, pbias_total_coarse, dhdt_coarse)
     vti_writer.append(problem.mg[LEVEL], time=i)
     vti_writer.write_pvd()
 
@@ -184,7 +188,7 @@ for f in INIT_SCHEME.__dataclass_fields__:
 print(f"Noise scheme:  {NOISE_SCHEME.value}"
       + (f"  (Sobol d={noise_source.sobol_d})" if noise_source.engine else ""))
 
-for sample_idx in range(28,N_SAMPLES):
+for sample_idx in range(N_SAMPLES):
     output_path = f"{INPUT_PATH}/rto_lr_decay/rto_{sample_idx:04d}/"
     print(f"\n=== Sample {sample_idx + 1}/{N_SAMPLES}  →  rto_{sample_idx} ===")
 
@@ -200,11 +204,33 @@ for sample_idx in range(28,N_SAMPLES):
     eps_z_bed_mean = noise_source.randn_like(params.z_bed_mean)
     eps_z_log_beta = noise_source.randn_like(params.z_log_beta)
     eps_z_pbias    = noise_source.randn_like(params.z_pbias)
+    # NOTE: when this script is migrated to the time-stamped-observation API,
+    # a tbias-enabled domain also needs an eps_z_tbias draw — appended AFTER
+    # the existing draw order (like eps_bed_cond below) so QMC dimension
+    # assignment stays stable — plus PriorMeans(z_tbias=...), the init loop,
+    # and an Adam group gated on config.tbias_enabled.
     eps_u_obs      = noise_source.randn_like(problem.observations.u_obs)
     eps_v_obs      = noise_source.randn_like(problem.observations.v_obs)
     eps_S_obs      = noise_source.randn_like(problem.observations.S_obs)
     mask_uniform   = noise_source.rand_like(
         problem.observations.rgi_mask.to(torch.float32))
+
+    # Bed-conditioning data perturbation (Matheron's rule). Appended AFTER the
+    # pre-existing draw order so QMC dimension assignment stays stable. The
+    # precision-weighted per-cell datum has variance 1/D_ii, and the perturbed
+    # data must reach the conditioning MAP (not a loss term) — hence the
+    # problem-level override rather than obs.randomized().
+    eps_bed_cond = None
+    if problem.priors.bed_conditioner is not None:
+        cond = problem.priors.bed_conditioner
+        b_data = torch.tensor(cond.data)
+        D_prec = torch.tensor(cond.precision)
+        eps_bed_cond = noise_source.randn_like(b_data)
+        observed = D_prec > 0
+        sigma_cell = torch.where(observed, D_prec,
+                                 torch.ones_like(D_prec)).rsqrt()
+        problem.set_bed_data_override(
+            b_data + observed.to(b_data.dtype) * sigma_cell * eps_bed_cond)
 
     observations = problem.observations.randomized(
         sigma_u=config.sigma_u, sigma_s=config.sigma_s, sigma_bed=config.sigma_s,
@@ -221,17 +247,17 @@ for sample_idx in range(28,N_SAMPLES):
         initialize_param(name, params, warm_start, prior_means,
                          getattr(INIT_SCHEME, name))
 
-    fac = 2.0
+    fac = 1.0
     optimizer_sgd = torch.optim.SGD([
-        {"params": params.z_bed,      "lr": fac * 0.2},
-        {"params": params.z_bed_mean, "lr": fac * 1.0},
-        {"params": params.z_log_beta, "lr": fac * 0.75},
+        {"params": params.z_bed,      "lr": fac * config.lr_z_bed},
+        {"params": params.z_bed_mean, "lr": fac * config.lr_z_bed_mean},
+        {"params": params.z_log_beta, "lr": fac * config.lr_z_log_beta},
     ], momentum=0.5)
 
     optimizer_adam = torch.optim.Adam([
-        {"params": params.z_pbias,  "lr": fac * 0.0003},
-        {"params": params.z_log_mf, "lr": fac * 0.01},
-        {"params": params.z_log_rf, "lr": fac * 0.01},
+        {"params": params.z_pbias,  "lr": fac * config.lr_z_pbias},
+        {"params": params.z_log_mf, "lr": fac * config.lr_z_log_mf},
+        {"params": params.z_log_rf, "lr": fac * config.lr_z_log_rf},
     ], betas=(0.5, 0.99))
 
     # LambdaLR multiplies each param group's base LR by cosine_ratio(step),
@@ -258,6 +284,9 @@ for sample_idx in range(28,N_SAMPLES):
 
         sim, physical = problem.simulate(
             level=LEVEL, params=params, time_writer=time_writer)
+        # No scheduling here: RTO warm-starts from the MAP, so every sample uses
+        # the steady-state loss weights (Schedule.final) the inverse solve
+        # converged to. compute_loss defaults to schedule=False.
         loss_terms = problem.compute_loss(
             sim=sim, physical=physical, params=params,
             observations=observations, prior_means=prior_means, mask=mask,
@@ -287,8 +316,11 @@ for sample_idx in range(28,N_SAMPLES):
         "prior_mean_z_log_mf":   eps_z_log_mf,
         "prior_mean_z_log_rf":   eps_z_log_rf,
         "mask_uniform":      mask_uniform,
+        "eps_bed_cond":      eps_bed_cond,
     }
     save_whitened_params(
         params, f"{output_path}/level_{LEVEL}/torch_vars.p",
         extras=noise_extras,
+        bed_parametrization=problem.priors.bed_parametrization,
     )
+    problem.set_bed_data_override(None)

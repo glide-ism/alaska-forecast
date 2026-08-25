@@ -15,7 +15,8 @@ Pipeline:
     3. Fetch topography (OpenTopography) and bathymetry (NOAA mosaic + BAGs)
        over the lat/lon fetch extent, splice them, then reproject onto the
        explicit target grid using a fixed destination transform.
-    4. Rasterize domain and RGI glacier masks.
+    4. Rasterize the domain mask, the RGI glacier mask, and a per-glacier
+       integer label field (with a lookup back to raw RGI identifiers).
 
 Output: {domain_path}/model_inputs/gridded_dem.nc
 """
@@ -28,6 +29,7 @@ from urllib.parse import urlencode
 import geopandas
 import numpy as np
 import pyproj
+import rasterio.features
 import rasterio.transform
 import requests
 import rioxarray
@@ -45,11 +47,29 @@ NOAA_DEM_SERVICE = (
     "https://gis.ngdc.noaa.gov/arcgis/rest/services/"
     "DEM_mosaics/DEM_global_mosaic/ImageServer"
 )
-GLACIER_MASK_PATH = '../common_data/area/rgi/rgi_ak/RGI2000-v7.0-C-01_alaska.shp'
+#GLACIER_MASK_PATH = '../common_data/area/rgi/rgi_ak/RGI2000-v7.0-C-01_alaska.shp'
+GLACIER_MASK_PATH = '../common_data/area/rgi/rgi_ak/RGI2000-v7.0-G-01_alaska.shp'
 NOAA_BAG_DIRECTORY = Path('../common_data/dem/bathy/bags')
 
 GRID_RESOLUTION_M = 90.0
 DEM_TYPE = 'COP90'
+
+# Acquisition epochs, written as variable-level attrs so the inverse model
+# compares each product against its state at the right calendar time.
+# COP90 (Copernicus GLO-90) derives from TanDEM-X acquisitions 2011-2015.
+DEM_TIME_ATTRS = {
+    'time_nominal': 2013.0,
+    'time_start': 2011.0,
+    'time_end': 2015.0,
+}
+# RGI v7 Alaska outlines derive from ~2000s Landsat imagery; the nominal year
+# below is an approximate regional median — refine per domain if needed (the
+# extent misfit is evaluated at this time).
+RGI_TIME_ATTRS = {
+    'time_nominal': 2008.0,
+    'time_start': 2000.0,
+    'time_end': 2013.0,
+}
 
 # Number of points sampled along each edge of the projected bbox when
 # back-projecting to lat/lon. 100 is plenty for Alaska Albers, where the
@@ -314,6 +334,49 @@ def build_dem(domain_path: str) -> xr.Dataset:
     ).notnull()
     rgi_mask.attrs['_FillValue'] = False
     dem_ds['rgi_mask'] = rgi_mask.astype('bool')
+
+    # Per-glacier integer labels. Reproject the RGI polygons into the grid CRS,
+    # keep those intersecting the target grid, and assign each a sequential
+    # integer (0..N-1). Pixels not covered by any glacier get -1. A 1-D lookup
+    # variable (`rgi_id`, indexed by the `glacier` dimension) maps each integer
+    # label `k` back to its raw RGI identifier: rgi_id[k].
+    glaciers_in_grid = glacier_polygons.to_crs(crs).cx[
+        target_xmin:target_xmax, target_ymin:target_ymax
+    ].reset_index(drop=True)
+
+    label_raster = rasterio.features.rasterize(
+        ((geom, label) for label, geom in enumerate(glaciers_in_grid.geometry)),
+        out_shape=(target_height, target_width),
+        transform=dst_transform,
+        fill=-1,
+        dtype='int32',
+    )
+    rgi_label = xr.DataArray(
+        label_raster,
+        dims=('y', 'x'),
+        coords={'y': dem_ds['y'], 'x': dem_ds['x']},
+    )
+    rgi_label.attrs['_FillValue'] = -1
+    dem_ds['rgi_label'] = rgi_label
+    dem_ds['rgi_id'] = xr.DataArray(
+        glaciers_in_grid['rgi_id'].to_numpy().astype('U'),
+        dims=('glacier',),
+        coords={'glacier': np.arange(len(glaciers_in_grid), dtype='int32')},
+    )
+    # Per-glacier surge classification (RGI surge_type: 0 = no evidence,
+    # 1-3 = possible/probable/observed). Indexed by the same `glacier`
+    # dimension, so surge_type[k] corresponds to rgi_label == k.
+    dem_ds['surge_type'] = xr.DataArray(
+        glaciers_in_grid['surge_type'].to_numpy().astype('int32'),
+        dims=('glacier',),
+        coords={'glacier': np.arange(len(glaciers_in_grid), dtype='int32')},
+    )
+
+    # Acquisition-time attrs (variable-level so they survive xr.merge).
+    for name in ('elevation', 'topography'):
+        dem_ds[name].attrs.update(DEM_TIME_ATTRS)
+    for name in ('rgi_mask', 'rgi_label', 'surge_type'):
+        dem_ds[name].attrs.update(RGI_TIME_ATTRS)
 
     dem_ds.to_netcdf(output_path)
     return dem_ds

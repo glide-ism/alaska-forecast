@@ -1,10 +1,16 @@
 import importlib.util
 from pathlib import Path
 
-from .config import GlacierConfig, PriorHyperparams, SolverConfig
+from .config import (BedConditioningConfig, GlacierConfig, PriorHyperparams,
+                     Schedule, SolverConfig)
 from .priors import GlacierPriors
-from .problem import GlacierProblem, Observations, WhitenedParameters
+from .problem import GlacierProblem, WhitenedParameters
 from .loss import LossTerms, PriorMeans
+from .observations import (
+    BedSpec, DhdtSpec, DivideFluxSpec, DomainData, ExtentSpec, Observation,
+    SnowlineSpec, SurfaceSpec, VelocitySpec, default_observation_specs,
+)
+from .scheduling import build_step_sequence, merge_times
 
 
 def load_config(domain_dir):
@@ -18,14 +24,27 @@ def load_config(domain_dir):
 
 
 __all__ = [
+    "BedConditioningConfig",
     "GlacierConfig",
     "PriorHyperparams",
+    "Schedule",
     "SolverConfig",
     "GlacierPriors",
     "GlacierProblem",
-    "Observations",
     "WhitenedParameters",
     "LossTerms",
     "PriorMeans",
+    "Observation",
+    "DomainData",
+    "SurfaceSpec",
+    "VelocitySpec",
+    "ExtentSpec",
+    "BedSpec",
+    "SnowlineSpec",
+    "DhdtSpec",
+    "DivideFluxSpec",
+    "default_observation_specs",
+    "build_step_sequence",
+    "merge_times",
     "load_config",
 ]

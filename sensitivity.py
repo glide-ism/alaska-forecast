@@ -21,6 +21,12 @@ from glacier_inverse.io import make_time_vti_writer
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
 DOMAIN = "domains/wrangell"
 config = load_config(DOMAIN)
+if config.tbias_enabled:
+    raise NotImplementedError(
+        "sensitivity.py hardcodes the five-block flattened parameter layout "
+        "(bed, pbias, log_beta, log_mf, log_rf) and would silently project "
+        "without the temperature bias — extend collect_rto_samples and the "
+        "downstream index arithmetic before running a tbias-enabled domain.")
 INPUT_PATH = config.output_dir
 OUTPUT_PATH = f"{INPUT_PATH}/sens/"
 LEVEL = 2
@@ -44,7 +50,17 @@ def collect_rto_samples(rto_dir: Path):
             data = torch.load(f"{d}/level_2/torch_vars.p")
         except FileNotFoundError:
             continue
-        beds.append(GGaPPMap.apply(priors.bed_model, data["bed"]).cpu().detach())
+        saved = data.get("bed_parametrization", "legacy")
+        if saved != priors.bed_parametrization:
+            raise ValueError(
+                f"{d}: sample saved with bed_parametrization={saved!r} but "
+                f"priors are {priors.bed_parametrization!r} — z_bed would be "
+                f"misinterpreted. Match config.bed_conditioning to the runs.")
+        # Shared whitened->bed map: correct in both bed parametrizations
+        # (conditioned checkpoints carry the kriging correction in the
+        # fluctuation field; bed_mean stays prior-coupled as in legacy).
+        beds.append(priors.bed_from_whitened(
+            data["bed"], data["bed_mean"])[0].cpu().detach())
         pbiases.append(GGaPPMap.apply(priors.pbias_model, data["precipitation_bias"]).cpu().detach())
         log_betas.append(GGaPPMap.apply(priors.log_beta_model, data["log_beta"]).cpu().detach())
         log_mfs.append((data["log_mf"] * priors.sigma_log_mf + priors.mu_log_mf).cpu().detach())

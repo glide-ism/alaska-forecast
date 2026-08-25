@@ -23,6 +23,15 @@ VY_PATH = '../common_data/velocity/ITS_LIVE_velocity_120m_RGI01A_0000_V02.1_vy.t
 # large enough to keep round-trip projection error negligible.
 FD_STEP_YEARS = 10.0
 
+# Acquisition epoch of the ITS_LIVE V2 composite mosaic (the `0000` product is
+# a multi-year composite, not a single epoch). Written as variable-level attrs
+# so the inverse model compares against its state at the nominal year.
+TIME_ATTRS = {
+    'time_nominal': 2015.0,
+    'time_start': 1985.0,
+    'time_end': 2018.5,
+}
+
 
 def build_velocity(domain_path: str) -> xr.Dataset:
     """Build the gridded velocity dataset for `domain_path` and write to disk."""
@@ -67,6 +76,8 @@ def build_velocity(domain_path: str) -> xr.Dataset:
     velocity_ds['vx'] = (('y', 'x'), vx_project.astype('float32'))
     velocity_ds['vy'] = (('y', 'x'), vy_project.astype('float32'))
     velocity_ds['vmask'] = (('y','x'),(((vx_project**2 + vy_project**2)**0.5) > 1.0).astype('float32'))
+    for name in ('vx', 'vy', 'vmask'):
+        velocity_ds[name].attrs.update(TIME_ATTRS)
 
     for name in ('elevation', 'topography', 'bathymetry', 'bathymetry_mask',
                  'domain_mask', 'rgi_mask'):

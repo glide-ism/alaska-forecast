@@ -1,0 +1,37 @@
+# Dependencies for alaska-forecast.
+#
+# This repo is an experiment/orchestration workspace, not an installable
+# package. To set up an environment:
+#
+#     pip install -r requirements.txt
+#
+# NOTE: the geospatial stack (rasterio/rioxarray/geopandas -> GDAL/PROJ) and
+# the GPU stack (cupy/torch -> CUDA) can be painful to install via pip wheels.
+
+# --- GPU: CuPy ---
+# CuPy ships a separate binary wheel per CUDA major version (no universal wheel),
+# so the custom libraries below leave it optional. Pick the ONE matching your
+# CUDA toolkit (cuda12 is the default; uncomment another and comment this out):
+# cupy-cuda11x>=12.0.0
+cupy-cuda12x>=12.0.0
+# cupy-cuda13x>=13.0.0
+
+# --- custom libraries (github.com/glide-ism), tracking main ---
+# These pull most of the scientific stack (numpy, scipy, xarray, pyproj,
+# geopandas, ...) transitively via their own dependencies.
+glide @ git+https://github.com/glide-ism/glide.git@main
+glare @ git+https://github.com/glide-ism/glare.git@main
+ggapp @ git+https://github.com/glide-ism/ggapp.git@main
+gtic @ git+https://github.com/glide-ism/gtic.git@main
+
+# --- this repo's own direct dependencies ---
+# (numpy, scipy, xarray, pyproj, geopandas come transitively from the libs above)
+pandas
+polars
+rasterio
+rioxarray
+shapely
+requests
+torch
+torchvision
+bmi_topography

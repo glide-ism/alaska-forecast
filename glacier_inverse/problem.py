@@ -8,9 +8,14 @@ A driver script constructs one GlacierProblem and then either:
     for the sensitivity ensemble,
   * inspects its priors only (posterior — use GlacierPriors directly there).
 
-The loss and forward methods take an `Observations` object so RTO can pass a
-randomized copy without rebuilding the problem.
+Observations are `Observation` objects (see observations.py): each carries its
+data, acquisition time(s), hyperparameters, and misfit. The problem collects
+their `required_times` and records model-state snapshots at exactly those
+times during every forward run, so each product is compared against the model
+at its own epoch. `compute_loss` accepts a substitute observation list so RTO
+can pass randomized copies without rebuilding the problem.
 """
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -24,91 +29,64 @@ import xarray as xr
 
 from glide.model import IceDynamics
 from glare.model import ImprovedTemperatureIndex
+from glare.avalanche import AvalancheOperator
 from ggapp.torch import GGaPPMap, GGaPPWhiten
+
+# The enthalpy SMB core is newer than some installed glare versions; import it
+# defensively so temperature-index-only setups keep working. Selecting
+# smb_model="enthalpy" against an old glare raises a clear error at build time.
+try:
+    from glare.enthalpy import (
+        EnthalpyModel, SECONDS_PER_YEAR, generate_temp_deviations,
+    )
+except ImportError:
+    EnthalpyModel = None
+    SECONDS_PER_YEAR = 365 * 24 * 3600
+
+# AvalancheStep (hoisted once-per-iteration redistribution) is newer than some
+# installed glare versions; only needed when config.avalanche_hoisted.
+try:
+    from glare.torch import AvalancheStep
+except ImportError:
+    AvalancheStep = None
 
 from .config import GlacierConfig, SolverConfig
 from .forward import simulate, differentiable_restriction, differentiable_prolongation
-from .loss import LossTerms, PriorMeans, compute_data_loss, compute_prior
+from .loss import LossTerms, PriorMeans, compute_prior
+from .observations import (
+    DomainData, Observation, ObservationBuildContext, default_observation_specs,
+)
 from .priors import GlacierPriors
-
-
-@dataclass
-class Observations:
-    u_obs: torch.Tensor
-    v_obs: torch.Tensor
-    v_mask: torch.Tensor
-    S_obs: torch.Tensor         # ice/water surface: max(DEM, 0)
-    dem: torch.Tensor           # full DEM (topography + bathymetry); the
-                                # off-ice bed anchor
-    bed_obs: torch.Tensor
-    bed_normed_coords: torch.Tensor
-    rgi_mask: torch.Tensor      # 0/1 ice extent
-    obs_mask: torch.Tensor
-    domain_mask: torch.Tensor   # 0/1 simulation domain
-    # End-of-summer snowline (ELA proxy). Optional: domains without the
-    # product leave these None and the snowline loss term is skipped.
-    snow_label: Optional[torch.Tensor] = None   # snow fraction in [0, 1]
-    snow_mask: Optional[torch.Tensor] = None    # 0/1 valid (on-ice) cells
-    debris: Optional[torch.Tensor] = None
-
-    def randomized(
-        self,
-        sigma_u: float,
-        sigma_s: float,
-        sigma_bed: float,
-        *,
-        eps_u: Optional[torch.Tensor] = None,
-        eps_v: Optional[torch.Tensor] = None,
-        eps_S: Optional[torch.Tensor] = None,
-        eps_bed: Optional[torch.Tensor] = None,
-    ) -> "Observations":
-        """Return a copy with N(0, sigma^2) noise added.
-
-        If `eps_*` whitened noise tensors are supplied they are used in place
-        of fresh `torch.randn_like` draws — this is how the RTO driver injects
-        QMC noise instead of standard Monte Carlo.
-        """
-        eps_u   = torch.randn_like(self.u_obs)   if eps_u   is None else eps_u
-        eps_v   = torch.randn_like(self.v_obs)   if eps_v   is None else eps_v
-        eps_S   = torch.randn_like(self.S_obs)   if eps_S   is None else eps_S
-        eps_bed = torch.randn_like(self.bed_obs) if eps_bed is None else eps_bed
-        return Observations(
-            u_obs=self.u_obs + eps_u * sigma_u,
-            v_obs=self.v_obs + eps_v * sigma_u,
-            v_mask=self.v_mask,
-            S_obs=self.S_obs + eps_S * sigma_s,
-            # The off-ice bed anchor shares eps_S with the surface term (as it
-            # did when this term read S_obs directly), so RTO noise bookkeeping
-            # is unchanged.
-            dem=self.dem + eps_S * sigma_s,
-            bed_obs=self.bed_obs + eps_bed * sigma_bed,
-            bed_normed_coords=self.bed_normed_coords,
-            rgi_mask=self.rgi_mask,
-            obs_mask=self.obs_mask,
-            domain_mask=self.domain_mask,
-            # The snowline label is a categorical observation with no
-            # Gaussian noise model, so RTO passes it through unperturbed.
-            snow_label=self.snow_label,
-            snow_mask=self.snow_mask,
-            debris=self.debris
-            
-        )
+from .scheduling import merge_times
 
 
 class WhitenedParameters:
-    """The six tensors we optimize over: four whitened fields plus two whitened scalars."""
+    """The tensors we optimize over: five whitened fields plus the whitened
+    scalars (log melt/radiation factors, the precip-depletion tau/z0, and the
+    enthalpy-model log H_atm / logit cloud factor). The depletion scalars are
+    inert unless precip_lapse_enabled, and the z_tbias field is inert unless
+    tbias_enabled; the mf/rf pair and the H_atm/cloud pair are mutually
+    exclusive per config.smb_model (every inactive tensor stays at
+    z = 0 = prior median and never enters the forward graph)."""
 
-    def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_log_mf, z_log_rf):
+    def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_tbias,
+                 z_log_mf, z_log_rf, z_tau, z_z0, z_log_H_atm, z_logit_cloud):
         self.z_bed = z_bed
         self.z_bed_mean = z_bed_mean
         self.z_log_beta = z_log_beta
         self.z_pbias = z_pbias
+        self.z_tbias = z_tbias
         self.z_log_mf = z_log_mf
         self.z_log_rf = z_log_rf
+        self.z_tau = z_tau
+        self.z_z0 = z_z0
+        self.z_log_H_atm = z_log_H_atm
+        self.z_logit_cloud = z_logit_cloud
 
     def requires_grad_(self) -> "WhitenedParameters":
         for t in (self.z_bed, self.z_bed_mean, self.z_log_beta,
-                  self.z_pbias, self.z_log_mf, self.z_log_rf):
+                  self.z_pbias, self.z_tbias, self.z_log_mf, self.z_log_rf,
+                  self.z_tau, self.z_z0, self.z_log_H_atm, self.z_logit_cloud):
             t.requires_grad_()
         return self
 
@@ -118,8 +96,13 @@ class WhitenedParameters:
             z_bed_mean=self.z_bed_mean.detach().clone(),
             z_log_beta=self.z_log_beta.detach().clone(),
             z_pbias=self.z_pbias.detach().clone(),
+            z_tbias=self.z_tbias.detach().clone(),
             z_log_mf=self.z_log_mf.detach().clone(),
             z_log_rf=self.z_log_rf.detach().clone(),
+            z_tau=self.z_tau.detach().clone(),
+            z_z0=self.z_z0.detach().clone(),
+            z_log_H_atm=self.z_log_H_atm.detach().clone(),
+            z_logit_cloud=self.z_logit_cloud.detach().clone(),
         )
 
     @torch.no_grad()
@@ -130,8 +113,13 @@ class WhitenedParameters:
         self.z_bed_mean.copy_(other.z_bed_mean)
         self.z_log_beta.copy_(other.z_log_beta)
         self.z_pbias.copy_(other.z_pbias)
+        self.z_tbias.copy_(other.z_tbias)
         self.z_log_mf.copy_(other.z_log_mf)
         self.z_log_rf.copy_(other.z_log_rf)
+        self.z_tau.copy_(other.z_tau)
+        self.z_z0.copy_(other.z_z0)
+        self.z_log_H_atm.copy_(other.z_log_H_atm)
+        self.z_logit_cloud.copy_(other.z_logit_cloud)
 
 
 def _apply_solver_settings(target_fas, cfg: SolverConfig) -> None:
@@ -191,6 +179,16 @@ class GlacierProblem:
         else:
             self.debris_data = None
 
+        # Optional surface elevation-change rate (Hugonnet dH/dt). Built on the
+        # same DEM grid as GLIDE_inputs, so the identical centered crop keeps it
+        # aligned. Domains without the file simply skip the dH/dt loss.
+        dhdt_path = inputs_dir / cfg.dhdt_filename
+        if dhdt_path.exists():
+            self.dhdt_data = _crop_to_factor(
+                xr.open_dataset(dhdt_path), 2 ** cfg.n_levels)
+        else:
+            self.dhdt_data = None
+
         ny, nx = self.gridded_data.sizes["y"], self.gridded_data.sizes["x"]
         dx = (self.gridded_data.x[1] - self.gridded_data.x[0]).item()
         x0 = self.gridded_data.x[0].item()
@@ -200,11 +198,45 @@ class GlacierProblem:
         self.model = self._build_ice_dynamics(ny, nx, dx, x0, y0)
         self.mg = self.model.mg
 
+        # Set by _build_enthalpy_smb_model when config.avalanche_hoisted: the
+        # redistribution operator applied once per simulate_physical call
+        # instead of inside every per-step SMB evaluation (see the loud
+        # discussion on GlacierConfig.avalanche_hoisted).
+        self.avalanche_op = None
         self.smb_model = self._build_smb_model(ny, nx, dx, x0, y0)
         self.mg.forcing.smb.set(self.smb_model.grid.state.smb.data.mean(axis=0))
 
         self.priors = GlacierPriors(cfg, ny, nx, dx)
-        self.observations = self._build_observations(flightlines_df)
+        self.domain = self._build_domain_data()
+        build_ctx = ObservationBuildContext(
+            gridded_data=self.gridded_data,
+            snowline_data=self.snowline_data,
+            dhdt_data=self.dhdt_data,
+            flightlines_df=flightlines_df,
+            domain=self.domain,
+            ny=ny, nx=nx,
+            config=cfg,
+        )
+        specs = cfg.observations if getattr(cfg, "observations", None) \
+            else default_observation_specs(cfg)
+        self.observations = [obs for spec in specs
+                             if (obs := spec.build(build_ctx)) is not None]
+
+        # RTO hook: per-sample perturbed conditioning data (Matheron's rule)
+        # consumed by physical_from until reset. Stale PCG warm-start caches
+        # across a swap are just initial guesses — always correct.
+        self._bed_data_override = None
+        if self.priors.bed_conditioner is not None:
+            bed_obs = next((o for o in self.observations if o.name == "bed"), None)
+            if bed_obs is not None and \
+                    bed_obs.weight_at(0, 0, schedule=False) != 0.0:
+                warnings.warn(
+                    "bed_conditioning is enabled but the BedObservation "
+                    "likelihood has nonzero weight — the bed data is counted "
+                    "twice (once in the conditioned prior map, once in the "
+                    "soft loss). Set BedSpec(weight=0.0) in the domain "
+                    "config; the observation is kept only for diagnostics.")
+
         self.params = self._build_initial_parameters()
 
         self.base_anomaly = self.temperature_anomaly.sel(
@@ -232,8 +264,33 @@ class GlacierProblem:
         self.H_prev = torch.tensor(self.mg[0].state.H_prev.data,
                                    device="cuda")
 
-        self.debris = torch.tensor(self.smb_model.grid.geometry.debris.data,
-                                   device="cuda")
+        if cfg.smb_model == "enthalpy":
+            self.debris = torch.tensor(
+                self.smb_model.grid.geometry.debris.data, device="cuda")
+            self.insol_mean = torch.tensor(
+                self.smb_model.grid.radiation.insol_mean.data, device="cuda")
+            self.t_base = torch.tensor(
+                self.smb_model.grid.geometry.t_base.data, device="cuda")
+            # Fixed (non-inverted) enthalpy constants as 0-dim tensors —
+            # EnthalpyStep consumes scalars via .item(); no gradients kept.
+            spy = SECONDS_PER_YEAR
+
+            def _const(v):
+                return torch.tensor(float(v), dtype=torch.float32, device="cuda")
+            self.enthalpy_consts = {
+                "H_base0": _const(cfg.H_base0 * spy),
+                "q_sw_bulk": _const(cfg.q_sw_bulk * spy),
+                "albedo_snow": _const(cfg.albedo_snow),
+                "albedo_ice": _const(cfg.albedo_ice),
+                "M_albedo": _const(cfg.M_albedo),
+            }
+        else:
+            self.debris = torch.tensor(
+                self.smb_model.grid.geometry.debris.data, device="cuda")
+            self.insol_mean = None
+            self.t_base = None
+            self.enthalpy_consts = None
+            self.temp_dev = None
     # ----------------------------------------------------------------- builders
 
     def _build_ice_dynamics(self, ny, nx, dx, x0, y0) -> IceDynamics:
@@ -256,6 +313,7 @@ class GlacierProblem:
 
         mg.sliding.beta.set(cfg.beta_init)
         mg.sliding.m.set(cfg.sliding_m)
+        mg.sliding.u_reg.set(cfg.u_reg)
         mg.sliding.water_drag.set(cfg.water_drag)
 
         mg.calving.calving_rate.set(cfg.calving_rate)
@@ -266,135 +324,186 @@ class GlacierProblem:
             cp.float32(cfg.ssa_damping))
         return model
 
-    def _build_smb_model(self, ny, nx, dx, x0, y0) -> ImprovedTemperatureIndex:
+    def _build_smb_model(self, ny, nx, dx, x0, y0):
+        cfg = self.config
+        if cfg.smb_model == "enthalpy":
+            return self._build_enthalpy_smb_model(ny, nx, dx, x0, y0)
+        if cfg.smb_model != "temperature_index":
+            raise ValueError(
+                f"unknown smb_model {cfg.smb_model!r}; "
+                "expected 'temperature_index' or 'enthalpy'")
+
+        if cfg.avalanche_hoisted:
+            raise ValueError(
+                "avalanche_hoisted is only valid with smb_model='enthalpy': "
+                "the ETIM snow/rain partition sits upstream of the avalanche "
+                "operator and depends on the per-step (anomaly-shifted) t2m, "
+                "so the redistribution input genuinely changes every step — "
+                "see GlacierConfig.avalanche_hoisted.")
+
         smb = ImprovedTemperatureIndex(ny=ny, nx=nx, nt=12,
                                        dx=dx, dt=1.0 / 12,
                                        x0=x0, y0=y0, crs=self.crs)
+
+        if cfg.use_avalanche_model:
+            smb.avalanche = AvalancheOperator(
+                smb.grid, s_crit=cfg.avalanche_s_crit,
+                w_trans=cfg.avalanche_w_trans, p=cfg.avalanche_p,
+                K=cfg.avalanche_K)
+
         gd = self.gridded_data
         smb.grid.insolation.insol_mean.set(gd.monthly_solar_potential_mean)
         smb.grid.insolation.insol_cos.set(gd.monthly_solar_potential_cos)
         smb.grid.insolation.insol_sin.set(gd.monthly_solar_potential_sin)
         smb.grid.temperature.t2m.set(gd.monthly_t2m)
         smb.grid.precipitation.precip.set(gd.monthly_precip)
-        smb.grid.insolation.rf.set(self.config.mu_rf)
-        smb.grid.temperature.mf.set(self.config.mu_mf)
-        smb.grid.geometry.debris.set(1.0 - self.config.debris_factor*self.debris_data.debris_fraction)
+        smb.grid.geometry.srf.set(gd.elevation)
+        smb.grid.insolation.rf.set(cfg.mu_rf)
+        smb.grid.temperature.mf.set(cfg.mu_mf)
+        if self.debris_data is not None:
+            smb.grid.geometry.debris.set(
+                1.0 - cfg.debris_factor * self.debris_data.debris_fraction)
+        else:
+            smb.grid.geometry.debris.set(1.0)
         smb.forward()
         return smb
 
-    def _build_observations(self, flightlines_df) -> Observations:
+    def _build_enthalpy_smb_model(self, ny, nx, dx, x0, y0):
+        """Build glare's EnthalpyModel, initialized at the prior-median
+        parameters, with one fixed seeded weather realization (`self.temp_dev`)
+        reused by every forward call so the checkpointed objective is
+        deterministic."""
+        cfg = self.config
+        if EnthalpyModel is None:
+            raise ImportError(
+                "smb_model='enthalpy' requires a glare version providing "
+                "glare.enthalpy.EnthalpyModel")
+        import inspect
+        kwargs = {}
+        if "materialize_state" in inspect.signature(EnthalpyModel).parameters:
+            # Older glare versions predate the flag; with a current one, the
+            # six diagnostic state cubes share one scratch buffer unless the
+            # domain asks for them (config.enthalpy_materialize_state).
+            kwargs["materialize_state"] = cfg.enthalpy_materialize_state
+        smb = EnthalpyModel(ny=ny, nx=nx, nt=12, dx=dx, dt=1.0 / 12,
+                            x0=x0, y0=y0, crs=self.crs,
+                            n_substeps=cfg.enthalpy_n_substeps, **kwargs)
+        if cfg.use_avalanche_model:
+            op = AvalancheOperator(
+                smb.grid, s_crit=cfg.avalanche_s_crit,
+                w_trans=cfg.avalanche_w_trans, p=cfg.avalanche_p,
+                K=cfg.avalanche_K)
+            if cfg.avalanche_hoisted:
+                # Hoisted mode: R is applied once per simulate_physical call
+                # (simulate_physical redistributes precip_ up front) and the
+                # model itself runs bare — _prepare_effective_precip reduces
+                # to a copy and the adjoint's R^T pull-back to identity. Only
+                # valid because the enthalpy core takes total precip and the
+                # per-step variation is a scalar multiplier — see the loud
+                # note on GlacierConfig.avalanche_hoisted.
+                if AvalancheStep is None:
+                    raise ImportError(
+                        "avalanche_hoisted=True requires a glare version "
+                        "providing glare.torch.AvalancheStep")
+                self.avalanche_op = op
+            else:
+                smb.avalanche = op
+
+        gd = self.gridded_data
+        smb.grid.temperature.t2m.set(gd.monthly_t2m)
+        smb.grid.precipitation.precip.set(gd.monthly_precip)
+        smb.grid.radiation.insol_mean.set(gd.monthly_solar_potential_mean)
+        smb.grid.geometry.srf.set(gd.elevation)
+        # Same debris attenuation as the ETIM branch: from glare's perspective
+        # a field multiplying bare-ice melt fluxes (1 = clean ice).
+        if self.debris_data is not None:
+            smb.grid.geometry.debris.set(
+                1.0 - cfg.debris_factor * self.debris_data.debris_fraction)
+        # Static substrate temperature: annual-mean air temperature, capped at
+        # the melting point (a permafrost-style proxy; not anomaly-shifted).
+        smb.grid.geometry.t_base.set(
+            cp.minimum(cp.asarray(gd.monthly_t2m.values).mean(axis=0), 0.0))
+
+        spy = SECONDS_PER_YEAR
+        smb.grid.thermodynamics.H_atm.set(cfg.mu_H_atm * spy)
+        smb.grid.thermodynamics.H_base0.set(cfg.H_base0 * spy)
+        smb.grid.radiation.q_sw_bulk.set(cfg.q_sw_bulk * spy)
+        smb.grid.radiation.q_sw_insol.set(cfg.mu_cloud_factor * cfg.q_sw_clear * spy)
+        smb.grid.radiation.albedo_snow.set(cfg.albedo_snow)
+        smb.grid.radiation.albedo_ice.set(cfg.albedo_ice)
+        smb.grid.radiation.M_albedo.set(cfg.M_albedo)
+
+        sigma_t2m = float(cp.asnumpy(smb.grid.temperature.sigma_t2m.value))
+        self.temp_dev = generate_temp_deviations(
+            12, cfg.enthalpy_n_substeps, sigma_t2m,
+            np.random.default_rng(cfg.enthalpy_seed))
+        smb.forward(temp_deviations=self.temp_dev)
+        return smb
+
+    def _build_domain_data(self) -> DomainData:
+        """Shared non-product context (masks, DEM, glacier labels) on the
+        cropped grid — everything a loss term may need that is not itself an
+        observational product."""
         gd = self.gridded_data
         domain_mask = torch.tensor(gd.domain_mask.values, device="cuda")
         rgi_mask = torch.tensor(gd.rgi_mask.values, device="cuda")
-        obs_mask = rgi_mask#differentiable_prolongation((1 - (differentiable_restriction((~rgi_mask).to(torch.float32),3,method='avg') > 0.1).to(torch.float32) ),3,mode='nearest')
-
-        u_obs = torch.tensor(gd.vx.values, dtype=torch.float32, device="cuda") \
-            .nan_to_num().masked_fill(~domain_mask, 0.0)
-        v_obs = torch.tensor(gd.vy.values, dtype=torch.float32, device="cuda") \
-            .nan_to_num().masked_fill(~domain_mask, 0.0)
-        v_mask = torch.tensor(gd.vmask.values,dtype=torch.float32,device="cuda") \
-            .nan_to_num().masked_fill(~domain_mask, 0.0)
+        rgi_label = torch.tensor(gd.rgi_label.values, device="cuda", dtype=torch.long)
+        rgi_label[torch.isnan(rgi_label)] = -1
+        surge_type = torch.tensor(gd.surge_type.values, device="cuda", dtype=torch.long)
         dem = torch.tensor(gd.elevation.values, dtype=torch.float32, device="cuda")
-        S_obs = torch.clamp(dem, min=0.0)
-
-        flightlines = torch.tensor(flightlines_df[["x", "y", "bed"]].values,
-                                    dtype=torch.float32, device="cuda")
-        xmin, xmax = gd.x.min().item(), gd.x.max().item()
-        ymin, ymax = gd.y.min().item(), gd.y.max().item()
-        col_normed = 2.0 * ((flightlines[:, 0] - xmin) / (xmax - xmin)) - 1
-        row_normed = -(2.0 * ((flightlines[:, 1] - ymin) / (ymax - ymin)) - 1)
-        bed_normed_coords = torch.stack([col_normed, row_normed], dim=-1)
-        bed_obs = flightlines[:, 2]
-
-        snow_label, snow_mask = self._build_snowline(domain_mask)
-
-        return Observations(
-            u_obs=u_obs, v_obs=v_obs, v_mask=v_mask, S_obs=S_obs, dem=dem,
-            bed_obs=bed_obs, bed_normed_coords=bed_normed_coords,
-            rgi_mask=rgi_mask, obs_mask=obs_mask, domain_mask=domain_mask,
-            snow_label=snow_label, snow_mask=snow_mask,
+        return DomainData(
+            dem=dem, rgi_mask=rgi_mask, rgi_label=rgi_label,
+            surge_type=surge_type, obs_mask=rgi_mask, domain_mask=domain_mask,
         )
 
-    def _build_snowline(self, domain_mask: torch.Tensor):
-        """Snow-fraction label and validity mask on the (cropped) grid.
+    @property
+    def required_times(self) -> tuple:
+        """Union of every observation's required emission times."""
+        return merge_times(*[obs.required_times for obs in self.observations])
 
-        `snow_fraction` is the fraction of the glacierized subarea classified
-        as retained snow (≈ accumulation area / above the ELA). It is only
-        defined where the product classified ice at all (`glacier_fraction`
-        > 0), so that — intersected with the simulation domain — is the BCE
-        validity mask. Returns (None, None) when the domain has no product.
-        """
-        sd = self.snowline_data
-        if sd is None:
-            return None, None
-
-        expected = (self.ny, self.nx)
-        if sd.snow_fraction.shape != expected:
-            raise ValueError(
-                f"snowline grid {tuple(sd.snow_fraction.shape)} does not match "
-                f"the cropped model grid {expected}; rebuild "
-                f"{self.config.snowline_filename} on the DEM grid."
-            )
-
-        snow_label = torch.tensor(
-            sd.snow_fraction.values, dtype=torch.float32, device="cuda"
-        ).nan_to_num().clamp_(0.0, 1.0)
-        glacier_fraction = torch.tensor(
-            sd.glacier_fraction.values, dtype=torch.float32, device="cuda"
-        ).nan_to_num()
-        snow_mask = ((glacier_fraction > 0.0) & domain_mask).to(torch.float32)
-        snow_label = snow_label.masked_fill(snow_mask == 0.0, 0.0)
-        return snow_label, snow_mask
-
-    def _bed_obs_raster(self) -> torch.Tensor:
-        """Scatter the scattered flightline bed picks onto the finest grid.
-
-        Uses the same normalized coordinates the loss feeds to grid_sample
-        (align_corners=False), so the raster lines up with what the bed misfit
-        actually sees. Cells with no flightline coverage are left NaN.
-        """
-        obs = self.observations
-        ny, nx = self.ny, self.nx
-        cn = obs.bed_normed_coords[:, 0]
-        rn = obs.bed_normed_coords[:, 1]
-        col = (((cn + 1.0) * nx - 1.0) / 2.0).round().long().clamp_(0, nx - 1)
-        row = (((rn + 1.0) * ny - 1.0) / 2.0).round().long().clamp_(0, ny - 1)
-        raster = torch.full((ny, nx), float("nan"),
-                            dtype=torch.float32, device="cuda")
-        raster[row, col] = obs.bed_obs.to(torch.float32)
-        return raster
+    def get_observation(self, name: str) -> Optional[Observation]:
+        """The observation with `Observation.name == name`, or None if the
+        domain lacks that product."""
+        for obs in self.observations:
+            if obs.name == name:
+                return obs
+        return None
 
     def write_observations(self, output_dir: str,
                            base: str = "observations") -> None:
         """Dump the observational products to a single-frame PVD.
 
-        Writes velocity, surface, DEM, snowline, debris, the extent/domain
-        masks, and the (rasterized) flightline bed picks at the finest grid.
+        Writes the domain context (DEM, masks) plus whatever static fields
+        each observation contributes via `diagnostics()` — velocity as a
+        vector field, snowline/dhdt rasters, the rasterized flightline picks.
         Call this once at the start of a run, pointed at the same directory
         the per-iteration diagnostics go to.
         """
         from .io import write_static_vti
 
-        obs = self.observations
+        domain = self.domain
+        srf = self.get_observation("srf")
         scalars = {
-            "srf_obs": obs.S_obs,
-            "dem": obs.dem,
-            "rgi_mask": obs.rgi_mask,
-            "obs_mask": obs.obs_mask,
-            "domain_mask": obs.domain_mask,
-            "bed_obs": self._bed_obs_raster(),
+            "srf_obs": (srf.S_obs if srf is not None
+                        else torch.clamp(domain.dem, min=0.0)),
+            "dem": domain.dem,
+            "rgi_mask": domain.rgi_mask,
+            "obs_mask": domain.obs_mask,
+            "domain_mask": domain.domain_mask,
         }
-        if obs.snow_label is not None:
-            scalars["snow_label"] = obs.snow_label
-            scalars["snow_mask"] = obs.snow_mask
+        for obs in self.observations:
+            scalars.update(obs.diagnostics())
         if self.debris_data is not None:
             scalars["debris_fraction"] = torch.tensor(
                 self.debris_data.debris_fraction.values,
                 dtype=torch.float32, device="cuda")
+        vel = self.get_observation("vel")
+        vector_fields = ({"U_obs": (vel.u_obs, vel.v_obs)}
+                         if vel is not None else None)
         write_static_vti(
             self.mg[0], output_dir, base,
             scalar_fields=scalars,
-            vector_fields={"U_obs": (obs.u_obs, obs.v_obs)},
+            vector_fields=vector_fields,
         )
 
     def _build_initial_parameters(self) -> WhitenedParameters:
@@ -410,36 +519,97 @@ class GlacierProblem:
         z_bed_mean = GGaPPWhiten.apply(priors.mean_model, bed_mean)
 
         z_pbias = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
+        # Temperature bias field: always allocated (shape-consistent save/load
+        # across tasks), but inert at 0 K unless config.tbias_enabled.
+        z_tbias = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
 
-        log_mf = torch.tensor(cp.log(self.smb_model.grid.temperature.mf.value), device="cuda")
-        log_rf = torch.tensor(cp.log(self.smb_model.grid.insolation.rf.value), device="cuda")
-        z_log_mf = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
-        z_log_rf = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
+        if self.config.smb_model == "enthalpy":
+            # The enthalpy grid carries no mf/rf; the inactive temperature-
+            # index scalars sit at their prior median (z = 0).
+            z_log_mf = torch.zeros((), dtype=torch.float32, device="cuda")
+            z_log_rf = torch.zeros((), dtype=torch.float32, device="cuda")
+        else:
+            log_mf = torch.tensor(cp.log(self.smb_model.grid.temperature.mf.value), device="cuda")
+            log_rf = torch.tensor(cp.log(self.smb_model.grid.insolation.rf.value), device="cuda")
+            z_log_mf = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
+            z_log_rf = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
+
+        # Precip-depletion and enthalpy-model scalars start at the prior mean
+        # (z = 0). The inactive ones are inert, but always present so save/load
+        # and the prior term stay shape-consistent across tasks.
+        z_tau = torch.zeros((), dtype=torch.float32, device="cuda")
+        z_z0 = torch.zeros((), dtype=torch.float32, device="cuda")
+        z_log_H_atm = torch.zeros((), dtype=torch.float32, device="cuda")
+        z_logit_cloud = torch.zeros((), dtype=torch.float32, device="cuda")
 
         params = WhitenedParameters(
             z_bed=z_bed, z_bed_mean=z_bed_mean, z_log_beta=z_log_beta,
-            z_pbias=z_pbias, z_log_mf=z_log_mf, z_log_rf=z_log_rf,
+            z_pbias=z_pbias, z_tbias=z_tbias,
+            z_log_mf=z_log_mf, z_log_rf=z_log_rf,
+            z_tau=z_tau, z_z0=z_z0,
+            z_log_H_atm=z_log_H_atm, z_logit_cloud=z_logit_cloud,
         )
         params.requires_grad_()
         return params
 
     # -------------------------------------------------------------------- core
 
+    def set_bed_data_override(self, data) -> None:
+        """RTO hook: substitute per-sample perturbed bed-conditioning data
+        (b + eps, Matheron's rule) for subsequent physical_from calls. Pass
+        None to restore the conditioner's stored data. No-op relevance unless
+        config.bed_conditioning.enabled."""
+        self._bed_data_override = data
+
     def physical_from(self, params: WhitenedParameters):
         """Map whitened parameters back to physical fields. Returns a namespace
-        with (bed, bed_mean, log_beta, pbias, log_mf, log_rf)."""
+        with (bed, bed_mean, log_beta, pbias, tbias, log_mf, log_rf, tau, z0)."""
         priors = self.priors
 
-        bed_mean = GGaPPMap.apply(priors.mean_model, params.z_bed_mean)
-        bed = GGaPPMap.apply(priors.bed_model, params.z_bed)# * self.observations.obs_mask.to(torch.float) + self.observations.dem*(1.0 - self.observations.obs_mask.to(torch.float)) 
+        bed, bed_mean, bed_uncond = priors.bed_from_whitened(
+            params.z_bed, params.z_bed_mean,
+            data_override=self._bed_data_override)
         log_beta = GGaPPMap.apply(priors.log_beta_model, params.z_log_beta)
         pbias = GGaPPMap.apply(priors.pbias_model, params.z_pbias)
+        # Additive temperature bias (K): mapped only when the term is enabled
+        # (no Matern hierarchy exists otherwise); None keeps t2m untouched.
+        tbias = (GGaPPMap.apply(priors.tbias_model, params.z_tbias)
+                 if priors.tbias_model is not None else None)
         log_mf = priors.mu_log_mf + priors.sigma_log_mf * params.z_log_mf
         log_rf = priors.mu_log_rf + priors.sigma_log_rf * params.z_log_rf
+        # Precip-depletion scalars: plain affine de-whitening of a normal prior.
+        tau = priors.mu_tau + priors.sigma_tau * params.z_tau
+        z0 = priors.mu_z0 + priors.sigma_z0 * params.z_z0
+        # Enthalpy-model scalars: log H_atm (in W m-2 K-1) and logit of the
+        # cloud factor. Exponentiation/sigmoid happens in simulate_physical.
+        log_H_atm = priors.mu_log_H_atm + priors.sigma_log_H_atm * params.z_log_H_atm
+        logit_cloud = priors.mu_logit_cloud + priors.sigma_logit_cloud * params.z_logit_cloud
         return PhysicalParameters(
             bed=bed, bed_mean=bed_mean, log_beta=log_beta,
-            pbias=pbias, log_mf=log_mf, log_rf=log_rf,
+            pbias=pbias, log_mf=log_mf, log_rf=log_rf, tau=tau, z0=z0,
+            log_H_atm=log_H_atm, logit_cloud=logit_cloud,
+            bed_uncond=bed_uncond, tbias=tbias,
         )
+
+    def effective_log_pbias(self, physical: "PhysicalParameters") -> torch.Tensor:
+        """Joint log-precip bias field (fine grid): the Matern pbias field minus
+        the optional elevation-dependent depletion ramp. This is the quantity
+        that actually multiplies precip in the forward model
+        (precip = base * exp(this)); the diagnostic VTI writes it too.
+
+        z is the static observed DEM elevation, so this field is built once per
+        forward call (not per step), avoiding the per-step VRAM blowup the precip
+        multiplier dodges. With precip_lapse_enabled=False it is exactly the
+        Matern pbias field.
+        """
+        cfg = self.config
+        log_pbias = physical.pbias
+        if cfg.precip_lapse_enabled:
+            w = cfg.precip_lapse_w
+            depletion = torch.exp(-physical.tau) * w * torch.nn.functional.softplus(
+                (self.domain.dem - physical.z0) / w)
+            log_pbias = log_pbias - depletion
+        return log_pbias
 
     def _initial_thickness_from_geometry(self, bed: torch.Tensor) -> torch.Tensor:
         """Seed integration thickness from the observed surface and the current
@@ -453,17 +623,16 @@ class GlacierProblem:
         Restricted to the observed ice extent and floored at `init_H_floor`.
         """
         cfg = self.config
-        obs = self.observations
         r = cfg.rho_ice / cfg.rho_water
         bed = bed.detach()                  # current bed iterate, no gradient
-        S_obs = obs.S_obs                   # max(DEM, 0)
+        S_obs = torch.clamp(self.domain.dem, min=0.0)   # ice/water surface
 
         H_grounded = S_obs - bed
         H_float = S_obs / (1.0 - r)
         grounded = bed >= -(r / (1.0 - r)) * S_obs
         H = torch.where(grounded, H_grounded, H_float)
 
-        ice = obs.rgi_mask.to(torch.float32)
+        ice = self.domain.rgi_mask.to(torch.float32)
         H = torch.clamp(H, min=cfg.init_H_floor) * ice \
             + cfg.init_H_floor * (1.0 - ice)
         return H.to(torch.float32)
@@ -494,6 +663,7 @@ class GlacierProblem:
         physical: "PhysicalParameters",
         t_start: Optional[float] = None,
         t_end: Optional[float] = None,
+        record_states_at: Optional[list] = None,
         record_volumes_at: Optional[list] = None,
         time_writer=None,
     ):
@@ -505,12 +675,45 @@ class GlacierProblem:
         from .forward import differentiable_restriction
 
         cfg = self.config
+        if record_states_at is None:
+            # Default: emit state at every observation epoch so compute_loss
+            # can compare each product against the model at its own time.
+            # Pass an explicit empty list to skip snapshots (e.g. projections).
+            record_states_at = list(self.required_times)
         self.update_depth(physical.bed)
         self.reset_state(level)
 
-        precip_ = self.precip * torch.exp(physical.pbias)
-        mf = torch.exp(physical.log_mf)
-        rf = torch.exp(physical.log_rf)
+        # Joint log-precip bias (Matern field minus the optional elevation
+        # depletion ramp); see effective_log_pbias for why it is static.
+        precip_ = self.precip * torch.exp(self.effective_log_pbias(physical))
+        # The optional additive temperature bias is NOT pre-added to t2m here
+        # (unlike the precip line above, whose retained (12, ny, nx) cost is
+        # tolerable for a single field): the (ny, nx) tbias is threaded into
+        # the checkpointed SMB fn, which adds it per step alongside the scalar
+        # anomaly — the biased t2m is recomputed in backward instead of
+        # retained, and only an (ny, nx) gradient leaves each segment (see
+        # compute_smb). t_base (enthalpy substrate proxy) deliberately stays
+        # unbiased, matching the anomaly's treatment.
+        tbias = getattr(physical, "tbias", None)
+        if self.avalanche_op is not None:
+            # Hoisted avalanche (config.avalanche_hoisted): apply R here, once
+            # per forward call, instead of ~150 times inside the per-step SMB
+            # (forward steps + checkpoint recomputes + adjoint rebuilds).
+            # Exactly equivalent ONLY because the enthalpy core takes total
+            # precip and each step scales it by a scalar — R(c*P) = c*R(P).
+            precip_ = AvalancheStep.apply(self.avalanche_op, precip_)
+        if cfg.smb_model == "enthalpy":
+            mf = rf = None
+            # Physical scalars in the model's J m-2 yr-1 (K-1) units:
+            # H_atm from its log in W m-2 K-1, q_sw_insol from the cloud
+            # factor times the clear-sky direct normal shortwave.
+            H_atm = torch.exp(physical.log_H_atm) * SECONDS_PER_YEAR
+            q_sw_insol = (torch.sigmoid(physical.logit_cloud)
+                          * cfg.q_sw_clear * SECONDS_PER_YEAR)
+        else:
+            mf = torch.exp(physical.log_mf)
+            rf = torch.exp(physical.log_rf)
+            H_atm = q_sw_insol = None
 
         bed_ = differentiable_restriction(physical.bed, level, method='avg')
         if cfg.init_from_observed_geometry:
@@ -524,6 +727,7 @@ class GlacierProblem:
         return simulate(
             model=self.model,
             smb_model=self.smb_model,
+            smb_kind=cfg.smb_model,
             level=level,
             t_start=cfg.t_start if t_start is None else t_start,
             t_end=cfg.t_end if t_end is None else t_end,
@@ -533,10 +737,18 @@ class GlacierProblem:
             H_prev_=H_prev_,
             t2m=self.t2m,
             precip_=precip_,
+            tbias=tbias,
             debris=self.debris,
             mf=mf,
             rf=rf,
-            domain_mask=self.observations.domain_mask,
+            insol_mean=self.insol_mean,
+            t_base=self.t_base,
+            H_atm=H_atm,
+            q_sw_insol=q_sw_insol,
+            enthalpy_consts=self.enthalpy_consts,
+            temp_dev=self.temp_dev,
+            anomaly_integration=cfg.anomaly_integration,
+            domain_mask=self.domain.domain_mask,
             temperature_anomaly=self.temperature_anomaly,
             base_anomaly=self.base_anomaly,
             alpha_t2m=self.alpha_t2m,
@@ -545,6 +757,7 @@ class GlacierProblem:
             alpha_precip=self.alpha_precip,
             dx_fine=self.dx,
             flotation_factor=1.0 - cfg.rho_ice / cfg.rho_water,
+            record_states_at=record_states_at,
             record_volumes_at=record_volumes_at,
             time_writer=time_writer,
         )
@@ -556,6 +769,7 @@ class GlacierProblem:
         params: WhitenedParameters,
         t_start: Optional[float] = None,
         t_end: Optional[float] = None,
+        record_states_at: Optional[list] = None,
         record_volumes_at: Optional[list] = None,
         time_writer=None,
     ):
@@ -564,6 +778,7 @@ class GlacierProblem:
         sim = self.simulate_physical(
             level=level, physical=physical,
             t_start=t_start, t_end=t_end,
+            record_states_at=record_states_at,
             record_volumes_at=record_volumes_at,
             time_writer=time_writer,
         )
@@ -575,26 +790,41 @@ class GlacierProblem:
         sim,
         physical: "PhysicalParameters",
         params: WhitenedParameters,
-        observations: Optional[Observations] = None,
+        observations: Optional[list] = None,
         prior_means: Optional[PriorMeans] = None,
         mask: Optional[torch.Tensor] = None,
+        iteration: int = 0,
+        level: int = 0,
+        schedule: bool = False,
     ) -> LossTerms:
-        """Assemble all loss terms from a finished simulation."""
-        observations = observations or self.observations
+        """Assemble all loss terms from a finished simulation.
+
+        Each observation contributes one data term, evaluated against the
+        model state at its own required time(s) (the simulation must have been
+        run with those times recorded — the default in `simulate`).
+        `observations` may be a substitute list (RTO passes randomized copies).
+
+        `iteration`/`level` resolve any scheduled loss weight to its value at
+        this optimizer step. `schedule` selects whether continuation ramps are
+        honored (the initial inverse solve, `schedule=True`) or each weight
+        collapses to its steady-state value (RTO and analysis, the default) —
+        see config.Schedule. Constant weights are unaffected either way.
+        """
+        observations = self.observations if observations is None else observations
         prior_means = prior_means or PriorMeans.zeros()
         if mask is None:
-            mask = (observations.rgi_mask * observations.domain_mask).to(torch.float32)
+            mask = (self.domain.rgi_mask * self.domain.domain_mask).to(torch.float32)
 
-        J_srf, J_vel, J_extent, J_bed, J_snow = compute_data_loss(
-            config=self.config,
-            sim_result=sim,
-            physical=physical,
-            observations=observations,
-            mask=mask,
-            dx=self.dx,
-        )
+        config = self.config.at_iteration(iteration, level, schedule=schedule)
+        data_terms = {}
+        for obs in observations:
+            weight = obs.weight_at(iteration, level, schedule=schedule)
+            data_terms[obs.name] = obs.loss(
+                sim=sim, physical=physical, config=config,
+                domain=self.domain, mask=mask, dx=self.dx, weight=weight,
+            )
         J_prior_terms = compute_prior(
-            config=self.config,
+            config=config,
             priors=self.priors,
             params=params,
             physical_bed=physical.bed,
@@ -602,15 +832,16 @@ class GlacierProblem:
             log_rf=physical.log_rf,
             log_mf=physical.log_mf,
             prior_means=prior_means,
+            physical_bed_uncond=getattr(physical, "bed_uncond", None),
         )
         return LossTerms(
-            J_srf=J_srf, J_vel=J_vel, J_extent=J_extent, J_bed=J_bed,
-            J_snow=J_snow,
+            data_terms=data_terms,
             J_prior_bed=J_prior_terms[0],
             J_prior_bed_mean=J_prior_terms[1],
             J_prior_beta=J_prior_terms[2],
             J_prior_pbias=J_prior_terms[3],
-            J_prior_smb=J_prior_terms[4],
+            J_prior_tbias=J_prior_terms[4],
+            J_prior_smb=J_prior_terms[5],
         )
 
 
@@ -622,3 +853,19 @@ class PhysicalParameters:
     pbias: torch.Tensor
     log_mf: torch.Tensor
     log_rf: torch.Tensor
+    # Precip-depletion scalars. Optional so physical-space callers (sensitivity)
+    # that predate the term still construct a valid object; only read when
+    # config.precip_lapse_enabled.
+    tau: Optional[torch.Tensor] = None
+    z0: Optional[torch.Tensor] = None
+    # Enthalpy-model scalars; only read when config.smb_model == "enthalpy".
+    log_H_atm: Optional[torch.Tensor] = None
+    logit_cloud: Optional[torch.Tensor] = None
+    # The unconditional bed field Map(z_bed), before the bed-conditioning
+    # kriging correction. None (or equal to bed) in the legacy
+    # parametrization; the prior term re-whitens THIS field, never the
+    # conditioned one. Optional so physical-space callers (sensitivity)
+    # still construct a valid object.
+    bed_uncond: Optional[torch.Tensor] = None
+    # Additive temperature bias field (K); None unless config.tbias_enabled.
+    tbias: Optional[torch.Tensor] = None

@@ -16,7 +16,7 @@ from glacier_inverse import load_config
 from glacier_inverse.priors import GlacierPriors, domain_shape
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/delta"
+DOMAIN = "domains/st_elias"
 config = load_config(DOMAIN)
 
 
@@ -28,15 +28,28 @@ priors = GlacierPriors(config, ny, nx, dx)
 
 beds = []
 pbiases = []
+tbiases = []
 log_betas = []
 log_mfs = []
 log_rfs = []
 
 for d in Path(f"{INPUT_PATH}/rto_lr_decay/").iterdir():
     try:
-        data = torch.load(f"{d}/level_2/torch_vars.p")
-        beds.append(GGaPPMap.apply(priors.bed_model, data["bed"]).cpu().detach())
+        data = torch.load(f"{d}/level_3/torch_vars.p")
+        saved = data.get("bed_parametrization", "legacy")
+        if saved != priors.bed_parametrization:
+            raise ValueError(
+                f"{d}: sample saved with bed_parametrization={saved!r} but "
+                f"priors are {priors.bed_parametrization!r} — z_bed would be "
+                f"misinterpreted. Match config.bed_conditioning to the runs.")
+        # The shared whitened->bed map handles both parametrizations (under
+        # bed conditioning the fluctuation field carries the kriging
+        # correction; bed_mean stays prior-coupled, as in legacy).
+        beds.append(priors.bed_from_whitened(
+            data["bed"], data["bed_mean"])[0].cpu().detach())
         pbiases.append(GGaPPMap.apply(priors.pbias_model, data["precipitation_bias"]).cpu().detach())
+        if priors.tbias_model is not None and "temperature_bias" in data:
+            tbiases.append(GGaPPMap.apply(priors.tbias_model, data["temperature_bias"]).cpu().detach())
         log_betas.append(GGaPPMap.apply(priors.log_beta_model, data["log_beta"]).cpu().detach())
         log_mfs.append(data["log_mf"].cpu().detach() * priors.sigma_log_mf + priors.mu_log_mf)
         log_rfs.append(data["log_rf"].cpu().detach() * priors.sigma_log_rf + priors.mu_log_rf)
@@ -59,3 +72,6 @@ def _centered_factor(samples):
 
 L_bed, s_bed = _centered_factor(bed_samples)
 L_pbias, s_pbias = _centered_factor(pbias_samples)
+if tbiases:
+    tbias_samples = torch.stack(tbiases[:MAX_SAMPLES], axis=0)
+    L_tbias, s_tbias = _centered_factor(tbias_samples)

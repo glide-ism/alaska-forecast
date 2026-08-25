@@ -12,7 +12,7 @@ from pathlib import Path
 import geopandas
 import numpy as np
 import xarray as xr
-from glare import SolarPotential
+from gtic import SolarPotential
 
 
 GRID_RESOLUTION_M = 90.0
@@ -45,8 +45,9 @@ def build_insolation(domain_path: str, year: int) -> xr.Dataset:
         longitude=longitude,
         grid_resolution=GRID_RESOLUTION_M,
         timezone=TIMEZONE,
+        clearsky_transmittance=0.7
     )
-    mean, cos_mode, sin_mode = solar.compute_solar_potential_fourier_decomposition(year)
+    mean, cos_mode, sin_mode = solar.potential_fourier(year)
 
     months = np.arange(0, 12, dtype=np.float32) / 12
     coords = {"t": months, "y": dem.y, "x": dem.x}
