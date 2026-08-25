@@ -16,7 +16,7 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/denali"
+DOMAIN = "domains/chugach"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir
@@ -50,7 +50,6 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse, pbias_coarse)
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
-
 
 for level in range(config.max_level, config.min_level - 1, -1):
     problem.model.set_top_level(level)
