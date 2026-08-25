@@ -19,7 +19,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="delta",
-    results_subdir="inverse_geosmooth_nonlin",
+    results_subdir="inverse_test",
     smb_model = "enthalpy",
     anomaly_integration="mean_anomaly",
     stress_scheme='molho',
@@ -51,12 +51,13 @@ CONFIG = GlacierConfig(
     debris_factor=0.5,
 
     #bed_prior = PriorHyperparams(sigma=500,    l=2000.0, nu=1),
-    #lr_z_bed=0.025,
+    lr_z_bed=0.2,
     alpha_t2m=2.5,
     dt=20.0,
     tbias_enabled=True,
-    max_level=0,
-    max_iters=(50,)
+    lr_z_log_beta=0.05,
+    max_level=2,
+    max_iters=(50,50,500)
 )
 
 """

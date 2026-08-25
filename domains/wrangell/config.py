@@ -37,8 +37,8 @@ CONFIG = GlacierConfig(
     loss_scale=1e-3,
     bed_conditioning=BedConditioningConfig(
                          enabled=True,
-                         sigma_picks=50,
-                         sigma_dem=50,
+                         sigma_picks=100,
+                         sigma_dem=100,
                          pcg_rtol=1e-3,
                          pcg_rtol_adjoint=1e-2),
     sliding_m=1./3.,
@@ -50,12 +50,12 @@ CONFIG = GlacierConfig(
     debris_factor=0.5,
 
     bed_prior = PriorHyperparams(sigma=500,    l=2000.0, nu=1),
-    lr_z_bed=0.025,
+    lr_z_bed=0.0125,
     #lr_z_bed=0.2,
     alpha_t2m=2.5,
     dt=20.0,
-    lr_z_log_beta=0.025,
-    tbias_enabled=True
+    lr_z_log_beta=0.05,
+    tbias_enabled=False
 )
 
 """

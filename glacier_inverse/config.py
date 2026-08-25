@@ -214,7 +214,7 @@ class GlacierConfig:
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0,   l=10000.0, nu=1)
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,      l=1000.0,  nu=1)
     pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.05,     l=10000.0, nu=1)
-    tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.5,     l=10000.0, nu=1)
+    tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
 
     # Optional additive temperature bias field (units: K). A Matern GP field
     # added to the monthly t2m before the anomaly shift — the spatial,
