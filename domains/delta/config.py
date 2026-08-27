@@ -21,6 +21,13 @@ CONFIG = GlacierConfig(
     vti_base_name="delta",
     results_subdir="inverse_test",
     smb_model = "enthalpy",
+    # Constant (non-albedo-scaled) surface-flux offset: a-priori interior sky
+    # longwave deficit + evaporative cooling. With the offset explicit, H_atm is
+    # the pure dT slope, so its prior median moves to the first-principles
+    # sensible+latent+longwave value and the prior is widened to honest ignorance.
+    q_lw0=-40.0,
+    mu_H_atm=15.0,
+    sigma_log_H_atm=0.35,
     anomaly_integration="mean_anomaly",
     stress_scheme='molho',
     grad_start_time=1712,

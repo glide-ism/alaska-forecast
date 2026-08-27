@@ -280,6 +280,7 @@ class GlacierProblem:
             self.enthalpy_consts = {
                 "H_base0": _const(cfg.H_base0 * spy),
                 "q_sw_bulk": _const(cfg.q_sw_bulk * spy),
+                "q_lw0": _const(cfg.q_lw0 * spy),
                 "albedo_snow": _const(cfg.albedo_snow),
                 "albedo_ice": _const(cfg.albedo_ice),
                 "M_albedo": _const(cfg.M_albedo),
@@ -436,6 +437,7 @@ class GlacierProblem:
         smb.grid.thermodynamics.H_base0.set(cfg.H_base0 * spy)
         smb.grid.radiation.q_sw_bulk.set(cfg.q_sw_bulk * spy)
         smb.grid.radiation.q_sw_insol.set(cfg.mu_cloud_factor * cfg.q_sw_clear * spy)
+        smb.grid.radiation.q_lw0.set(cfg.q_lw0 * spy)
         smb.grid.radiation.albedo_snow.set(cfg.albedo_snow)
         smb.grid.radiation.albedo_ice.set(cfg.albedo_ice)
         smb.grid.radiation.M_albedo.set(cfg.M_albedo)

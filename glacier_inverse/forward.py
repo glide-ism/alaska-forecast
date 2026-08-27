@@ -109,7 +109,7 @@ def compute_smb(smb_model, t2m, tbias, anomaly_terms, base_anomaly, precip_,
 
 def compute_smb_enthalpy(smb_model, t2m, tbias, anomaly_terms, base_anomaly,
                          precip_, precip_multiplier, insol_mean, t_base,
-                         H_atm, H_base0, q_sw_bulk, q_sw_insol,
+                         H_atm, H_base0, q_sw_bulk, q_sw_insol, q_lw0,
                          albedo_snow, albedo_ice, M_albedo, debris, temp_dev,
                          domain_mask, level=0, want_fine=False):
     # Same contract as compute_smb (annual-mean smb, -10 fill outside the
@@ -130,8 +130,8 @@ def compute_smb_enthalpy(smb_model, t2m, tbias, anomaly_terms, base_anomaly,
         shift = (a - base_anomaly) if tbias is None else tbias + (a - base_anomaly)
         s = enthalpy_step(smb_model, t2m + shift, precip_step,
                           insol_mean, t_base, H_atm, H_base0, q_sw_bulk,
-                          q_sw_insol, albedo_snow, albedo_ice, M_albedo, debris,
-                          temp_dev).mean(axis=0)
+                          q_sw_insol, q_lw0, albedo_snow, albedo_ice, M_albedo,
+                          debris, temp_dev).mean(axis=0)
         smb = w * s if smb is None else smb + w * s
     return _finish_smb(smb, domain_mask, level, want_fine)
 
@@ -398,8 +398,8 @@ def simulate(
     melt-attenuation field; "temperature_index" additionally consumes
     `mf`/`rf`, while "enthalpy" consumes `insol_mean`/`t_base` (fine-grid
     forcing), the inverted scalars `H_atm`/`q_sw_insol` (J m-2 yr-1 (K-1)),
-    the fixed constants in `enthalpy_consts` (H_base0, q_sw_bulk, albedo_snow,
-    albedo_ice, M_albedo as 0-dim tensors), and the fixed `(12, n_substeps)`
+    the fixed constants in `enthalpy_consts` (H_base0, q_sw_bulk, q_lw0,
+    albedo_snow, albedo_ice, M_albedo as 0-dim tensors), and the fixed `(12, n_substeps)`
     weather realization `temp_dev`.
 
     `flotation_factor` is `1 - rho_i/rho_w`; the surface is lower-bounded by
@@ -537,7 +537,7 @@ def simulate(
             smb_args = (smb_model,
                         t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
                         insol_mean, t_base,
-                        H_atm, ec["H_base0"], ec["q_sw_bulk"], q_sw_insol,
+                        H_atm, ec["H_base0"], ec["q_sw_bulk"], q_sw_insol, ec["q_lw0"],
                         ec["albedo_snow"], ec["albedo_ice"], ec["M_albedo"],
                         debris, temp_dev, domain_mask, level, want_fine)
         else:

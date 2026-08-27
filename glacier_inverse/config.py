@@ -269,6 +269,16 @@ class GlacierConfig:
     # converted by SECONDS_PER_YEAR where they are fluxes).
     q_sw_clear:  float = 1000.0  # W m-2, direct normal shortwave at sea level
     q_sw_bulk:   float = 0.0     # W m-2, insolation-independent shortwave
+    # Constant flux into the surface that is NOT albedo-scaled and NOT
+    # proportional to (T_air - T_s): the dT-independent part of net longwave /
+    # latent exchange (clear-sky longwave deficit -(1-eps_a) sigma T^4,
+    # evaporation into sub-saturated air). Negative cools; 0 reproduces the
+    # original balance. Without it a calibrated H_atm absorbs the offset and
+    # comes out too small (flattening the melt-temperature sensitivity), so
+    # read mu_H_atm as the dT slope *given* this offset. A-priori interior
+    # Alaska summer value ~ -40, maritime ~ -20; a monthly field from CARRA
+    # downward longwave is the intended replacement.
+    q_lw0:       float = 0.0     # W m-2, constant non-albedo-scaled surface flux
     H_base0:     float = 0.6     # W m-2 K-1, basal conductance at zero snow mass
     albedo_snow: float = 0.9
     albedo_ice:  float = 0.4

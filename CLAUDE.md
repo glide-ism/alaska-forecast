@@ -218,7 +218,16 @@ scalars of the active backend: `z_log_mf` (melt factor) and
 `z_log_rf` (radiation factor) under `smb_model="temperature_index"`, or `z_log_H_atm`
 (log of the lumped sensible/longwave transfer coefficient in W m⁻² K⁻¹, prior median
 `mu_H_atm`) and `z_logit_cloud` (logit of the cloud factor f, `q_sw_insol = f·q_sw_clear`,
-prior median `mu_cloud_factor`) under `smb_model="enthalpy"`. All scalar z-tensors always
+prior median `mu_cloud_factor`) under `smb_model="enthalpy"`. The enthalpy balance is
+`q = (1−α)(q_sw_bulk + q_sw_insol·I) + q_lw0 + H_atm(T_air − T_s) + H_base(T_base − T_s)`;
+the fixed (never inverted, never checkpointed — they come from the config at every build)
+constants are `H_base0, q_sw_bulk, q_lw0, albedo_snow, albedo_ice, M_albedo`. `q_lw0` is a
+constant flux that is neither albedo-scaled nor ∝ ΔT — the offset part of net longwave /
+latent exchange (clear-sky sky deficit, evaporation into sub-saturated air; negative cools,
+default 0). It matters because without it a calibrated `H_atm` has to absorb the offset
+(fits at ~5 instead of a first-principles ~15 W m⁻² K⁻¹), which flattens the ablation-area
+balance gradient and the melt–temperature sensitivity; read `mu_H_atm` as the ΔT slope
+*given* the offset. All scalar z-tensors always
 exist (inactive ones sit at z = 0 = prior median, contribute zero prior loss, and are
 saved/loaded for checkpoint compatibility); only the active pair joins the Adam block.
 Fields use SGD, smooth/scalar params use Adam (see optimizer setup in
