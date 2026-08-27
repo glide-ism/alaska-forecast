@@ -150,11 +150,29 @@ def marginal_velocity_log_likelihood(
     sigma,          # (N,)   per-pixel noise scale
     labels,         # (N,)   long, glacier id per pixel, -1 = unlabeled
     eta_nodes,      # (K,)   quadrature nodes on (0, 1]
-    log_w_eff,      # (K,)   log(w_k * P(eta_k)), precomputed once
+    log_w_eff,      # (K, n_glaciers) log(w_k * P(eta_k | glacier)), precomputed once
     nu,             # pseudo-Huber threshold
     lamda,
     scale
 ):
+    """Per-glacier marginal velocity penalty, tempered OUTSIDE the marginal.
+
+    Each labeled glacier carries an unknown factor eta in (0, 1] by which the
+    observed mosaic may underestimate the model speed (surge quiescence,
+    tracking failure). The likelihood is marginalized over eta in its own
+    units — per-pixel pseudo-Huber costs in nats at the stated `sigma` — so
+    the pixels of a glacier collectively decide which eta dominates the
+    integral, and only the resulting log-marginal is multiplied by the
+    tempering weight `scale * lamda`:
+
+        loss = scale*lamda * sum_g [ -log sum_k w_k P(eta_k | g) exp(-c_g(eta_k)) ]
+
+    Tempering the pixel costs *inside* the integral instead (the historical
+    form) inflates the effective sigma by 1/sqrt(scale*lamda) (~250x), leaves
+    the integrand flat in eta, and collapses the term to the prior average
+    E_eta[c(eta)] — a symmetric bowl centred on U_mod = E[eta]/E[eta^2] U_obs,
+    which is the opposite of the intended one-sided tolerance.
+    """
 
     K = eta_nodes.shape[0]
     n_glaciers = (labels.max() + 1).item()
@@ -173,16 +191,22 @@ def marginal_velocity_log_likelihood(
     # normalized residual magnitude squared: (K, M)
     r2 = (r / sigma_l[None, :, None]).square().sum(dim=-1)
 
-    # pseudo-Huber log-likelihood per pixel per node: (K, M)
-    phl = scale * lamda * (nu ** 2) * (torch.sqrt(1.0 + r2 / nu ** 2) - 1.0)
+    # pseudo-Huber negative log-likelihood per pixel per node, in nats
+    # (untempered — see the docstring): (K, M)
+    phl = (nu ** 2) * (torch.sqrt(1.0 + r2 / nu ** 2) - 1.0)
 
     # segment sum by glacier label: (K, M) -> (K, n_glaciers)
     per_glacier = torch.zeros(K, n_glaciers, device=u_obs.device, dtype=torch.float32)
     per_glacier.scatter_add_(1, lab.unsqueeze(0).expand(K, -1), phl)
 
-    # add precomputed log effective weights, logsumexp over nodes
-    marginal = torch.logsumexp(per_glacier + log_w_eff, dim=0)  # (n_glaciers,)
-    ll_labeled = marginal.sum()
+    # Marginalize the per-glacier likelihood over eta: `per_glacier` is a
+    # positive penalty (negative log-likelihood), so the marginal penalty is
+    #   -log sum_k w_k P(eta_k) exp(-cost_k) = -logsumexp(-cost + log_w_eff).
+    # (A `+logsumexp(+cost + log_w_eff)` coincides with this only while
+    # per-glacier costs are << 1 nat; at larger costs it tends to the WORST
+    # eta instead of the best.) The tempering weight is applied afterwards.
+    marginal = -torch.logsumexp(-per_glacier + log_w_eff, dim=0)  # (n_glaciers,)
+    ll_labeled = scale * lamda * marginal.sum()
 
     # --- unlabeled pixels: standard likelihood at eta = 1 ---
 

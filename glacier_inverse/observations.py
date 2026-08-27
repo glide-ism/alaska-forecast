@@ -159,15 +159,32 @@ class VelocityObservation(Observation):
 
     Either a plain pseudo-Huber on the cell-centered residual, or (when
     `surge_biased` is set) the per-glacier marginal likelihood over a velocity
-    scaling eta with surge-dependent Beta priors.
+    scaling eta in (0, 1] (observed = eta * model) with Beta(alpha, 1) priors,
+    `alpha_surge` for RGI surge_type == 3 and `alpha_nonsurge` otherwise. The
+    marginal is formed in the likelihood's own units and tempered by the
+    weight afterwards, so the weight expresses trust in the product while the
+    alphas express how much the mosaic may under-read the model per glacier
+    (alpha=2 is very permissive; hold non-surging glaciers near eta=1 with
+    alpha ~ 30-50, or make them permissive too if the mosaic is not trusted
+    on slow ice).
+
+    `mask_unobserved` decides what a mosaic pixel with `v_mask == 0` (no
+    retrieved motion: |v_obs| <= 1 m/yr in make_velocity.py — every off-ice
+    cell and the low-texture accumulation zones) means. False (historical):
+    it is an observation of ~zero velocity, so modelled ice flowing there is
+    penalized. True: it is undefined and contributes nothing to the misfit.
     """
 
     name = "vel"
 
     def __init__(self, *, u_obs, v_obs, v_mask, time: float, sigma: float,
                  nu: float, surge_biased: bool, weight: LossWeight,
-                 outlier_threshold: float):
+                 outlier_threshold: float, alpha_surge: float = 2.0,
+                 alpha_nonsurge: float = 6.0, mask_unobserved: bool = False):
         super().__init__(weight=weight)
+        self.alpha_surge = alpha_surge
+        self.alpha_nonsurge = alpha_nonsurge
+        self.mask_unobserved = mask_unobserved
         self.u_obs = u_obs
         self.v_obs = v_obs
         self.v_mask = v_mask
@@ -195,20 +212,20 @@ class VelocityObservation(Observation):
 
         if self.surge_biased:
             U_obs = torch.stack((self.u_obs.ravel(), self.v_obs.ravel()), dim=1)
-            
             U_mod = torch.stack((u_pred.ravel(), v_pred.ravel()), dim=1)
+            labels = domain.rgi_label.ravel()
+            if self.mask_unobserved:
+                keep = self.v_mask.ravel() > 0.0
+                U_obs, U_mod, labels = U_obs[keep], U_mod[keep], labels[keep]
             sigma = self.sigma * torch.ones(U_obs.shape[0], device='cuda',
                                             dtype=torch.float32)
-            labels = domain.rgi_label.ravel()
             nodes, weights = leggauss(10)
             eta_nodes = torch.tensor((nodes + 1) / 2, device='cuda',
                                      dtype=torch.float32)
             w_gl = torch.tensor(weights / 2, device='cuda', dtype=torch.float32)
 
-            alpha_surge = 2.0
-            alpha_nonsurge = 6.0
             alpha = torch.where(domain.surge_type == 3,
-                                alpha_surge, alpha_nonsurge).cuda()
+                                self.alpha_surge, self.alpha_nonsurge).cuda()
 
             log_w_eff = (torch.log(w_gl)[:, None]
                          + torch.log(alpha)[None, :]
@@ -221,6 +238,8 @@ class VelocityObservation(Observation):
         else:
             r_u2 = (((u_pred - self.u_obs) ** 2 + (v_pred - self.v_obs) ** 2)
                     / self.sigma ** 2)
+            if self.mask_unobserved:
+                r_u2 = r_u2 * self.v_mask
             if self.outlier_threshold is not None:
                 U_obs2 = self.u_obs**2 + self.v_obs**2
                 r_u2[U_obs2 > self.outlier_threshold**2] = 0.0
@@ -234,7 +253,10 @@ class VelocityObservation(Observation):
             u_obs=self.u_obs + eps_u * self.sigma,
             v_obs=self.v_obs + eps_v * self.sigma,
             v_mask=self.v_mask, time=self.time, sigma=self.sigma, nu=self.nu,
-            surge_biased=self.surge_biased, weight=self.weight)
+            surge_biased=self.surge_biased, weight=self.weight,
+            outlier_threshold=self.outlier_threshold,
+            alpha_surge=self.alpha_surge, alpha_nonsurge=self.alpha_nonsurge,
+            mask_unobserved=self.mask_unobserved)
 
 
 class ExtentObservation(Observation):
@@ -246,16 +268,22 @@ class ExtentObservation(Observation):
     hyperparameter so a variable step sequence cannot silently change it.
     The extent labels themselves come through `mask` (rgi_mask ∩ domain, or
     the RTO Bernoulli realization).
+
+    `two_sided=False` (historical) scores only the mask's ice cells — it
+    penalizes missing ice where the inventory has it and leaves surplus ice
+    to the surface term. `two_sided=True` is the full Brier score on every
+    in-domain cell, so modelled ice outside the outline is penalized too.
     """
 
     name = "extent"
 
     def __init__(self, *, time: float, s_H: float, smb_dt: float,
-                 weight: LossWeight):
+                 weight: LossWeight, two_sided: bool = False):
         super().__init__(weight=weight)
         self.time = time
         self.s_H = s_H
         self.smb_dt = smb_dt
+        self.two_sided = two_sided
 
     @property
     def required_times(self):
@@ -271,10 +299,11 @@ class ExtentObservation(Observation):
         p_extent_smb = (1 / (1 + torch.exp(-self.smb_dt / self.s_H * state.smb_fine))
                         ).clip(min=0.001, max=0.999)
         p_extent = p_extent_dyn * (1 - active_fine) + p_extent_smb * active_fine
-        return config.loss_scale * weight * dx ** 2 * (
-            mask * ((1 - p_extent) / 0.5) ** 2).sum()
-        #return config.loss_scale * weight * dx ** 2 * (
-        #    ((mask - p_extent) / 0.5) ** 2).sum()
+        if self.two_sided:
+            brier = (domain.domain_mask * ((mask - p_extent) / 0.5) ** 2).sum()
+        else:
+            brier = (mask * ((1 - p_extent) / 0.5) ** 2).sum()
+        return config.loss_scale * weight * dx ** 2 * brier
 
 
 class BedObservation(Observation):
@@ -350,17 +379,23 @@ class SnowlineObservation(Observation):
     produces a logit by scaling the SMB field at the observation time, so
     sigmoid(SMB / s_smb) reads as P(cell is above the ELA). Restricted to
     `snow_mask` (valid, glacierized cells); Brier-scored.
+
+    `two_sided=False` (historical) weights the score by the observed snow
+    fraction, so only "snow observed, model bare" is penalized — the model may
+    keep snow below the observed snowline for free. `two_sided=True` is the
+    full Brier score against the fraction, penalizing both directions.
     """
 
     name = "snow"
 
     def __init__(self, *, snow_label, snow_mask, time: float, s_smb: float,
-                 weight: LossWeight):
+                 weight: LossWeight, two_sided: bool = False):
         super().__init__(weight=weight)
         self.snow_label = snow_label
         self.snow_mask = snow_mask
         self.time = time
         self.s_smb = s_smb
+        self.two_sided = two_sided
 
     @property
     def required_times(self):
@@ -370,8 +405,10 @@ class SnowlineObservation(Observation):
         smb = sim.at(self.time).smb_fine
         logits = smb / self.s_smb
         y = torch.nn.functional.sigmoid(logits)
-        #brier = (self.snow_mask * ((y - self.snow_label) / 0.25) ** 2).sum()
-        brier = (self.snow_mask * self.snow_label * ((1.0 - y) / 0.25)**2).sum()
+        if self.two_sided:
+            brier = (self.snow_mask * ((y - self.snow_label) / 0.25) ** 2).sum()
+        else:
+            brier = (self.snow_mask * self.snow_label * ((1.0 - y) / 0.25) ** 2).sum()
         return config.loss_scale * weight * dx ** 2 * brier
 
     def diagnostics(self):
@@ -638,6 +675,13 @@ class VelocitySpec:
     surge_biased: bool = False
     time: Optional[float] = None
     outlier_threshold: Optional[float] = None
+    # Beta(alpha, 1) priors on the per-glacier mosaic under-read factor eta
+    # (surge_biased only); see VelocityObservation.
+    alpha_surge: float = 2.0
+    alpha_nonsurge: float = 6.0
+    # False (historical): v_mask == 0 pixels are observations of ~0 velocity.
+    # True: they are undefined and dropped from the misfit.
+    mask_unobserved: bool = False
 
     def build(self, ctx: ObservationBuildContext) -> VelocityObservation:
         cfg = ctx.config
@@ -654,7 +698,9 @@ class VelocitySpec:
         return VelocityObservation(
             u_obs=u_obs, v_obs=v_obs, v_mask=v_mask, time=time,
             sigma=self.sigma, nu=self.nu, surge_biased=self.surge_biased,
-            weight=self.weight,outlier_threshold=self.outlier_threshold)
+            weight=self.weight, outlier_threshold=self.outlier_threshold,
+            alpha_surge=self.alpha_surge, alpha_nonsurge=self.alpha_nonsurge,
+            mask_unobserved=self.mask_unobserved)
 
 
 @dataclass(frozen=True)
@@ -663,6 +709,7 @@ class ExtentSpec:
     s_H: float = 10.0
     smb_dt: Optional[float] = None  # None -> config.dt (the historical factor)
     time: Optional[float] = None
+    two_sided: bool = False         # False: penalize missing ice only
 
     def build(self, ctx: ObservationBuildContext) -> ExtentObservation:
         cfg = ctx.config
@@ -670,7 +717,7 @@ class ExtentSpec:
                              fallback=cfg.t_end, what="RGI extent (rgi_mask)")
         smb_dt = cfg.dt if self.smb_dt is None else self.smb_dt
         return ExtentObservation(time=time, s_H=self.s_H, smb_dt=smb_dt,
-                                 weight=self.weight)
+                                 weight=self.weight, two_sided=self.two_sided)
 
 
 @dataclass(frozen=True)
@@ -702,6 +749,7 @@ class SnowlineSpec:
     weight: LossWeight = 2e-4
     s_smb: float = 0.2
     time: Optional[float] = None
+    two_sided: bool = False         # False: penalize missing snow only
 
     def build(self, ctx: ObservationBuildContext) -> Optional[SnowlineObservation]:
         sd = ctx.snowline_data
@@ -730,7 +778,7 @@ class SnowlineSpec:
         snow_label = snow_label.masked_fill(snow_mask == 0.0, 0.0)
         return SnowlineObservation(
             snow_label=snow_label, snow_mask=snow_mask, time=time,
-            s_smb=self.s_smb, weight=self.weight)
+            s_smb=self.s_smb, weight=self.weight, two_sided=self.two_sided)
 
 
 @dataclass(frozen=True)

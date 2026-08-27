@@ -69,7 +69,12 @@ coordinates is set by prior curvature), so changing a prior usually means retuni
 (`glacier_inverse/observations.py`) carrying its data tensors, its acquisition time(s)
 (`required_times`, calendar years), its noise/loss hyperparameters, its misfit, and an RTO
 `randomized(**eps)` hook. Domain configs declare frozen **specs** (`SurfaceSpec`,
-`VelocitySpec`, `ExtentSpec`, `BedSpec`, `SnowlineSpec`, `DhdtSpec`, plus the opt-in
+`VelocitySpec`, `ExtentSpec`, `BedSpec`, `SnowlineSpec`, `DhdtSpec` — the Brier terms are
+one-sided by default (`ExtentSpec`/`SnowlineSpec(two_sided=False)` penalize only missing
+ice/snow; `two_sided=True` is the full Brier score), and `VelocitySpec(mask_unobserved=)`
+decides whether `v_mask == 0` mosaic pixels (no retrieved motion: all off-ice cells and
+low-texture accumulation zones) are observations of ~0 velocity (False, historical) or
+undefined and dropped (True) — plus the opt-in
 prior-style `DivideFluxSpec` — a quadratic penalty on ice flux across RGI drainage
 divides, the anti-basin-piracy term; its mask drops confluences where the velocity
 mosaic shows real cross-boundary flow, and it dumps a `divide_mask` diagnostic for
@@ -161,7 +166,13 @@ The library the drivers sit on top of:
   inside one checkpoint segment are safe because both glare adjoints re-derive their
   effective inputs (ETIM snowfall / enthalpy precip_eff) from the re-set raw inputs.
 - `loss.py` — `LossTerms` (dict-backed, one data term per observation), prior terms, and
-  shared helpers (`_huber`, the surge-marginal velocity likelihood). Identical for MAP
+  shared helpers (`_huber`, the surge-marginal velocity likelihood — per-glacier
+  marginal over the mosaic under-read factor η∈(0,1] with `Beta(alpha,1)` priors from
+  `VelocitySpec.alpha_surge/alpha_nonsurge`; formed in the likelihood's own units (nats
+  at `sigma`) and tempered by `loss_scale·weight·dx²` *afterwards*, so the weight
+  expresses trust in the product while the α's set how much a glacier's mosaic may
+  under-read the model — tempering inside the marginal would flatten it into a
+  symmetric pull toward `E[η]/E[η²]·U_obs`). Identical for MAP
   (zero prior means) and RTO (nonzero whitened-space means via `PriorMeans`).
 - `io.py` — VTI/PVD diagnostic writers and whitened-parameter `save`/`load`.
 - `config.py`, `__init__.py` (`load_config(domain_dir)` imports a domain's `config.py` by path).
