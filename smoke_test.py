@@ -352,6 +352,15 @@ def main() -> int:
         check("initial enthalpy smb finite",
               bool(torch.isfinite(torch.tensor(
                   eproblem.smb_model.grid.state.smb.data)).all()))
+        has_dif = "monthly_diffuse_potential" in eproblem.gridded_data
+        dif = eproblem.insol_dif
+        check("diffuse-sky potential present in GLIDE_inputs.nc "
+              "(else the diffuse term is zero)", has_dif)
+        check("insol_dif is (12, ny, nx), finite, in [0, 1]",
+              tuple(dif.shape) == (12,) + tuple(eproblem.domain.dem.shape)
+              and torch.isfinite(dif).all().item()
+              and dif.min().item() >= 0.0 and dif.max().item() <= 1.0 + 1e-6,
+              f"shape={tuple(dif.shape)} range=[{dif.min().item():.3f}, {dif.max().item():.3f}]")
 
         eparams = eproblem.params
         elevel = econfig.n_levels - 1

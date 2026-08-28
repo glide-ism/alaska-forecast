@@ -145,8 +145,8 @@ The library the drivers sit on top of:
   variable dt, horizon extension) and `merge_times`. Pure Python floats so snapshot dict
   keys match requested times exactly.
 - `priors.py` — `GlacierPriors` (4 Matérn field priors + scalar SMB priors: log-normal
-  mf/rf for the temperature-index model, log-normal H_atm and logit-normal cloud factor
-  for the enthalpy model). Cheap to build without `IceDynamics`; `posterior.py` uses it
+  mf/rf for the temperature-index model, log-normal H_atm and logit-normal clear-sky
+  fraction f for the enthalpy model). Cheap to build without `IceDynamics`; `posterior.py` uses it
   directly to map samples back to physical space.
 - `forward.py` — `simulate()` time-stepping loop (SMB → ice dynamics per step) over the
   snapped step sequence; emits a lazy-prolonging `ModelState` per requested time into
@@ -228,11 +228,22 @@ raises on tbias-enabled domains until its 5-block layout is extended) — plus t
 scalars of the active backend: `z_log_mf` (melt factor) and
 `z_log_rf` (radiation factor) under `smb_model="temperature_index"`, or `z_log_H_atm`
 (log of the lumped sensible/longwave transfer coefficient in W m⁻² K⁻¹, prior median
-`mu_H_atm`) and `z_logit_cloud` (logit of the cloud factor f, `q_sw_insol = f·q_sw_clear`,
-prior median `mu_cloud_factor`) under `smb_model="enthalpy"`. The enthalpy balance is
-`q = (1−α)(q_sw_bulk + q_sw_insol·I) + q_lw0 + H_atm(T_air − T_s) + H_base(T_base − T_s)`;
-the fixed (never inverted, never checkpointed — they come from the config at every build)
-constants are `H_base0, q_sw_bulk, q_lw0, albedo_snow, albedo_ice, M_albedo`. `q_lw0` is a
+`mu_H_atm`) and `z_logit_cloud` (logit of the **clear-sky fraction** f = 1 − cloud
+fraction, prior median `mu_cloud_factor`; direct `q_sw_insol = f·S₀` and diffuse
+`q_sw_dif = (f·k_diffuse_clear + (1−f)·k_diffuse_cloud)·S₀` both derive from this one
+scalar, `S₀ = q_sw_clear` = 1361 W m⁻² extraterrestrial — the clear-sky τ^airmass
+attenuation lives in the direct potential, not in the base flux) under
+`smb_model="enthalpy"`. The enthalpy balance is
+`q = (1−α)(q_sw_bulk + q_sw_insol·I + q_sw_dif·I_dif) + q_lw0 + H_atm(T_air − T_s) + H_base(T_base − T_s)`,
+with `I = monthly_solar_potential_mean` (direct beam: incidence × shadow × τ^m) and
+`I_dif = monthly_diffuse_potential` (isotropic-sky view factor of the tilted,
+horizon-limited surface × monthly-mean cos zenith; static geometry, no gradient, built by
+`make_insolation.py` — inputs predating it load as zeros with a warning, i.e. no diffuse
+term); at 60–63°N diffuse is ~half the monthly global shortwave, and it is what lights
+shaded cirques and north-facing accumulation zones. The fixed (never inverted, never
+checkpointed — they come from the config at every build) constants are
+`q_sw_clear, k_diffuse_clear, k_diffuse_cloud, H_base0, q_sw_bulk, q_lw0, albedo_snow,
+albedo_ice, M_albedo`. `q_lw0` is a
 constant flux that is neither albedo-scaled nor ∝ ΔT — the offset part of net longwave /
 latent exchange (clear-sky sky deficit, evaporation into sub-saturated air; negative cools,
 default 0). It matters because without it a calibrated `H_atm` has to absorb the offset
@@ -298,6 +309,9 @@ editing `results_subdir` in the domain config, not the drivers.
 `preprocessing/make_all.py` runs per-variable `make_*.py` builders in dependency order
 (DEM → flightlines/velocity/snowline/debris/insolation/climate, plus independent
 temperature & precip anomalies, then a merge) and writes `domains/<name>/model_inputs/`.
+`make_insolation.py` emits the direct-beam potential (Fourier modes) *and* the diffuse-sky
+potential; `--diffuse-only` adds the latter to an existing product (36 horizon ray-traces
+rather than the hour-by-hour direct loop), followed by `make_merged.py`.
 Inputs come from the shared `common_data/` bundle plus the domain's `local_data/outline.kml`.
 Each builder is also importable/runnable on its own.
 

@@ -256,18 +256,35 @@ class GlacierConfig:
     debris_factor: float = 0.5 # Amount by which debris cover reduces melt of bare ice.
 
     # Enthalpy-model inverted scalars. H_atm (lumped sensible/longwave heat
-    # transfer) is inferred as log(H_atm in W m-2 K-1); the effective normal
-    # shortwave is inferred as logit(f) of the cloud factor f in (0, 1), with
-    # q_sw_insol = f * q_sw_clear. Physical values passed to the model are
-    # converted to J m-2 yr-1 (K-1) via SECONDS_PER_YEAR.
+    # transfer) is inferred as log(H_atm in W m-2 K-1); the shortwave is
+    # inferred through logit(f) of the CLEAR-SKY FRACTION f = 1 - cloud
+    # fraction in (0, 1): direct q_sw_insol = f * q_sw_clear (the direct-beam
+    # potential I already carries the clear-sky tau^airmass attenuation, so
+    # q_sw_clear is the extraterrestrial S0) and diffuse
+    # q_sw_dif = (f * k_diffuse_clear + (1 - f) * k_diffuse_cloud) * q_sw_clear,
+    # both from the same f. Physical values passed to the model are converted
+    # to J m-2 yr-1 (K-1) via SECONDS_PER_YEAR.
     mu_H_atm:          float = 10.0   # W m-2 K-1, prior median
     sigma_log_H_atm:   float = 0.4
-    mu_cloud_factor:   float = 0.6    # prior median of f in (0, 1)
+    # Prior median of the clear-sky fraction f. 0.35 ~ interior-Alaska summer
+    # cloud fraction 0.65; with k_diffuse_* below it reproduces the station
+    # June climatology (horizontal direct ~100, diffuse ~120, global ~220 W m-2
+    # at 63 N). Maritime domains sit lower (~0.2).
+    mu_cloud_factor:   float = 0.35
     sigma_logit_cloud: float = 0.5
 
     # Enthalpy-model fixed constants (not inverted; per-second SI units,
     # converted by SECONDS_PER_YEAR where they are fluxes).
-    q_sw_clear:  float = 1000.0  # W m-2, direct normal shortwave at sea level
+    # Extraterrestrial normal irradiance S0. The clear-sky attenuation
+    # tau^(airmass * p/p0) lives in the insolation potential (gtic), NOT here.
+    q_sw_clear:  float = 1361.0  # W m-2, extraterrestrial (TOA) normal shortwave
+    # Diffuse-sky fractions of S0 * cos(zenith) on an unobstructed horizontal
+    # surface: clear-sky diffuse (~10-15% of clear-sky global; 0.10 at 1-2 km
+    # elevation) and overcast global (all diffuse; ~0.30 of TOA). The monthly
+    # diffuse potential I_dif (sky-view factor x mean cos zenith, from
+    # make_insolation.py) multiplies q_sw_dif in the balance.
+    k_diffuse_clear: float = 0.10
+    k_diffuse_cloud: float = 0.30
     q_sw_bulk:   float = 0.0     # W m-2, insolation-independent shortwave
     # Constant flux into the surface that is NOT albedo-scaled and NOT
     # proportional to (T_air - T_s): the dT-independent part of net longwave /

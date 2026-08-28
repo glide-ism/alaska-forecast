@@ -215,7 +215,8 @@ class GlacierPriors:
         self.sigma_log_mf = config.sigma_log_mf
 
         # Enthalpy-model scalars: log-normal on H_atm (in W m-2 K-1) and
-        # logit-normal on the cloud factor f (q_sw_insol = f * q_sw_clear).
+        # logit-normal on the clear-sky fraction f (direct q_sw_insol = f * S0,
+        # diffuse q_sw_dif = (f k_clr + (1 - f) k_cld) * S0 from the same f).
         self.mu_log_H_atm = float(np.log(config.mu_H_atm))
         self.sigma_log_H_atm = config.sigma_log_H_atm
         self.mu_logit_cloud = float(

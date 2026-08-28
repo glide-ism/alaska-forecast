@@ -9,6 +9,7 @@ Both climatologies are included to facilitate source intercomparison.
 Output: {domain_path}/model_inputs/GLIDE_inputs.nc
 """
 import argparse
+import os
 from pathlib import Path
 
 import xarray as xr
@@ -39,7 +40,13 @@ def build_merged(domain_path: str) -> xr.Dataset:
             print(f"Warning: {var} lost its time attrs in the merge; "
                   f"the inverse model will fall back to t_end for it.")
 
-    merged.to_netcdf(output_path)
+    # Write to a temporary file and rename into place: netCDF4 truncates the
+    # target on open-for-write BEFORE the HDF5 lock check, so writing directly
+    # onto a GLIDE_inputs.nc that another process (an inversion, a notebook)
+    # holds open would leave an empty file behind when the lock is refused.
+    tmp_path = output_path.with_suffix('.nc.tmp')
+    merged.to_netcdf(tmp_path)
+    os.replace(tmp_path, output_path)
     return merged
 
 

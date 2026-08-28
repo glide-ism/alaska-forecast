@@ -108,8 +108,8 @@ def compute_smb(smb_model, t2m, tbias, anomaly_terms, base_anomaly, precip_,
 
 
 def compute_smb_enthalpy(smb_model, t2m, tbias, anomaly_terms, base_anomaly,
-                         precip_, precip_multiplier, insol_mean, t_base,
-                         H_atm, H_base0, q_sw_bulk, q_sw_insol, q_lw0,
+                         precip_, precip_multiplier, insol_mean, insol_dif, t_base,
+                         H_atm, H_base0, q_sw_bulk, q_sw_insol, q_sw_dif, q_lw0,
                          albedo_snow, albedo_ice, M_albedo, debris, temp_dev,
                          domain_mask, level=0, want_fine=False):
     # Same contract as compute_smb (annual-mean smb, -10 fill outside the
@@ -129,9 +129,9 @@ def compute_smb_enthalpy(smb_model, t2m, tbias, anomaly_terms, base_anomaly,
     for a, w in anomaly_terms:
         shift = (a - base_anomaly) if tbias is None else tbias + (a - base_anomaly)
         s = enthalpy_step(smb_model, t2m + shift, precip_step,
-                          insol_mean, t_base, H_atm, H_base0, q_sw_bulk,
-                          q_sw_insol, q_lw0, albedo_snow, albedo_ice, M_albedo,
-                          debris, temp_dev).mean(axis=0)
+                          insol_mean, insol_dif, t_base, H_atm, H_base0, q_sw_bulk,
+                          q_sw_insol, q_sw_dif, q_lw0, albedo_snow, albedo_ice,
+                          M_albedo, debris, temp_dev).mean(axis=0)
         smb = w * s if smb is None else smb + w * s
     return _finish_smb(smb, domain_mask, level, want_fine)
 
@@ -357,9 +357,11 @@ def simulate(
     rf=None,
     smb_kind: str = "temperature_index",
     insol_mean=None,
+    insol_dif=None,
     t_base=None,
     H_atm=None,
     q_sw_insol=None,
+    q_sw_dif=None,
     enthalpy_consts: Optional[dict] = None,
     temp_dev=None,
     anomaly_integration: str = "mean_anomaly",
@@ -396,8 +398,10 @@ def simulate(
 
     `smb_kind` selects the SMB backend. Both consume the static `debris`
     melt-attenuation field; "temperature_index" additionally consumes
-    `mf`/`rf`, while "enthalpy" consumes `insol_mean`/`t_base` (fine-grid
-    forcing), the inverted scalars `H_atm`/`q_sw_insol` (J m-2 yr-1 (K-1)),
+    `mf`/`rf`, while "enthalpy" consumes `insol_mean`/`insol_dif`/`t_base`
+    (fine-grid forcing; `insol_dif` is the static diffuse-sky potential, no
+    gradient), the inverted scalars `H_atm`/`q_sw_insol`/`q_sw_dif`
+    (J m-2 yr-1 (K-1); the two shortwave scales derive from one clear-sky fraction),
     the fixed constants in `enthalpy_consts` (H_base0, q_sw_bulk, q_lw0,
     albedo_snow, albedo_ice, M_albedo as 0-dim tensors), and the fixed `(12, n_substeps)`
     weather realization `temp_dev`.
@@ -536,8 +540,9 @@ def simulate(
             smb_fn = compute_smb_enthalpy
             smb_args = (smb_model,
                         t2m, tbias, anomaly_terms, base_anomaly, precip_, precip_multiplier,
-                        insol_mean, t_base,
-                        H_atm, ec["H_base0"], ec["q_sw_bulk"], q_sw_insol, ec["q_lw0"],
+                        insol_mean, insol_dif, t_base,
+                        H_atm, ec["H_base0"], ec["q_sw_bulk"], q_sw_insol, q_sw_dif,
+                        ec["q_lw0"],
                         ec["albedo_snow"], ec["albedo_ice"], ec["M_albedo"],
                         debris, temp_dev, domain_mask, level, want_fine)
         else:

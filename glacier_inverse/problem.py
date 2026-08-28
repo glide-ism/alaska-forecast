@@ -269,6 +269,8 @@ class GlacierProblem:
                 self.smb_model.grid.geometry.debris.data, device="cuda")
             self.insol_mean = torch.tensor(
                 self.smb_model.grid.radiation.insol_mean.data, device="cuda")
+            self.insol_dif = torch.tensor(
+                self.smb_model.grid.radiation.insol_dif.data, device="cuda")
             self.t_base = torch.tensor(
                 self.smb_model.grid.geometry.t_base.data, device="cuda")
             # Fixed (non-inverted) enthalpy constants as 0-dim tensors —
@@ -289,6 +291,7 @@ class GlacierProblem:
             self.debris = torch.tensor(
                 self.smb_model.grid.geometry.debris.data, device="cuda")
             self.insol_mean = None
+            self.insol_dif = None
             self.t_base = None
             self.enthalpy_consts = None
             self.temp_dev = None
@@ -421,6 +424,18 @@ class GlacierProblem:
         smb.grid.temperature.t2m.set(gd.monthly_t2m)
         smb.grid.precipitation.precip.set(gd.monthly_precip)
         smb.grid.radiation.insol_mean.set(gd.monthly_solar_potential_mean)
+        # Diffuse-sky potential (sky-view factor x mean cos zenith). Inputs
+        # built before it existed load as zeros: no diffuse term, loudly.
+        if "monthly_diffuse_potential" in gd:
+            smb.grid.radiation.insol_dif.set(gd.monthly_diffuse_potential)
+        else:
+            warnings.warn(
+                "GLIDE_inputs.nc has no 'monthly_diffuse_potential': the diffuse "
+                "shortwave term is zero for this run. Regenerate with "
+                "`python preprocessing/make_insolation.py --domain-path <domain> "
+                "--year <year> --diffuse-only` then `python preprocessing/make_merged.py "
+                "--domain-path <domain>`.")
+            smb.grid.radiation.insol_dif.set(0.0)
         smb.grid.geometry.srf.set(gd.elevation)
         # Same debris attenuation as the ETIM branch: from glare's perspective
         # a field multiplying bare-ice melt fluxes (1 = clean ice).
@@ -437,6 +452,9 @@ class GlacierProblem:
         smb.grid.thermodynamics.H_base0.set(cfg.H_base0 * spy)
         smb.grid.radiation.q_sw_bulk.set(cfg.q_sw_bulk * spy)
         smb.grid.radiation.q_sw_insol.set(cfg.mu_cloud_factor * cfg.q_sw_clear * spy)
+        smb.grid.radiation.q_sw_dif.set(
+            (cfg.mu_cloud_factor * cfg.k_diffuse_clear
+             + (1.0 - cfg.mu_cloud_factor) * cfg.k_diffuse_cloud) * cfg.q_sw_clear * spy)
         smb.grid.radiation.q_lw0.set(cfg.q_lw0 * spy)
         smb.grid.radiation.albedo_snow.set(cfg.albedo_snow)
         smb.grid.radiation.albedo_ice.set(cfg.albedo_ice)
@@ -718,15 +736,20 @@ class GlacierProblem:
         if cfg.smb_model == "enthalpy":
             mf = rf = None
             # Physical scalars in the model's J m-2 yr-1 (K-1) units:
-            # H_atm from its log in W m-2 K-1, q_sw_insol from the cloud
-            # factor times the clear-sky direct normal shortwave.
+            # H_atm from its log in W m-2 K-1; the direct (q_sw_insol) and
+            # diffuse (q_sw_dif) shortwave scales from the SAME clear-sky
+            # fraction f = sigmoid(logit_cloud) times the extraterrestrial S0,
+            # so both carry gradient to z_logit_cloud.
             H_atm = torch.exp(physical.log_H_atm) * SECONDS_PER_YEAR
-            q_sw_insol = (torch.sigmoid(physical.logit_cloud)
-                          * cfg.q_sw_clear * SECONDS_PER_YEAR)
+            f_clear = torch.sigmoid(physical.logit_cloud)
+            q_sw_insol = f_clear * cfg.q_sw_clear * SECONDS_PER_YEAR
+            q_sw_dif = ((f_clear * cfg.k_diffuse_clear
+                         + (1.0 - f_clear) * cfg.k_diffuse_cloud)
+                        * cfg.q_sw_clear * SECONDS_PER_YEAR)
         else:
             mf = torch.exp(physical.log_mf)
             rf = torch.exp(physical.log_rf)
-            H_atm = q_sw_insol = None
+            H_atm = q_sw_insol = q_sw_dif = None
 
         bed_ = differentiable_restriction(physical.bed, level, method='avg')
         if cfg.init_from_observed_geometry:
@@ -755,9 +778,11 @@ class GlacierProblem:
             mf=mf,
             rf=rf,
             insol_mean=self.insol_mean,
+            insol_dif=self.insol_dif,
             t_base=self.t_base,
             H_atm=H_atm,
             q_sw_insol=q_sw_insol,
+            q_sw_dif=q_sw_dif,
             enthalpy_consts=self.enthalpy_consts,
             temp_dev=self.temp_dev,
             anomaly_integration=cfg.anomaly_integration,
