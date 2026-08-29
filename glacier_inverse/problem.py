@@ -15,6 +15,7 @@ times during every forward run, so each product is compared against the model
 at its own epoch. `compute_loss` accepts a substitute observation list so RTO
 can pass randomized copies without rebuilding the problem.
 """
+import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -508,16 +509,30 @@ class GlacierProblem:
         return None
 
     def write_observations(self, output_dir: str,
-                           base: str = "observations") -> None:
+                           base: str = "observations", level: int = 0) -> None:
         """Dump the observational products to a single-frame PVD.
 
         Writes the domain context (DEM, masks) plus whatever static fields
         each observation contributes via `diagnostics()` — velocity as a
         vector field, snowline/dhdt rasters, the rasterized flightline picks.
-        Call this once at the start of a run, pointed at the same directory
-        the per-iteration diagnostics go to.
+        Call this at the start of each level, pointed at the same directory
+        the per-iteration diagnostics go to. `level > 0` writes every field
+        box-restricted to that multigrid grid (masks become fractions; NaN
+        no-data rasters are averaged over their valid pixels) — the targets
+        the coarse-space terms actually see.
         """
         from .io import write_static_vti
+        from .observations import _restrict, _restrict_weighted
+
+        def coarsen(arr):
+            if level == 0:
+                return arr
+            arr = torch.as_tensor(arr).to(torch.float32)
+            if torch.isnan(arr).any():
+                valid = torch.isfinite(arr).to(torch.float32)
+                out = _restrict_weighted(arr.nan_to_num(), valid, level)
+                return out.masked_fill(_restrict(valid, level) == 0, float("nan"))
+            return _restrict(arr, level)
 
         domain = self.domain
         srf = self.get_observation("srf")
@@ -536,11 +551,11 @@ class GlacierProblem:
                 self.debris_data.debris_fraction.values,
                 dtype=torch.float32, device="cuda")
         vel = self.get_observation("vel")
-        vector_fields = ({"U_obs": (vel.u_obs, vel.v_obs)}
+        vector_fields = ({"U_obs": (coarsen(vel.u_obs), coarsen(vel.v_obs))}
                          if vel is not None else None)
         write_static_vti(
-            self.mg[0], output_dir, base,
-            scalar_fields=scalars,
+            self.mg[level], output_dir, base,
+            scalar_fields={k: coarsen(v) for k, v in scalars.items()},
             vector_fields=vector_fields,
         )
 
@@ -549,9 +564,11 @@ class GlacierProblem:
         """Dump every field likelihood's residual diagnostics (`obs.residuals()`:
         σ-normalized `r` and whitened `z`, per component for velocity) on the
         fine grid to a single-frame PVD, keyed `<name>_<field>` (srf_r, srf_z,
-        vel_z_u, …, dhdt_z). Call after a level's final simulate; only the
-        finest level's residuals are statistically meaningful (coarser levels
-        compare prolonged fields)."""
+        vel_z_u, …, dhdt_z). Call after a level's final simulate. Terms
+        evaluated in coarse space at that level (surface) come back on the
+        coarse grid and are prolonged (bilinear) onto the fine grid here so
+        the dump stays one file."""
+        from .forward import differentiable_prolongation
         from .io import write_static_vti
 
         mask = (self.domain.rgi_mask * self.domain.domain_mask).to(torch.float32)
@@ -562,7 +579,11 @@ class GlacierProblem:
                 sim=sim, physical=physical, config=config,
                 domain=self.domain, mask=mask, dx=self.dx)
             for k, v in fields.items():
-                scalars[f"{obs.name}_{k}"] = v.detach()
+                v = v.detach()
+                if v.shape != (self.ny, self.nx):
+                    n = int(round(math.log2(self.ny / v.shape[0])))
+                    v = differentiable_prolongation(v, n)
+                scalars[f"{obs.name}_{k}"] = v
         if not scalars:
             return
         write_static_vti(self.mg[0], output_dir, base, scalar_fields=scalars)

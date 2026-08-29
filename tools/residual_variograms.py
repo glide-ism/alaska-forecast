@@ -258,15 +258,26 @@ def main():
         label = dom.rgi_label.clone()
         mask = (dom.rgi_mask * dom.domain_mask).to(torch.float32)
         cfg0 = config.at_iteration(0, 0, schedule=False)
+        # Coarse-space terms (surface) return residuals on the level's grid;
+        # their masks/labels are the box-restricted ice fraction (> 1/2) and
+        # the strided label sample. The fine-grid terms keep the fine masks.
+        f = 2 ** level
+
+        def coarse_mask(m):
+            return (torch.nn.functional.avg_pool2d(
+                m.to(torch.float32)[None, None], f)[0, 0] > 0.5) if f > 1 else m
+        ice_L = coarse_mask(ice)
+        label_L = label[::f, ::f] if f > 1 else label
+        dx_L = dx * f
 
         # ------------------------------------------------ residual fields
         fields = {}   # name -> (field, valid, whitened?)
         srf = problem.get_observation("srf")
         S_model = sim.at(srf.time).S_fine
         res = srf.residuals(sim=sim, physical=phys, config=cfg0, domain=dom, mask=mask, dx=dx)
-        fields["srf_r"] = (res["r"], ice, False)
+        fields["srf_r"] = (res["r"], ice_L, False)
         if srf.noise is not None:
-            fields["srf_z"] = (res["z"], ice, True)
+            fields["srf_z"] = (res["z"], ice_L, True)
 
         vel = problem.get_observation("vel")
         u_mod, v_mod = vel._predicted(sim.at(vel.time))
@@ -317,11 +328,15 @@ def main():
         fc = torch.where(slow, -dSc, fc)
         nrm = torch.sqrt(fr ** 2 + fc ** 2).clamp(min=1e-9)
         vg = Variograms(fr / nrm, fc / nrm, label, dx)
+        vg_L = (Variograms((fr / nrm)[::f, ::f], (fc / nrm)[::f, ::f], label_L, dx_L)
+                if f > 1 else vg)
 
         print()
         results = {}
         for name, (r, valid, whitened) in fields.items():
-            results[name] = analyse(vg, f"{tag}/{name}", r, valid, dx, whitened=whitened)
+            coarse = r.shape != ice.shape
+            results[name] = analyse(vg_L if coarse else vg, f"{tag}/{name}", r, valid,
+                                    dx_L if coarse else dx, whitened=whitened)
 
         eta_ok = cnt_lab >= 100
         print(f"per-glacier eta (n>=100 px): n={eta_ok.sum()} "
@@ -341,7 +356,7 @@ def main():
         import matplotlib.pyplot as plt
 
         icen = ice.cpu().numpy()
-        panels = [("srf_r", (S_model - srf.S_obs).cpu().numpy(), 60, "S_model - S_obs [m]", icen),
+        panels = [("srf_r", (S_model - srf.S_obs).cpu().numpy(), 60, "S_model - S_obs [m] (fine)", icen),
                   ("vel_speed", (speed_mod - speed_obs).cpu().numpy(), 30,
                    "speed model - obs [m/yr]", vvalid.cpu().numpy()),
                   ("vel_speed_eta", (eta_pix * speed_mod - speed_obs).cpu().numpy(), 30,
@@ -350,7 +365,7 @@ def main():
             panels.append(("dhdt_r", dhdt_raw.cpu().numpy(), 1.5, "dhdt model - obs [m/yr]",
                            dvalid.cpu().numpy()))
         for key in ("srf_z", "vel_z_u", "dhdt_z"):
-            if key in fields:
+            if key in fields and fields[key][0].shape == ice.shape:
                 panels.append((key, fields[key][0].cpu().numpy(), 3.0, f"{key} (whitened)",
                                fields[key][1].cpu().numpy()))
         ncol = 2

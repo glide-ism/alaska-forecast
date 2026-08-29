@@ -19,9 +19,10 @@ cheap consistency checks:
      differentiable end-to-end — including through a non-final snapshot.
   7b. The correlated-noise (MaternNoise) likelihood: an ad-hoc whitened
      SurfaceSpec built against the problem's context yields finite residual
-     fields, a finite loss and gradient, its Matérn member round-trips
-     W(Map(ε)) ≈ ε with unit whitened variance, and the weight == 1 /
-     odd-ν contracts are enforced.
+     fields on the level's (coarse) grid, a finite loss and gradient, its
+     Matérn member round-trips W(Map(ε)) ≈ ε with unit whitened variance,
+     the coarse-level model is the physical model re-discretized with
+     nugget/2^L, and the weight == 1 / smoothness contracts are enforced.
   8. The enthalpy SMB backend (smb_model="enthalpy") builds, runs, is
      deterministic (fixed weather realization), and is differentiable w.r.t.
      its two whitened scalars (skipped if the installed glare predates it).
@@ -357,11 +358,29 @@ def main() -> int:
         mask = (domain.rgi_mask * domain.domain_mask).to(torch.float32)
         res = srf_w.residuals(sim=sim, physical=physical, config=cfg0,
                               domain=domain, mask=mask, dx=problem.dx)
-        check("residuals() returns raw and whitened fields of domain shape",
+        # Section 7 ran at the coarsest level: the surface term is evaluated
+        # in coarse space, so its residual fields live on that grid.
+        f = 2 ** level
+        check("residuals() returns raw and whitened fields on the LEVEL's grid",
               set(res) == {"r", "z"}
-              and res["z"].shape == (problem.ny, problem.nx)
+              and res["z"].shape == (problem.ny // f, problem.nx // f)
               and torch.isfinite(res["z"]).all().item()
               and res["z"] is not res["r"])
+        from glacier_inverse.priors import SpectralMaternNoise as _SMN
+        nm_L = srf_w.noise_model_at(level)
+        check("coarse-level noise model: spectral, nugget scaled by 1/2^L, "
+              "same sigma/l/nu",
+              isinstance(nm_L, _SMN) and nm_L.hp.nugget == noise.nugget / f
+              and (nm_L.hp.sigma, nm_L.hp.l, nm_L.hp.nu) == (noise.sigma, noise.l, noise.nu)
+              and nm_L.dx == problem.dx * f)
+        check("coarse-level whitening of a coarse white draw has unit variance",
+              abs((GGaPPWhiten.apply(nm_L, GGaPPMap.apply(
+                  nm_L, torch.randn(problem.ny // f, problem.nx // f,
+                                    device="cuda"))) ** 2).mean().item() - 1) < 0.2)
+        S_obs_L = srf_w.S_obs_at(level)
+        check("S_obs_at(level) is the box-restricted DEM",
+              S_obs_L.shape == res["r"].shape
+              and abs(S_obs_L.mean().item() - srf_w.S_obs.mean().item()) < 1e-2)
         J_w = srf_w.loss(sim=sim, physical=physical, config=cfg0,
                          domain=domain, mask=mask, dx=problem.dx, weight=1.0)
         check("whitened surface loss is finite", torch.isfinite(J_w).item(),

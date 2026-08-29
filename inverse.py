@@ -30,8 +30,8 @@ params = problem.params
 if WARM_START_PATH is not None:
     load_whitened_params_into(params, WARM_START_PATH, priors=problem.priors)
 
-# Dump the observational products once, alongside the finest-level diagnostics.
-problem.write_observations(f"{OUTPUT_PATH}/level_{config.min_level}/vti")
+# The observational products are dumped per level (box-restricted to each
+# grid — the targets the coarse-space terms see) at the top of the level loop.
 
 # Each param group is named after its config lr field so the per-iteration
 # refresh below can apply scheduled learning rates (Schedule / callable on any
@@ -118,6 +118,7 @@ for level in range(config.max_level, config.min_level - 1, -1):
     problem.model.set_top_level(level)
     diag = make_diagnostic_fields(problem.mg[level])
     level_dir = f"{OUTPUT_PATH}/level_{level}/vti"
+    problem.write_observations(level_dir, level=level)
     vti_writer = make_loss_vti_writer(problem.mg[level], level_dir,
                                        config.vti_base_name, diag)
 

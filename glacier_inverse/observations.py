@@ -57,10 +57,44 @@ from .loss import _huber, marginal_velocity_log_likelihood
 # carries a margin band there (amplitude ~ r_edge·l/(10 dx)); the Huber
 # threshold bounds its influence. Inspect the `*_z` fields in residuals.pvd.
 #
+# Multigrid levels. Surface, extent and snowline are evaluated IN THE MODEL'S
+# OWN SPACE at each level: the observation is box-restricted to the level's
+# grid and compared with the coarse model field (S_coarse, H, active,
+# smb_coarse), the whitening model re-discretized at the coarse dx with the
+# white nugget scaled nugget/2^L, and the diagonal/Brier forms carrying dx_L².
+# For structure the coarse grid resolves this is the same quadratic form as
+# on the fine grid (up to discretization), so the terms' effective
+# observation counts are level-independent; what is dropped is only the
+# sub-grid content of the observation that a coarse model cannot represent —
+# which, compared on the fine grid, was an irreducible floor (delta surface:
+# 790 loss units at level 2, 370 at level 1, i.e. essentially the whole
+# term). Velocity and dh/dt stay fine-grid (smooth model fields under
+# on-ice masks; their floors are a few units). Level 0 is unchanged.
+#
 # Products with pixel-scale noise need `MaternNoise(nugget=)` (see config.py):
 # the whitening then goes through priors.SpectralMaternNoise (exact DCT-II
 # form of the same operator plus a white term) — the code here is agnostic,
 # `noise_model` just has to provide cupy `whiten`/`forward`.
+
+
+def _restrict(field: torch.Tensor, level: int) -> torch.Tensor:
+    """Box-average a fine (ny, nx) field down `level` times (the model's
+    restriction). Masks become fractions; identity at level 0."""
+    if level == 0:
+        return field
+    f = 2 ** level
+    return torch.nn.functional.avg_pool2d(
+        field.to(torch.float32)[None, None], f)[0, 0]
+
+
+def _restrict_weighted(field, weight, level):
+    """Weight-averaged restriction: sum(w f) / sum(w) per cell (0 where the
+    cell carries no weight). For labels defined only where a mask is set."""
+    if level == 0:
+        return field
+    num = _restrict(field * weight, level)
+    den = _restrict(weight, level)
+    return torch.where(den > 0, num / den.clamp(min=1e-12), torch.zeros_like(num))
 
 
 def _whiten(member, r: torch.Tensor) -> torch.Tensor:
@@ -198,13 +232,19 @@ class SurfaceObservation(Observation):
     With a `noise` model the residual S_model − S_obs is whitened by the
     Matérn member (marginal std `sigma` = noise.sigma) over the full grid —
     off-ice the residual is bed − DEM, exactly as in the diagonal form.
+
+    Evaluated in the model's own space: at multigrid level L the coarse
+    surface is compared with the box-restricted DEM (`S_obs_at(L)`) and
+    whitened by the error model re-discretized on the coarse grid
+    (`noise_model_at(L)`, nugget/2^L); the diagonal form carries dx_L². See
+    the module note on multigrid levels.
     """
 
     name = "srf"
 
     def __init__(self, *, S_obs, time: float, sigma: float, nu: float,
                  weight: LossWeight, noise: Optional[MaternNoise] = None,
-                 noise_model=None):
+                 noise_model=None, priors=None):
         super().__init__(weight=weight)
         self.S_obs = S_obs
         self.time = time
@@ -212,27 +252,47 @@ class SurfaceObservation(Observation):
         self.nu = nu
         self.noise = noise
         self.noise_model = noise_model
+        self._priors = priors       # registry for the per-level noise models
+        self._S_obs_at = {0: S_obs}
 
     @property
     def required_times(self):
         return (self.time,)
 
+    def S_obs_at(self, level: int) -> torch.Tensor:
+        """The DEM box-restricted to multigrid `level` (cached)."""
+        if level not in self._S_obs_at:
+            self._S_obs_at[level] = _restrict(self.S_obs, level)
+        return self._S_obs_at[level]
+
+    def noise_model_at(self, level: int):
+        """The error model discretized on the level's grid (level 0: the
+        registered model itself)."""
+        if level == 0:
+            return self.noise_model
+        if self._priors is None:
+            raise ValueError("SurfaceObservation: coarse-level whitening needs "
+                             "the GlacierPriors registry (build via a spec)")
+        return self._priors.noise_model("srf", self.noise, level=level)
+
     def _raw(self, sim):
-        return sim.at(self.time).S_fine - self.S_obs
+        """(S_model − S_obs) on the snapshot's own grid."""
+        state = sim.at(self.time)
+        return state.S_coarse - self.S_obs_at(state.level), state.level
 
     def residuals(self, *, sim, physical, config, domain, mask, dx):
-        raw = self._raw(sim)
+        raw, level = self._raw(sim)
         r = raw / self.sigma
-        z = _whiten(self.noise_model, raw) if self.noise is not None else r
+        z = _whiten(self.noise_model_at(level), raw) if self.noise is not None else r
         return {"r": r, "z": z}
 
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
+        raw, level = self._raw(sim)
         if self.noise is not None:
-            z = _whiten(self.noise_model, self._raw(sim))
+            z = _whiten(self.noise_model_at(level), raw)
             return config.loss_scale * weight * _huber(z, self.nu).sum()
-        scale = config.loss_scale * dx ** 2
-        state = sim.at(self.time)
-        r_s = (state.S_fine - self.S_obs) / self.sigma
+        scale = config.loss_scale * (dx * 2 ** level) ** 2
+        r_s = raw / self.sigma
         return scale * weight * _huber(r_s, self.nu).sum()
 
     def randomized(self, *, eps_S=None):
@@ -244,7 +304,8 @@ class SurfaceObservation(Observation):
         return SurfaceObservation(
             S_obs=self.S_obs + perturbation, time=self.time,
             sigma=self.sigma, nu=self.nu, weight=self.weight,
-            noise=self.noise, noise_model=self.noise_model)
+            noise=self.noise, noise_model=self.noise_model,
+            priors=self._priors)
 
     def diagnostics(self):
         return {"srf_obs": self.S_obs}
@@ -477,20 +538,28 @@ class ExtentObservation(Observation):
         return (self.time,)
 
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
+        # Evaluated on the snapshot's own grid: coarse H / active / smb
+        # against the box-averaged (fractional) extent labels. For a
+        # cell-constant p, sum_cell (p - y_i)^2 = 4^L [(p - ybar)^2 +
+        # ybar (1 - ybar)], so the coarse Brier on the fraction is the fine
+        # one minus an irreducible within-cell term; the one-sided form is
+        # linear in y and restricts exactly.
         state = sim.at(self.time)
-        H_fine = state.H_fine
-        active_fine = state.active_fine
-
-        p_extent_dyn = (2.0 / (1 + torch.exp(-H_fine / self.s_H)) - 1
+        level = state.level
+        H = state.H
+        active = state.active
+        p_extent_dyn = (2.0 / (1 + torch.exp(-H / self.s_H)) - 1
                         ).clip(min=0.001, max=0.999)
-        p_extent_smb = (1 / (1 + torch.exp(-self.smb_dt / self.s_H * state.smb_fine))
+        p_extent_smb = (1 / (1 + torch.exp(-self.smb_dt / self.s_H * state.smb_coarse))
                         ).clip(min=0.001, max=0.999)
-        p_extent = p_extent_dyn * (1 - active_fine) + p_extent_smb * active_fine
+        p_extent = p_extent_dyn * (1 - active) + p_extent_smb * active
+        mask_L = _restrict(mask, level)
         if self.two_sided:
-            brier = (domain.domain_mask * ((mask - p_extent) / 0.5) ** 2).sum()
+            domain_L = _restrict(domain.domain_mask.to(torch.float32), level)
+            brier = (domain_L * ((mask_L - p_extent) / 0.5) ** 2).sum()
         else:
-            brier = (mask * ((1 - p_extent) / 0.5) ** 2).sum()
-        return config.loss_scale * weight * dx ** 2 * brier
+            brier = (mask_L * ((1 - p_extent) / 0.5) ** 2).sum()
+        return config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
 
 
 class BedObservation(Observation):
@@ -583,20 +652,34 @@ class SnowlineObservation(Observation):
         self.time = time
         self.s_smb = s_smb
         self.two_sided = two_sided
+        self._targets = {0: (snow_mask, snow_label)}
 
     @property
     def required_times(self):
         return (self.time,)
 
+    def _target_at(self, level: int):
+        """(snow_mask, snow_label) box-restricted to `level`: the mask
+        becomes the valid fraction, the label its mask-weighted mean."""
+        if level not in self._targets:
+            m = _restrict(self.snow_mask, level)
+            lab = _restrict_weighted(self.snow_label, self.snow_mask, level)
+            self._targets[level] = (m, lab)
+        return self._targets[level]
+
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
-        smb = sim.at(self.time).smb_fine
-        logits = smb / self.s_smb
+        # Evaluated on the snapshot's own grid (see ExtentObservation.loss
+        # for why the Brier on box-averaged targets is the right coarse form).
+        state = sim.at(self.time)
+        level = state.level
+        logits = state.smb_coarse / self.s_smb
         y = torch.nn.functional.sigmoid(logits)
+        snow_mask, snow_label = self._target_at(level)
         if self.two_sided:
-            brier = (self.snow_mask * ((y - self.snow_label) / 0.25) ** 2).sum()
+            brier = (snow_mask * ((y - snow_label) / 0.25) ** 2).sum()
         else:
-            brier = (self.snow_mask * self.snow_label * ((1.0 - y) / 0.25) ** 2).sum()
-        return config.loss_scale * weight * dx ** 2 * brier
+            brier = (snow_mask * snow_label * ((1.0 - y) / 0.25) ** 2).sum()
+        return config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
 
     def diagnostics(self):
         return {"snow_label": self.snow_label, "snow_mask": self.snow_mask}
@@ -890,7 +973,8 @@ class SurfaceSpec:
         return SurfaceObservation(
             S_obs=torch.clamp(ctx.domain.dem, min=0.0), time=time,
             sigma=sigma, nu=self.nu, weight=self.weight,
-            noise=self.noise, noise_model=noise_model)
+            noise=self.noise, noise_model=noise_model,
+            priors=getattr(ctx, "priors", None))
 
 
 @dataclass(frozen=True)

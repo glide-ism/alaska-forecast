@@ -9,6 +9,7 @@ full forward model. Reused inside GlacierProblem. Everything here (including
 the bed-conditioning data) is loadable from the config alone, so the
 standalone path stays intact.
 """
+import dataclasses
 import math
 import warnings
 from pathlib import Path
@@ -285,14 +286,21 @@ class GlacierPriors:
         self.mu_z0 = config.mu_z0
         self.sigma_z0 = config.sigma_z0
 
-    def noise_model(self, name: str, hp: MaternNoise):
+    def noise_model(self, name: str, hp: MaternNoise, level: int = 0):
         """The model whitening the residual field of observation `name`:
         a member `noise_<name>` on the shared ggapp collection for a pure
         odd-ν Matérn (nugget == 0), or a `SpectralMaternNoise` otherwise
-        (nugget set, or a ν the stencil cannot realize). Idempotent: re-registering the same product with equal
-        hyperparameters returns the stored model; differing hyperparameters
-        raise, since one product cannot carry two error models."""
-        key = f"noise_{name}"
+        (nugget set, or a ν the stencil cannot realize). Idempotent:
+        re-registering the same product with equal hyperparameters returns
+        the stored model; differing hyperparameters raise, since one product
+        cannot carry two error models.
+
+        `level > 0` returns the same physical model discretized on that
+        multigrid level's grid (key `noise_<name>_L<level>`, always
+        spectral): σ, l, ν carry over unchanged, and the white nugget scales
+        as nugget/2^level (box-averaging 4^level pixels), which keeps the
+        quadratic form of any resolved residual level-independent."""
+        key = f"noise_{name}" if level == 0 else f"noise_{name}_L{level}"
         stored = self.noise_models.get(key)
         if stored is not None:
             hp0, member = stored
@@ -301,7 +309,12 @@ class GlacierPriors:
                     f"noise model {key!r} already registered with {hp0}, "
                     f"cannot re-register with {hp}")
             return member
-        if not hp.stencil_compatible:
+        if level > 0:
+            f = 2 ** level
+            hp_L = dataclasses.replace(hp, nugget=hp.nugget / f)
+            member = SpectralMaternNoise(hp_L, self.ny // f, self.nx // f,
+                                         self.dx * f)
+        elif not hp.stencil_compatible:
             member = SpectralMaternNoise(hp, self.ny, self.nx, self.dx)
         elif self.prior_collection is not None:
             member = self.prior_collection.add(key, hp.sigma, hp.l, int(hp.nu))

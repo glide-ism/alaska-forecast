@@ -98,6 +98,27 @@ uniform spinup grid onto observation times, variable dt), and each misfit compar
 `(H(t1) − H(t0)) / (t1 − t0)` over the product window. The run horizon auto-extends to
 `max(t_end, latest observation time)`; observation times ≤ `t_start` raise.
 
+**Multigrid levels and the observations.** The surface, extent and snowline terms are
+evaluated **in the model's own space at each level**: the observation is box-restricted to
+the level's grid (`SurfaceObservation.S_obs_at(L)`, fractional extent/snow masks with
+mask-weighted labels) and compared with the coarse model fields (`S_coarse`, `H`, `active`,
+`smb_coarse`); the whitening model is re-discretized on the coarse grid by
+`GlacierPriors.noise_model(name, hp, level=L)` (key `noise_<name>_L<L>`, spectral, white
+nugget scaled `nugget/2^L`), and diagonal/Brier forms carry `dx_L²`. For any residual the
+coarse grid resolves this is the same quadratic form as on the fine grid (verified to a
+few % for ≥ 10 pixels per wavelength), so each term's effective observation count is
+level-independent; what disappears is the sub-grid content of the observation a coarse
+model cannot represent — compared on the fine grid that was an irreducible floor (delta
+surface: ~790 loss units at level 2, ~370 at level 1, i.e. essentially the whole term).
+The Brier terms restrict exactly: for cell-constant p, `Σ_cell (p − y_i)² = 4^L[(p − ȳ)² +
+ȳ(1 − ȳ)]`, i.e. the coarse Brier on the fraction plus a within-cell constant; the
+one-sided form is linear in y and has no floor at all. Velocity and dh/dt stay on the fine
+grid (smooth model fields under on-ice masks; their floors are a few units). Level 0 is
+bit-identical to before. `problem.write_observations(dir, level=L)` dumps every product
+box-restricted to that level (NaN-aware for the pick raster) — `inverse.py` calls it at
+the top of every level, so `level_<L>/vti/observations.pvd` shows the targets the level's
+terms actually see; `write_residuals` prolongs coarse residual fields onto the fine grid.
+
 **Correlated observation errors (`MaternNoise`).** The three field likelihoods
 (`SurfaceSpec`, `VelocitySpec`, `DhdtSpec`) accept `noise=MaternNoise(sigma, l, nu)`
 (`config.py`): the residual field r = model − data is modelled as a zero-mean Matérn GP
