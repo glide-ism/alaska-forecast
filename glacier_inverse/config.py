@@ -123,12 +123,20 @@ class MaternNoise:
       surface, m/yr per velocity component). For dh/dt it is a dimensionless
       multiplier on the product's own per-pixel error (clamped at
       `sigma_floor`), so σ=1 trusts the reported uncertainty as the marginal.
-    * `l`: correlation length in metres, ggapp convention κ = √(8ν)/l, i.e.
-      the correlation drops to ≈0.1 at distance l. An exponential variogram
-      range a (γ = c0 + c1(1 − e^{−h/a})) corresponds to l ≈ 2.3 a.
-    * `nu`: Matérn smoothness — a positive ODD integer (α = ν + 1 must be
-      even; ggapp truncates α//2 silently for even ν). This is NOT the spec's
-      `nu`, which is the pseudo-Huber threshold on the whitened residual.
+    * `l`: correlation length in metres, ggapp convention κ = √(8ν)/l (the
+      correlation drops to ≈0.1 at distance l for ν = 1; for ν = ½ it is
+      exp(−2h/l)). An exponential variogram range a (γ = c0 + c1(1 −
+      e^{−h/a})) corresponds to l ≈ 2.3 a for ν = 1 and l = 2a for ν = ½.
+    * `nu`: Matérn smoothness, any positive real. ggapp's stencil whitening
+      needs a positive ODD integer (α = ν + 1 even; it truncates α//2
+      silently otherwise); every other ν — in particular ν = ½, the
+      exponential covariance that the residual variograms actually fit — is
+      handled exactly by the spectral path (`priors.SpectralMaternNoise`),
+      as is any ν with a nugget. Mind the spectral tail: ν = 1 falls as k⁻⁴
+      and declares intermediate (glacier-scale) model error impossible, so
+      those scales get counted against the nugget alone; ν = ½ (k⁻³) keeps
+      real power there. This is NOT the spec's `nu`, which is the
+      pseudo-Huber threshold on the whitened residual.
     * `nugget`: std of an additional WHITE (pixel-scale) error component, same
       units as `sigma` — error = Matérn(sigma, l, nu) + N(0, nugget²) per
       pixel. Real products have one (DEM/mosaic pixel noise, the reported
@@ -146,7 +154,7 @@ class MaternNoise:
     """
     sigma: float
     l: float
-    nu: int = 1
+    nu: float = 1
     nugget: float = 0.0
 
     def __post_init__(self):
@@ -156,11 +164,16 @@ class MaternNoise:
             raise ValueError(f"MaternNoise.l must be > 0, got {self.l}")
         if not (self.nugget >= 0.0):
             raise ValueError(f"MaternNoise.nugget must be >= 0, got {self.nugget}")
-        if isinstance(self.nu, bool) or not isinstance(self.nu, int) \
-                or self.nu < 1 or self.nu % 2 != 1:
-            raise ValueError(
-                f"MaternNoise.nu must be a positive odd integer (alpha = nu + 1 "
-                f"even; ggapp truncates alpha//2 for even nu), got {self.nu!r}")
+        if isinstance(self.nu, bool) or not (self.nu > 0.0):
+            raise ValueError(f"MaternNoise.nu must be a positive real, got {self.nu!r}")
+
+    @property
+    def stencil_compatible(self) -> bool:
+        """True when ggapp's stencil whitening applies exactly: no nugget
+        and ν a positive odd integer. Otherwise the spectral path is used."""
+        nu = self.nu
+        return (self.nugget == 0.0 and float(nu).is_integer()
+                and int(nu) >= 1 and int(nu) % 2 == 1)
 
 
 @dataclass(frozen=True)

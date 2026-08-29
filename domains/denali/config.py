@@ -59,7 +59,11 @@ CONFIG = GlacierConfig(
         # (temperature forcing), not measurement noise. Every product also
         # carries pixel-scale noise that a long-l Matern alone would amplify
         # ~(l/dx)^2 -- the nugget (same units as sigma; for dhdt in units of
-        # the per-pixel error) absorbs it. The nugget is set from A-PRIORI
+        # the per-pixel error) absorbs it. Smoothness nu=0.5 (exponential
+        # covariance, l = 2x the fitted range) for surface and dhdt: their
+        # variograms are linear at short lags, and nu=1's k^-4 tail would
+        # declare glacier-scale (1-5 km) model error impossible and count
+        # those scales against the nugget alone. The nugget is set from A-PRIORI
         # pixel noise (DEM ~10 m, ITS_LIVE ~10 m/yr per component, the dhdt
         # product's own error), NOT from the residual variogram's c0: a MAP
         # with a free fine-scale bed overfits below the noise, so the residual
@@ -67,14 +71,14 @@ CONFIG = GlacierConfig(
         # makes the whitened metric count every pixel's fine-scale pattern
         # against it (curvature ~ nugget^-2), pinning the scalars. The Matern
         # sigma is then the smooth remainder of the measured residual.
-        SurfaceSpec(noise=MaternNoise(sigma=12.0, l=2000.0, nugget=10.0), weight=1.0, nu=3),
+        SurfaceSpec(noise=MaternNoise(sigma=12.0, l=2000.0, nu=0.5, nugget=10.0), weight=1.0, nu=3),
         VelocitySpec(noise=MaternNoise(sigma=12.0, l=3000.0, nugget=10.0), weight=1.0,
                      surge_biased=True, nu=3, alpha_nonsurge=20),
         ExtentSpec(weight=2e-5, s_H=10.0),
         BedSpec(weight=0.0e-6),
         SnowlineSpec(weight=Schedule(final=1e-5, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1e-5),
                      s_smb=0.5),
-        DhdtSpec(noise=MaternNoise(sigma=0.5, l=8000.0, nugget=1.0),
+        DhdtSpec(noise=MaternNoise(sigma=0.5, l=7200.0, nu=0.5, nugget=1.0),
                  weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0)),
         BedSlopeSpec(weight=1e-5,s_scale=5.0),
     ),

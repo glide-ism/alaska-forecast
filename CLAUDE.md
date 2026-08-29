@@ -113,19 +113,26 @@ smooth directions a correlated error can explain (where the scalars live). Seman
 `sigma` is the marginal std in product units (surface m; velocity m/yr per component);
 for dh/dt it is a dimensionless multiplier on the product's per-pixel error (the member is
 registered with unit σ, `DhdtObservation._sigma_pixel`). `l` is ggapp's correlation length
-(κ = √(8ν)/l, ρ(l) ≈ 0.1; an exponential variogram range a ↔ l ≈ 2.3a). `MaternNoise.nu`
-is the Matérn smoothness (positive **odd** int — ggapp truncates α//2 silently otherwise)
-and is distinct from the spec's `nu`, the pseudo-Huber threshold (now on z). **`nugget`**
+(κ = √(8ν)/l; ρ(l) ≈ 0.1 for ν = 1, e^{−2h/l} for ν = ½; an exponential variogram range a
+↔ l ≈ 2.3a at ν = 1, l = 2a at ν = ½). `MaternNoise.nu` is the Matérn smoothness — any
+positive real: odd integers can use ggapp's stencil, everything else (ν = ½ in particular,
+the exponential shape the residual variograms actually fit) goes through the exact
+spectral path — and is distinct from the spec's `nu`, the pseudo-Huber threshold (now on z).
+Mind ν's spectral tail: ν = 1 (k⁻⁴) declares glacier-scale (1–5 km) model error impossible
+under a long l, so those scales are counted against the nugget alone (the *unweighted*
+diagonal, ~60× the old `weight·dx²`), which is where the scalar sensitivities live; ν = ½
+(k⁻³) keeps real error power there (delta: dh/dt curvature along H_atm 65 → 34). **`nugget`**
 (std of an additional white per-pixel error, same units as σ) is not optional in practice:
 every product has pixel-scale noise (the variogram's c0), and a pure Matérn with a long l
 declares it impossible — its whitening filter amplifies white noise by ~(dx/τ)‖L‖ (45× for
 l = 9 km at 90 m; the old delta MAP's dh/dt residual whitened to std 3.7 without a nugget,
 0.9–1.4 with one), so the term would fit noise. With `nugget > 0` the model is
-`priors.SpectralMaternNoise`: ggapp's 5-point mirror-Neumann operator is diagonalized
-exactly by the orthonormal DCT-II, so `C = C_m + nugget²I` and its ±½ powers are spectral
-filters (`cupyx.scipy.fft.dctn`, O(N log N), exact — reproduces the stencil to ~1e-6 at
-nugget = 0); it exposes the same cupy `whiten`/`forward` as a ggapp member, so
-`GGaPPWhiten`/`GGaPPMap` and everything downstream are agnostic. Pure Matérn models are
+`priors.SpectralMaternNoise` (also used for any non-odd-integer ν): ggapp's 5-point
+mirror-Neumann operator is diagonalized exactly by the orthonormal DCT-II, so
+`C = C_m + nugget²I` and its ±½ powers are spectral filters (`cupyx.scipy.fft.dctn`,
+O(N log N), exact — reproduces the stencil to ~1e-6 at nugget = 0, odd ν); it exposes the
+same cupy `whiten`/`forward` as a ggapp member, so `GGaPPWhiten`/`GGaPPMap` and everything
+downstream are agnostic. Pure odd-ν Matérn models (`MaternNoise.stencil_compatible`) are
 members `noise_<name>` on the shared `PriorCollection`; either way
 `GlacierPriors.noise_model(name, hp)` is the registry (idempotent per product;
 `ObservationBuildContext.priors` carries it — ad-hoc spec builds use `problem.build_ctx`). Under the surge marginal the whitened stacks
@@ -140,9 +147,19 @@ The Brier/prior-style terms (extent, snowline, bed picks, divide, bedslope) keep
 — they are not Gaussian field likelihoods. Because the whitened data terms are ~60× the
 old diagonal scale with their gradient power at fine scales, the SGD field learning rates
 (`lr_z_bed`, `lr_z_log_beta`) need retuning (delta/denali start ÷30). Enabled for delta
-and denali; fitted from `tools/residual_variograms.py` on the MAP residuals (2026-08-28):
-surface σ 16 m, l = bed-prior l, nugget 4 m; velocity σ 15/20 m yr⁻¹ per component,
-l 3 km, nugget 3; dh/dt σ 1 (× reported error), l 9/8 km, nugget 0.15.
+and denali. **Set the nugget from a-priori pixel noise, not from the residual variogram's
+c0**: a MAP with a free fine-scale bed overfits below the noise, so the residual's nugget
+(0.2 σ_pix for delta dh/dt against a reported 1 σ_pix) is an artefact, and a small nugget
+makes every pixel's fine-scale pattern count against it (curvature ~ nugget⁻²). Current
+values: surface σ 12 m, l = bed-prior l (the user's rule: surface and bed measure the same
+quantity, so l_srf ≥ l_bed), ν ½, nugget 10 m; velocity σ 12 m yr⁻¹ per component, l 3 km,
+ν 1, nugget 10 (ITS_LIVE's typical error — the inputs carry no error field); dh/dt σ 0.5 ×
+reported error, l 7.7/7.2 km (= 2× the fitted exponential range), ν ½, nugget 1.0. Note
+the prior/data balance on the scalars is **not** restored by whitening alone — the
+finite-difference curvature of the data terms along `z_log_H_atm` etc. (conditional on the
+fields) stays 10⁴–10⁵× the prior's, because the scalar sensitivity fields carry their power
+at glacier scales; what limits the scalars in the joint problem is their degeneracy with
+the fields, i.e. the field priors, not the error model.
 
 **Schedulable loss weights (continuation, inverse-only).** Per-observation weights
 (`weight=` on each spec) and the global `loss_scale` may be a constant *or* a

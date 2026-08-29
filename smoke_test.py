@@ -406,6 +406,16 @@ def main() -> int:
         spec_n = priors.noise_model("srf_nugget_test", noise_n)
         check("noise_model with a nugget returns a SpectralMaternNoise",
               isinstance(spec_n, SpectralMaternNoise))
+        spec_h = priors.noise_model("srf_halfnu_test",
+                                    MaternNoise(sigma=10.0, l=1000.0, nu=0.5))
+        z_h = GGaPPWhiten.apply(spec_h, GGaPPMap.apply(spec_h, eps))
+        rel = (z_h - eps).norm() / (eps.norm() + 1e-12)
+        check("nu = 1/2 (exponential) model: spectral round-trip exact",
+              isinstance(spec_h, SpectralMaternNoise) and rel.item() < 1e-4,
+              f"relative error = {rel.item():.3e}")
+        v_h = (GGaPPMap.apply(spec_h, eps) ** 2).mean().sqrt().item()
+        check("nu = 1/2 model: Map(ε) has marginal std ≈ sigma",
+              abs(v_h / 10.0 - 1.0) < 0.3, f"std = {v_h:.2f}")
         z_n = GGaPPWhiten.apply(spec_n, GGaPPMap.apply(spec_n, eps))
         rel = (z_n - eps).norm() / (eps.norm() + 1e-12)
         check("nugget model: ‖W(M(ε)) − ε‖ / ‖ε‖ < 1e-4 (exact spectral pair)",
@@ -439,11 +449,16 @@ def main() -> int:
         except ValueError as e:
             check("Schedule(final=1) with a zero ramp passes the contract",
                   False, str(e))
+    check("MaternNoise: even / fractional nu route to the spectral path",
+          not MaternNoise(10.0, 1000.0, nu=2).stencil_compatible
+          and not MaternNoise(10.0, 1000.0, nu=0.5).stencil_compatible
+          and MaternNoise(10.0, 1000.0, nu=3).stencil_compatible
+          and not MaternNoise(10.0, 1000.0, nu=1, nugget=1.0).stencil_compatible)
     try:
-        MaternNoise(10.0, 1000.0, nu=2)
-        check("MaternNoise rejects even nu", False)
+        MaternNoise(10.0, 1000.0, nu=0.0)
+        check("MaternNoise rejects nu <= 0", False)
     except ValueError:
-        check("MaternNoise rejects even nu", True)
+        check("MaternNoise rejects nu <= 0", True)
     try:
         MaternNoise(10.0, 1000.0, nugget=-1.0)
         check("MaternNoise rejects a negative nugget", False)
@@ -464,7 +479,7 @@ def main() -> int:
         del sim, physical, loss_terms, probe, J
         del problem, params, srf, vel, bed, snow, dhdt, domain, priors
         srf_w = again = res = J_w = corr = z_back = pert = None
-        spec0 = spec_n = z_spec = z_n = white = None
+        spec0 = spec_n = z_spec = z_n = white = spec_h = z_h = None
         torch.cuda.empty_cache()
 
         import dataclasses

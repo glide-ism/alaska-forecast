@@ -42,25 +42,26 @@ def _build_matern_prior(p: PriorHyperparams, n_levels: int, ny: int, nx: int, dx
 
 
 class SpectralMaternNoise:
-    """Matérn + nugget error model as an exact spectral operator.
+    """Matérn(ν) + nugget error model as an exact spectral operator.
 
     ggapp's Matérn operator L = −Δ_h + κ² uses the 5-point Laplacian with
     mirror (Neumann) boundaries, which the orthonormal DCT-II diagonalizes
     exactly (eigenvalues λ_ij = (2 − 2cos(πi/ny) + 2 − 2cos(πj/nx))/dx²), so the
-    Matérn covariance C_m = (τ/dx)² L^{−α} has eigen-variance
-    S(λ) = (τ/dx)²(κ² + λ)^{−α} in that basis and the nugget adds a constant:
+    Matérn covariance C_m = (τ/dx)² L^{−α}, α = ν + 1, has eigen-variance
+    S(λ) = (τ/dx)²(κ² + λ)^{−α} in that basis — for ANY real ν, not just the
+    odd integers the stencil can realize — and the nugget adds a constant:
     C = C_m + nugget²·I. `whiten` applies C^{−1/2}, `forward` applies C^{+1/2}
     — both self-adjoint, O(N log N) through cupyx.scipy.fft, exact (with
-    nugget = 0 they reproduce ggapp's stencil whitening to float32 rounding,
-    ~4e-7 relative). Duck-compatible with a ggapp prior member: cupy in /
-    cupy out, so `GGaPPWhiten` / `GGaPPMap` drive it unchanged.
+    nugget = 0 and odd ν they reproduce ggapp's stencil whitening to float32
+    rounding, ~4e-7 relative). Duck-compatible with a ggapp prior member:
+    cupy in / cupy out, so `GGaPPWhiten` / `GGaPPMap` drive it unchanged.
     """
 
     def __init__(self, hp: MaternNoise, ny: int, nx: int, dx: float):
         import cupyx.scipy.fft as cfft
         self._fft = cfft
         self.hp, self.ny, self.nx, self.dx = hp, ny, nx, dx
-        nu, alpha = hp.nu, hp.nu + 1
+        nu, alpha = float(hp.nu), float(hp.nu) + 1.0
         kappa = math.sqrt(8.0 * nu) / hp.l
         tau = math.sqrt(hp.sigma ** 2 * (4.0 * math.pi) * kappa ** (2 * nu)
                         * _gamma_fn(alpha) / _gamma_fn(nu))
@@ -287,8 +288,8 @@ class GlacierPriors:
     def noise_model(self, name: str, hp: MaternNoise):
         """The model whitening the residual field of observation `name`:
         a member `noise_<name>` on the shared ggapp collection for a pure
-        Matérn (nugget == 0), or a `SpectralMaternNoise` when a nugget is
-        set. Idempotent: re-registering the same product with equal
+        odd-ν Matérn (nugget == 0), or a `SpectralMaternNoise` otherwise
+        (nugget set, or a ν the stencil cannot realize). Idempotent: re-registering the same product with equal
         hyperparameters returns the stored model; differing hyperparameters
         raise, since one product cannot carry two error models."""
         key = f"noise_{name}"
@@ -300,10 +301,10 @@ class GlacierPriors:
                     f"noise model {key!r} already registered with {hp0}, "
                     f"cannot re-register with {hp}")
             return member
-        if hp.nugget > 0.0:
+        if not hp.stencil_compatible:
             member = SpectralMaternNoise(hp, self.ny, self.nx, self.dx)
         elif self.prior_collection is not None:
-            member = self.prior_collection.add(key, hp.sigma, hp.l, hp.nu)
+            member = self.prior_collection.add(key, hp.sigma, hp.l, int(hp.nu))
         else:
             member = _build_matern_prior(hp, self.config.n_levels,
                                          self.ny, self.nx, self.dx)
