@@ -55,6 +55,7 @@ from .forward import simulate, differentiable_restriction, differentiable_prolon
 from .loss import LossTerms, PriorMeans, compute_prior
 from .observations import (
     DomainData, Observation, ObservationBuildContext, default_observation_specs,
+    validate_noise_weights,
 )
 from .priors import GlacierPriors
 from .scheduling import merge_times
@@ -216,11 +217,16 @@ class GlacierProblem:
             domain=self.domain,
             ny=ny, nx=nx,
             config=cfg,
+            priors=self.priors,
         )
+        # Kept for ad-hoc spec builds (smoke test, tools) against this problem.
+        self.build_ctx = build_ctx
         specs = cfg.observations if getattr(cfg, "observations", None) \
             else default_observation_specs(cfg)
         self.observations = [obs for spec in specs
                              if (obs := spec.build(build_ctx)) is not None]
+        # Whitened (MaternNoise) terms carry weight == 1 by contract.
+        validate_noise_weights(self.observations)
 
         # RTO hook: per-sample perturbed conditioning data (Matheron's rule)
         # consumed by physical_from until reset. Stale PCG warm-start caches
@@ -537,6 +543,29 @@ class GlacierProblem:
             scalar_fields=scalars,
             vector_fields=vector_fields,
         )
+
+    def write_residuals(self, output_dir: str, sim, physical,
+                        base: str = "residuals") -> None:
+        """Dump every field likelihood's residual diagnostics (`obs.residuals()`:
+        σ-normalized `r` and whitened `z`, per component for velocity) on the
+        fine grid to a single-frame PVD, keyed `<name>_<field>` (srf_r, srf_z,
+        vel_z_u, …, dhdt_z). Call after a level's final simulate; only the
+        finest level's residuals are statistically meaningful (coarser levels
+        compare prolonged fields)."""
+        from .io import write_static_vti
+
+        mask = (self.domain.rgi_mask * self.domain.domain_mask).to(torch.float32)
+        config = self.config.at_iteration(0, 0, schedule=False)
+        scalars = {}
+        for obs in self.observations:
+            fields = obs.residuals(
+                sim=sim, physical=physical, config=config,
+                domain=self.domain, mask=mask, dx=self.dx)
+            for k, v in fields.items():
+                scalars[f"{obs.name}_{k}"] = v.detach()
+        if not scalars:
+            return
+        write_static_vti(self.mg[0], output_dir, base, scalar_fields=scalars)
 
     def _build_initial_parameters(self) -> WhitenedParameters:
         priors = self.priors

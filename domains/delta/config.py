@@ -9,7 +9,7 @@ stay in the driver scripts.
 
 from pathlib import Path
 
-from glacier_inverse.config import BedConditioningConfig, GlacierConfig, PriorHyperparams, Schedule
+from glacier_inverse.config import BedConditioningConfig, GlacierConfig, MaternNoise, PriorHyperparams, Schedule
 from glacier_inverse.observations import (
     BedSpec, BedSlopeSpec, DhdtSpec, ExtentSpec, SnowlineSpec, SurfaceSpec, VelocitySpec,
 )
@@ -47,13 +47,29 @@ CONFIG = GlacierConfig(
     grad_start_time=1712,
     #t_start=1712,
     observations=(
-        SurfaceSpec(weight=2.0e-6,nu=3),
-        VelocitySpec(weight=2.0e-6, surge_biased=True,nu=3,alpha_nonsurge=20),
+        # Correlated (Matern GP) error models, weight == 1 by contract: the
+        # misfit is on the whitened residual, no dx^2 observation-density
+        # factor; sigma/l carry all the weighting. Fitted to the variograms of
+        # the inverse_molho_diffuse MAP residuals (tools/residual_variograms.py,
+        # 2026-08-28; Matern l ~ 2.3x the exponential range). Surface l follows
+        # the bed prior's l (zero-order rule: surface misfit inherits the
+        # bed's roughness scale). Velocity sigma is per component, after the
+        # per-glacier surge factor eta. dhdt sigma multiplies the product's
+        # per-pixel error; its l ~ 8-9 km is a model-inflexibility scale
+        # (temperature forcing), not measurement noise. Every product also
+        # carries pixel-scale noise (the variogram's c0) that a long-l Matern
+        # alone would amplify ~(l/dx)^2 -- the nugget (same units as sigma;
+        # for dhdt in units of the per-pixel error) absorbs it. Values chosen
+        # so the whitened residual of the old MAP has std(z) ~ 1.
+        SurfaceSpec(noise=MaternNoise(sigma=16.0, l=1000.0, nugget=4.0), weight=1.0, nu=3),
+        VelocitySpec(noise=MaternNoise(sigma=15.0, l=3000.0, nugget=3.0), weight=1.0,
+                     surge_biased=True, nu=3, alpha_nonsurge=20),
         ExtentSpec(weight=2e-5, s_H=10.0),
         BedSpec(weight=0.0e-6),
         SnowlineSpec(weight=Schedule(final=1e-5, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1e-5),
                      s_smb=0.5),
-        DhdtSpec(weight=Schedule(final=1e-5, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1e-5)),
+        DhdtSpec(noise=MaternNoise(sigma=1.0, l=9000.0, nugget=0.15),
+                 weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0)),
         BedSlopeSpec(weight=1e-5,s_scale=5.0),
     ),
     loss_scale=1e-3,
@@ -71,13 +87,16 @@ CONFIG = GlacierConfig(
     avalanche_hoisted=True,
     debris_factor=0.5,
     bed_prior = PriorHyperparams(sigma=500,    l=1000.0, nu=1),
-    lr_z_bed=0.05,
+    # SGD field learning rates: the whitened data terms are ~1/(2e-6*dx^2) ~ 60x
+    # the old diagonal scale and put their gradient power at fine scales, so
+    # the bed/beta steps start ~30x smaller. Retune on the level-2 loss trace.
+    lr_z_bed=0.0017,
     alpha_t2m=2.5,
     dt=20.0,
     tbias_enabled=True,
     mu_log_beta = np.log(5.0),
     log_beta_prior = PriorHyperparams(sigma=1./3.,    l=1000.0, nu=1),
-    lr_z_log_beta=0.05*9*9,
+    lr_z_log_beta=0.05*9*9/30,
     max_level=2,
     max_iters=(50,50,500),
     lr_z_pbias=Schedule(final=0.001, ramp=lambda i,level:0.0 if (i<50 and level==2) else 0.001),

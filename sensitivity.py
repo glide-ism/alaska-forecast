@@ -150,7 +150,7 @@ num = (L @ (L.T @ q)) ** 2
 num_bed   = num[:nx * ny].reshape(ny, nx)
 num_pbias = num[nx * ny:2 * nx * ny].reshape(ny, nx)
 
-denom_bed   = Sigma_diag[:ny * nx].reshape(ny, nx)         + config.sigma_s ** 2
+denom_bed   = Sigma_diag[:ny * nx].reshape(ny, nx)         + problem.get_observation("srf").sigma ** 2
 denom_pbias = Sigma_diag[ny * nx:2 * ny * nx].reshape(ny, nx) + 0.01 ** 2
 
 rho2_bed   = num_bed   / (denom_bed   * Q_var)

@@ -106,6 +106,64 @@ class PriorHyperparams:
 
 
 @dataclass(frozen=True)
+class MaternNoise:
+    """Correlated (Matérn GP) observation-error model for a field likelihood.
+
+    Attach to `SurfaceSpec`/`VelocitySpec`/`DhdtSpec(noise=...)`. The residual
+    field r = model − data is treated as a draw from a zero-mean Matérn GP
+    with marginal std `sigma`, correlation length `l` and smoothness `nu`,
+    and the misfit is formed on the *whitened* residual z = W r (ggapp's
+    `GGaPPWhiten`, a stencil application), so that
+        loss = loss_scale · weight · Σ huber(z)
+    with NO dx² observation-density factor and `weight == 1` by contract
+    (`GlacierProblem` raises otherwise — any up/down-weighting must be a
+    change to σ, l or ν, i.e. to the probabilistic model).
+
+    * `sigma`: marginal std of the error in the product's units (m for the
+      surface, m/yr per velocity component). For dh/dt it is a dimensionless
+      multiplier on the product's own per-pixel error (clamped at
+      `sigma_floor`), so σ=1 trusts the reported uncertainty as the marginal.
+    * `l`: correlation length in metres, ggapp convention κ = √(8ν)/l, i.e.
+      the correlation drops to ≈0.1 at distance l. An exponential variogram
+      range a (γ = c0 + c1(1 − e^{−h/a})) corresponds to l ≈ 2.3 a.
+    * `nu`: Matérn smoothness — a positive ODD integer (α = ν + 1 must be
+      even; ggapp truncates α//2 silently for even ν). This is NOT the spec's
+      `nu`, which is the pseudo-Huber threshold on the whitened residual.
+    * `nugget`: std of an additional WHITE (pixel-scale) error component, same
+      units as `sigma` — error = Matérn(sigma, l, nu) + N(0, nugget²) per
+      pixel. Real products have one (DEM/mosaic pixel noise, the reported
+      dh/dt error), and a pure Matérn with a long l declares pixel-scale
+      noise impossible: its whitening filter amplifies white noise by
+      ~(dx/τ)·‖L‖ (≈45× for l = 9 km at 90 m), so the whitened residual is
+      dominated by amplified noise and the term fits noise. With a nugget the
+      model is handled as an exact spectral (DCT-II) operator on the Neumann
+      grid (`priors.SpectralMaternNoise`) instead of ggapp's stencil — the
+      same discretization, diagonalized. Read it off the variogram: nugget² ≈
+      the fitted c0 (in the product's units); the post-hoc check is
+      `tools/residual_variograms.py` (std(z) → 1, γ_z(dx)/var → 1).
+
+    Duck-compatible with `PriorHyperparams` (same first three attributes).
+    """
+    sigma: float
+    l: float
+    nu: int = 1
+    nugget: float = 0.0
+
+    def __post_init__(self):
+        if not (self.sigma > 0.0):
+            raise ValueError(f"MaternNoise.sigma must be > 0, got {self.sigma}")
+        if not (self.l > 0.0):
+            raise ValueError(f"MaternNoise.l must be > 0, got {self.l}")
+        if not (self.nugget >= 0.0):
+            raise ValueError(f"MaternNoise.nugget must be >= 0, got {self.nugget}")
+        if isinstance(self.nu, bool) or not isinstance(self.nu, int) \
+                or self.nu < 1 or self.nu % 2 != 1:
+            raise ValueError(
+                f"MaternNoise.nu must be a positive odd integer (alpha = nu + 1 "
+                f"even; ggapp truncates alpha//2 for even nu), got {self.nu!r}")
+
+
+@dataclass(frozen=True)
 class SolverConfig:
     coarsest_steps: int = 200
     pre_steps: int = 10

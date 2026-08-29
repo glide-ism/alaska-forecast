@@ -17,6 +17,11 @@ cheap consistency checks:
   7. A short forward run at the coarsest level emits a state snapshot at
      every required observation time, produces finite loss terms, and is
      differentiable end-to-end — including through a non-final snapshot.
+  7b. The correlated-noise (MaternNoise) likelihood: an ad-hoc whitened
+     SurfaceSpec built against the problem's context yields finite residual
+     fields, a finite loss and gradient, its Matérn member round-trips
+     W(Map(ε)) ≈ ε with unit whitened variance, and the weight == 1 /
+     odd-ν contracts are enforced.
   8. The enthalpy SMB backend (smb_model="enthalpy") builds, runs, is
      deterministic (fixed weather realization), and is differentiable w.r.t.
      its two whitened scalars (skipped if the installed glare predates it).
@@ -35,7 +40,7 @@ import torch
 
 from ggapp.torch import GGaPPMap, GGaPPWhiten
 
-from glacier_inverse import GlacierProblem, load_config
+from glacier_inverse import GlacierProblem, MaternNoise, load_config
 from glacier_inverse.forward import year_overlap_weights
 from glacier_inverse.scheduling import build_step_sequence, merge_times
 
@@ -315,12 +320,135 @@ def main() -> int:
         check("dhdt term is active (non-zero)",
               float(loss_terms.data_terms["dhdt"]) != 0.0)
 
-    J.backward()
+    J.backward(retain_graph=True)
     check("z_bed received a finite gradient",
           params.z_bed.grad is not None
           and torch.isfinite(params.z_bed.grad).all().item(),
           f"grad norm = {params.z_bed.grad.norm().item():.3e}"
           if params.z_bed.grad is not None else "no grad")
+
+    header("7b. Correlated-noise (MaternNoise) likelihood")
+    from glacier_inverse import Schedule
+    from glacier_inverse.observations import (SurfaceSpec,
+                                              validate_noise_weights)
+    noise = MaternNoise(sigma=10.0, l=1000.0, nu=1)
+    try:
+        srf_w = SurfaceSpec(noise=noise, weight=1.0).build(problem.build_ctx)
+        check("whitened SurfaceSpec builds against problem.build_ctx", True)
+    except Exception as e:
+        traceback.print_exc()
+        check("whitened SurfaceSpec builds against problem.build_ctx", False, str(e))
+        srf_w = None
+    if srf_w is not None:
+        check("noise member is registered on the priors as noise_srf",
+              srf_w.noise_model is priors.noise_models["noise_srf"][1]
+              and srf_w.sigma == noise.sigma)
+        again = SurfaceSpec(noise=noise, weight=1.0).build(problem.build_ctx)
+        check("re-registering the same noise model is idempotent",
+              again.noise_model is srf_w.noise_model)
+        try:
+            SurfaceSpec(noise=MaternNoise(20.0, 1000.0), weight=1.0) \
+                .build(problem.build_ctx)
+            check("re-registering with different hyperparameters raises", False)
+        except ValueError:
+            check("re-registering with different hyperparameters raises", True)
+
+        cfg0 = config.at_iteration(0, 0, schedule=False)
+        mask = (domain.rgi_mask * domain.domain_mask).to(torch.float32)
+        res = srf_w.residuals(sim=sim, physical=physical, config=cfg0,
+                              domain=domain, mask=mask, dx=problem.dx)
+        check("residuals() returns raw and whitened fields of domain shape",
+              set(res) == {"r", "z"}
+              and res["z"].shape == (problem.ny, problem.nx)
+              and torch.isfinite(res["z"]).all().item()
+              and res["z"] is not res["r"])
+        J_w = srf_w.loss(sim=sim, physical=physical, config=cfg0,
+                         domain=domain, mask=mask, dx=problem.dx, weight=1.0)
+        check("whitened surface loss is finite", torch.isfinite(J_w).item(),
+              f"J_srf_whitened = {J_w.item():.4f}")
+        params.z_bed.grad = None
+        J_w.backward(retain_graph=True)
+        check("whitened loss gives z_bed a finite, non-zero gradient",
+              params.z_bed.grad is not None
+              and torch.isfinite(params.z_bed.grad).all().item()
+              and params.z_bed.grad.abs().sum() > 0,
+              f"grad norm = {params.z_bed.grad.norm().item():.3e}"
+              if params.z_bed.grad is not None else "no grad")
+        params.z_bed.grad = None
+
+        # The member is a Matérn model like any prior: W(Map(ε)) ≈ ε and the
+        # whitened image of a correlated draw has unit variance.
+        eps = torch.randn(problem.ny, problem.nx, dtype=torch.float32,
+                          device="cuda")
+        corr = GGaPPMap.apply(srf_w.noise_model, eps)
+        z_back = GGaPPWhiten.apply(srf_w.noise_model, corr)
+        rel = (z_back - eps).norm() / (eps.norm() + 1e-12)
+        check(f"noise member: ‖W(M(ε)) − ε‖ / ‖ε‖ < {rtol}", rel.item() < rtol,
+              f"relative error = {rel.item():.3e}")
+        m2 = (z_back ** 2).mean().item()
+        check("noise member: mean(z²) ≈ 1 for a correlated draw",
+              abs(m2 - 1.0) < 0.2, f"mean(z²) = {m2:.3f}")
+        # randomized() perturbs by a correlated field with the model's marginal std.
+        pert = srf_w.randomized(eps_S=eps).S_obs - srf_w.S_obs
+        check("randomized() perturbation has marginal std ≈ noise.sigma",
+              abs(pert.std().item() / noise.sigma - 1.0) < 0.25,
+              f"std = {pert.std().item():.2f} (sigma = {noise.sigma})")
+
+        # Nugget path: the spectral operator reproduces ggapp's stencil at
+        # nugget = 0 and is an exact self-inverse pair with a nugget.
+        from glacier_inverse.priors import SpectralMaternNoise
+        spec0 = SpectralMaternNoise(noise, problem.ny, problem.nx, problem.dx)
+        z_spec = GGaPPWhiten.apply(spec0, corr)
+        rel = (z_spec - z_back).norm() / (z_back.norm() + 1e-12)
+        check("SpectralMaternNoise(nugget=0) matches the ggapp whitening",
+              rel.item() < 1e-4, f"relative error = {rel.item():.3e}")
+        noise_n = MaternNoise(sigma=10.0, l=1000.0, nu=1, nugget=3.0)
+        spec_n = priors.noise_model("srf_nugget_test", noise_n)
+        check("noise_model with a nugget returns a SpectralMaternNoise",
+              isinstance(spec_n, SpectralMaternNoise))
+        z_n = GGaPPWhiten.apply(spec_n, GGaPPMap.apply(spec_n, eps))
+        rel = (z_n - eps).norm() / (eps.norm() + 1e-12)
+        check("nugget model: ‖W(M(ε)) − ε‖ / ‖ε‖ < 1e-4 (exact spectral pair)",
+              rel.item() < 1e-4, f"relative error = {rel.item():.3e}")
+        white = GGaPPWhiten.apply(spec_n, noise_n.nugget * eps)
+        check("nugget model: pure pixel noise at the nugget std whitens to < 1",
+              (white ** 2).mean().item() < 1.0,
+              f"mean(z²) = {(white ** 2).mean().item():.3f}")
+        srf_n = SurfaceSpec(noise=noise_n, weight=1.0)
+        try:
+            SurfaceSpec(noise=MaternNoise(10.0, 1000.0, nugget=1.0), weight=1.0) \
+                .build(problem.build_ctx)
+            check("re-registering srf with a different nugget raises", False)
+        except ValueError:
+            check("re-registering srf with a different nugget raises", True)
+        del srf_n
+
+        # Contracts.
+        try:
+            validate_noise_weights([SurfaceSpec(noise=noise, weight=2e-6)
+                                    .build(problem.build_ctx)])
+            check("weight != 1 on a whitened term raises", False)
+        except ValueError:
+            check("weight != 1 on a whitened term raises", True)
+        try:
+            validate_noise_weights([
+                SurfaceSpec(noise=noise, weight=Schedule(
+                    final=1.0, ramp=lambda i: 0.0 if i < 10 else 1.0))
+                .build(problem.build_ctx)])
+            check("Schedule(final=1) with a zero ramp passes the contract", True)
+        except ValueError as e:
+            check("Schedule(final=1) with a zero ramp passes the contract",
+                  False, str(e))
+    try:
+        MaternNoise(10.0, 1000.0, nu=2)
+        check("MaternNoise rejects even nu", False)
+    except ValueError:
+        check("MaternNoise rejects even nu", True)
+    try:
+        MaternNoise(10.0, 1000.0, nugget=-1.0)
+        check("MaternNoise rejects a negative nugget", False)
+    except ValueError:
+        check("MaternNoise rejects a negative nugget", True)
 
     header("8. Enthalpy SMB backend")
     try:
@@ -335,6 +463,8 @@ def main() -> int:
         # a second full problem on the same GPU.
         del sim, physical, loss_terms, probe, J
         del problem, params, srf, vel, bed, snow, dhdt, domain, priors
+        srf_w = again = res = J_w = corr = z_back = pert = None
+        spec0 = spec_n = z_spec = z_n = white = None
         torch.cuda.empty_cache()
 
         import dataclasses

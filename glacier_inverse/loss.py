@@ -231,7 +231,10 @@ def compute_prior(
     prior_means: PriorMeans,
     physical_bed_uncond: Optional[torch.Tensor] = None,
 ) -> tuple:
-    """Whitened-space Gaussian prior terms.
+    """Whitened-space Gaussian prior terms: exact negative log-densities
+    `loss_scale · ½‖z − mean‖²`, on the same footing as the data terms
+    (`_huber(r) ≈ r²/2`). (Before 2026-08 the ½ was missing, i.e. every prior
+    was twice as stiff as its stated hyperparameters.)
 
     physical_bed is the bed produced by the prior map; we recompute its
     whitened representation here (matching the original code) rather than
@@ -248,18 +251,18 @@ def compute_prior(
     # tuned learning rate) is identical in both parametrizations.
     base_bed = physical_bed if physical_bed_uncond is None else physical_bed_uncond
     z_bed_recomputed = GGaPPWhiten.apply(priors.bed_model, base_bed - physical_bed_mean)
-    J_prior_bed = scale * ((z_bed_recomputed - prior_means.value("z_bed", z_bed_recomputed)) ** 2).sum()
-    J_prior_bed_mean = scale * ((params.z_bed_mean - prior_means.value("z_bed_mean", params.z_bed_mean)) ** 2).sum()
-    J_prior_beta = scale * ((params.z_log_beta - prior_means.value("z_log_beta", params.z_log_beta)) ** 2).sum()
-    J_prior_pbias = scale * ((params.z_pbias - prior_means.value("z_pbias", params.z_pbias)) ** 2).sum()
+    J_prior_bed = scale * 0.5 * ((z_bed_recomputed - prior_means.value("z_bed", z_bed_recomputed)) ** 2).sum()
+    J_prior_bed_mean = scale * 0.5 * ((params.z_bed_mean - prior_means.value("z_bed_mean", params.z_bed_mean)) ** 2).sum()
+    J_prior_beta = scale * 0.5 * ((params.z_log_beta - prior_means.value("z_log_beta", params.z_log_beta)) ** 2).sum()
+    J_prior_pbias = scale * 0.5 * ((params.z_pbias - prior_means.value("z_pbias", params.z_pbias)) ** 2).sum()
     # Temperature bias: whitened-space term, so it needs no Matern model and
     # is computed unconditionally — exactly zero while the term is disabled
     # (z_tbias stays at 0 and out of the optimizer).
-    J_prior_tbias = scale * ((params.z_tbias - prior_means.value("z_tbias", params.z_tbias)) ** 2).sum()
+    J_prior_tbias = scale * 0.5 * ((params.z_tbias - prior_means.value("z_tbias", params.z_tbias)) ** 2).sum()
     # Standard-normal whitened priors on every scalar, including the precip-
     # depletion tau/z0 and the enthalpy-model H_atm/cloud pair (each inert when
     # its model/term is disabled: those z stay at 0).
-    J_prior_smb = scale * ((params.z_log_rf - prior_means.value("z_log_rf", params.z_log_rf)) ** 2
+    J_prior_smb = scale * 0.5 * ((params.z_log_rf - prior_means.value("z_log_rf", params.z_log_rf)) ** 2
                    + (params.z_log_mf - prior_means.value("z_log_mf", params.z_log_mf)) ** 2
                    + (params.z_tau - prior_means.value("z_tau", params.z_tau)) ** 2
                    + (params.z_z0 - prior_means.value("z_z0", params.z_z0)) ** 2

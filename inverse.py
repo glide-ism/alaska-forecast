@@ -162,8 +162,14 @@ for level in range(config.max_level, config.min_level - 1, -1):
         torch.cuda.empty_cache()
 
     # Final evaluation (no backward) so the multigrid state matches the
-    # converged parameters before we save it out.
-    problem.simulate(level=level, params=params)
+    # converged parameters before we save it out. Its residual fields (raw
+    # and whitened, per field likelihood) go to level_<n>/vti/residuals.pvd;
+    # only the finest level's are statistically meaningful (coarser levels
+    # compare prolonged fields).
+    sim, physical = problem.simulate(level=level, params=params)
+    with torch.no_grad():
+        problem.write_residuals(level_dir, sim, physical)
+    del sim, physical
 
     mg_lvl = problem.mg[level]
     ds = xr.merge([

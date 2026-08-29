@@ -9,11 +9,14 @@ full forward model. Reused inside GlacierProblem. Everything here (including
 the bed-conditioning data) is loadable from the config alone, so the
 standalone path stays intact.
 """
+import math
 import warnings
 from pathlib import Path
 
+import cupy as cp
 import numpy as np
 import xarray as xr
+from scipy.special import gamma as _gamma_fn
 
 from ggapp.model import MaternPrior
 from ggapp.torch import GGaPPMap
@@ -26,7 +29,7 @@ try:
 except ImportError:
     PriorCollection = None
 
-from .config import GlacierConfig, PriorHyperparams
+from .config import GlacierConfig, MaternNoise, PriorHyperparams
 
 
 def _build_matern_prior(p: PriorHyperparams, n_levels: int, ny: int, nx: int, dx: float) -> MaternPrior:
@@ -36,6 +39,48 @@ def _build_matern_prior(p: PriorHyperparams, n_levels: int, ny: int, nx: int, dx
     m.mg.parameters.nu.set(p.nu)
     m.forward_solver.fas_options.report_norms.set(False)
     return m
+
+
+class SpectralMaternNoise:
+    """Matérn + nugget error model as an exact spectral operator.
+
+    ggapp's Matérn operator L = −Δ_h + κ² uses the 5-point Laplacian with
+    mirror (Neumann) boundaries, which the orthonormal DCT-II diagonalizes
+    exactly (eigenvalues λ_ij = (2 − 2cos(πi/ny) + 2 − 2cos(πj/nx))/dx²), so the
+    Matérn covariance C_m = (τ/dx)² L^{−α} has eigen-variance
+    S(λ) = (τ/dx)²(κ² + λ)^{−α} in that basis and the nugget adds a constant:
+    C = C_m + nugget²·I. `whiten` applies C^{−1/2}, `forward` applies C^{+1/2}
+    — both self-adjoint, O(N log N) through cupyx.scipy.fft, exact (with
+    nugget = 0 they reproduce ggapp's stencil whitening to float32 rounding,
+    ~4e-7 relative). Duck-compatible with a ggapp prior member: cupy in /
+    cupy out, so `GGaPPWhiten` / `GGaPPMap` drive it unchanged.
+    """
+
+    def __init__(self, hp: MaternNoise, ny: int, nx: int, dx: float):
+        import cupyx.scipy.fft as cfft
+        self._fft = cfft
+        self.hp, self.ny, self.nx, self.dx = hp, ny, nx, dx
+        nu, alpha = hp.nu, hp.nu + 1
+        kappa = math.sqrt(8.0 * nu) / hp.l
+        tau = math.sqrt(hp.sigma ** 2 * (4.0 * math.pi) * kappa ** (2 * nu)
+                        * _gamma_fn(alpha) / _gamma_fn(nu))
+        li = (2.0 - 2.0 * np.cos(np.pi * np.arange(ny) / ny)) / dx ** 2
+        lj = (2.0 - 2.0 * np.cos(np.pi * np.arange(nx) / nx)) / dx ** 2
+        lam = li[:, None] + lj[None, :]
+        var = (tau / dx) ** 2 * (kappa ** 2 + lam) ** (-alpha) + hp.nugget ** 2
+        self._w = cp.asarray(var ** -0.5, dtype=cp.float32)   # C^{-1/2}
+        self._m = cp.asarray(var ** 0.5, dtype=cp.float32)    # C^{+1/2}
+
+    def _apply(self, x, f):
+        x = cp.asarray(x, dtype=cp.float32)
+        X = self._fft.dctn(x, type=2, norm="ortho")
+        return self._fft.idctn(X * f, type=2, norm="ortho").astype(cp.float32)
+
+    def whiten(self, x):
+        return self._apply(x, self._w)
+
+    def forward(self, z, zero_init=True):
+        return self._apply(z, self._m)
 
 
 def _cropped_inputs(config: GlacierConfig, variables: list = None) -> "xr.Dataset":
@@ -190,6 +235,11 @@ class GlacierPriors:
                 _build_matern_prior(config.tbias_prior, config.n_levels, ny, nx, dx)
                 if tbias_enabled else None)
 
+        # Correlated observation-error models (MaternNoise on a spec), keyed
+        # by product name; see noise_model(). They join the shared collection
+        # (scalars only) or get their own hierarchy under the fallback.
+        self.noise_models: dict = {}
+
         # Optional bed GP conditioning (posterior-as-prior). Built from the
         # config alone so the standalone (posterior.py) path keeps working.
         self.bed_conditioner = None
@@ -233,6 +283,32 @@ class GlacierPriors:
         self.sigma_tau = config.sigma_tau
         self.mu_z0 = config.mu_z0
         self.sigma_z0 = config.sigma_z0
+
+    def noise_model(self, name: str, hp: MaternNoise):
+        """The model whitening the residual field of observation `name`:
+        a member `noise_<name>` on the shared ggapp collection for a pure
+        Matérn (nugget == 0), or a `SpectralMaternNoise` when a nugget is
+        set. Idempotent: re-registering the same product with equal
+        hyperparameters returns the stored model; differing hyperparameters
+        raise, since one product cannot carry two error models."""
+        key = f"noise_{name}"
+        stored = self.noise_models.get(key)
+        if stored is not None:
+            hp0, member = stored
+            if hp0 != hp:
+                raise ValueError(
+                    f"noise model {key!r} already registered with {hp0}, "
+                    f"cannot re-register with {hp}")
+            return member
+        if hp.nugget > 0.0:
+            member = SpectralMaternNoise(hp, self.ny, self.nx, self.dx)
+        elif self.prior_collection is not None:
+            member = self.prior_collection.add(key, hp.sigma, hp.l, hp.nu)
+        else:
+            member = _build_matern_prior(hp, self.config.n_levels,
+                                         self.ny, self.nx, self.dx)
+        self.noise_models[key] = (hp, member)
+        return member
 
     def log_beta_from_whitened(self, z_log_beta):
         """THE whitened -> log_beta map (mu_log_beta + Map(z)), shared by

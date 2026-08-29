@@ -21,6 +21,7 @@ A spec-level `time` override wins; files without attrs fall back to the
 nominal calibration end `config.t_end` with a warning (legacy inputs keep
 working unchanged).
 """
+import dataclasses
 import warnings
 from dataclasses import dataclass
 from typing import Optional
@@ -28,8 +29,69 @@ from typing import Optional
 import torch
 from torch.nn.functional import grid_sample
 
-from .config import LossWeight, resolve_weight
+from ggapp.torch import GGaPPMap, GGaPPWhiten
+
+from .config import LossWeight, MaternNoise, resolve_weight
 from .loss import _huber, marginal_velocity_log_likelihood
+
+
+# --------------------------------------------------------------------------- #
+# Correlated (Matérn GP) observation errors                                   #
+# --------------------------------------------------------------------------- #
+#
+# A field likelihood with `noise=MaternNoise(sigma, l, nu)` on its spec treats
+# the residual r = model − data as a draw from a zero-mean Matérn GP and forms
+# its misfit on the whitened residual z = W r (ggapp's GGaPPWhiten: one
+# application of the (dx/τ)·L^{α/2} stencil — no solve, self-adjoint, cheap).
+# The contract is
+#     loss = loss_scale · weight · Σ huber(z),   weight ≡ 1,   no dx²
+# — the ad-hoc "observation density" weight·dx² of the diagonal terms is gone;
+# the error model's σ and l carry all of that information. Whitening is not
+# down-weighting: it keeps full weight on fine-scale residual structure (what
+# constrains bed/β) and discounts only the smooth directions that a correlated
+# error can explain. `validate_noise_weights` enforces the weight contract at
+# problem build (continuation ramps may zero a term, but `final` must be 1).
+#
+# Masks (dhdt_mask, v_mask under mask_unobserved, outlier keep-masks) are
+# applied to r BEFORE whitening, so r drops to zero at the mask edge and z
+# carries a margin band there (amplitude ~ r_edge·l/(10 dx)); the Huber
+# threshold bounds its influence. Inspect the `*_z` fields in residuals.pvd.
+#
+# Products with pixel-scale noise need `MaternNoise(nugget=)` (see config.py):
+# the whitening then goes through priors.SpectralMaternNoise (exact DCT-II
+# form of the same operator plus a white term) — the code here is agnostic,
+# `noise_model` just has to provide cupy `whiten`/`forward`.
+
+
+def _whiten(member, r: torch.Tensor) -> torch.Tensor:
+    """z = W r for a (ny, nx) residual field (GGaPPWhiten needs a contiguous
+    float32 tensor — it copies through cupy)."""
+    return GGaPPWhiten.apply(member, r.contiguous().to(torch.float32))
+
+
+def _require_priors(ctx: "ObservationBuildContext", what: str):
+    if getattr(ctx, "priors", None) is None:
+        raise ValueError(
+            f"{what}: a MaternNoise error model needs the GlacierPriors "
+            f"collection, but ObservationBuildContext.priors is None (build "
+            f"the observation through GlacierProblem, or pass priors=).")
+    return ctx.priors
+
+
+def validate_noise_weights(observations) -> None:
+    """Enforce the weight == 1 contract for every noise-modelled term. The
+    steady-state (`final`) weight is checked; a Schedule ramp may still hold a
+    term at 0 during continuation."""
+    for obs in observations:
+        if getattr(obs, "noise", None) is None:
+            continue
+        w = obs.weight_at(0, 0, schedule=False)
+        if w != 1.0:
+            raise ValueError(
+                f"observation {obs.name!r} carries a MaternNoise error model "
+                f"but its (final) weight is {w!r}; whitened terms have "
+                f"weight == 1 by contract — express trust in the product "
+                f"through MaternNoise(sigma, l, nu) instead.")
 
 
 @dataclass
@@ -54,6 +116,7 @@ class ObservationBuildContext:
     ny: int
     nx: int
     config: object                       # GlacierConfig
+    priors: object = None                # GlacierPriors (noise-model registry)
 
 
 def read_time_attrs(da, *, fallback: float, what: str):
@@ -113,6 +176,14 @@ class Observation:
              mask: torch.Tensor, dx: float, weight: float) -> torch.Tensor:
         raise NotImplementedError
 
+    def residuals(self, *, sim, physical, config, domain: DomainData,
+                  mask: torch.Tensor, dx: float) -> dict:
+        """Diagnostic residual fields (name -> 2-D tensor) for the field
+        likelihoods: `r` = σ-normalized raw residual, `z` = whitened residual
+        (`z is r` when the term has no MaternNoise model). Empty for
+        categorical / prior-style terms."""
+        return {}
+
     def randomized(self, **eps) -> "Observation":
         return self
 
@@ -122,23 +193,43 @@ class Observation:
 
 
 class SurfaceObservation(Observation):
-    """Surface-elevation misfit (Huber) against the DEM at its epoch."""
+    """Surface-elevation misfit (Huber) against the DEM at its epoch.
+
+    With a `noise` model the residual S_model − S_obs is whitened by the
+    Matérn member (marginal std `sigma` = noise.sigma) over the full grid —
+    off-ice the residual is bed − DEM, exactly as in the diagonal form.
+    """
 
     name = "srf"
 
     def __init__(self, *, S_obs, time: float, sigma: float, nu: float,
-                 weight: LossWeight):
+                 weight: LossWeight, noise: Optional[MaternNoise] = None,
+                 noise_model=None):
         super().__init__(weight=weight)
         self.S_obs = S_obs
         self.time = time
-        self.sigma = sigma
+        self.sigma = sigma          # marginal std under both error models
         self.nu = nu
+        self.noise = noise
+        self.noise_model = noise_model
 
     @property
     def required_times(self):
         return (self.time,)
 
+    def _raw(self, sim):
+        return sim.at(self.time).S_fine - self.S_obs
+
+    def residuals(self, *, sim, physical, config, domain, mask, dx):
+        raw = self._raw(sim)
+        r = raw / self.sigma
+        z = _whiten(self.noise_model, raw) if self.noise is not None else r
+        return {"r": r, "z": z}
+
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
+        if self.noise is not None:
+            z = _whiten(self.noise_model, self._raw(sim))
+            return config.loss_scale * weight * _huber(z, self.nu).sum()
         scale = config.loss_scale * dx ** 2
         state = sim.at(self.time)
         r_s = (state.S_fine - self.S_obs) / self.sigma
@@ -146,9 +237,14 @@ class SurfaceObservation(Observation):
 
     def randomized(self, *, eps_S=None):
         eps_S = torch.randn_like(self.S_obs) if eps_S is None else eps_S
+        if self.noise is not None:
+            perturbation = GGaPPMap.apply(self.noise_model, eps_S.contiguous())
+        else:
+            perturbation = eps_S * self.sigma
         return SurfaceObservation(
-            S_obs=self.S_obs + eps_S * self.sigma, time=self.time,
-            sigma=self.sigma, nu=self.nu, weight=self.weight)
+            S_obs=self.S_obs + perturbation, time=self.time,
+            sigma=self.sigma, nu=self.nu, weight=self.weight,
+            noise=self.noise, noise_model=self.noise_model)
 
     def diagnostics(self):
         return {"srf_obs": self.S_obs}
@@ -173,6 +269,16 @@ class VelocityObservation(Observation):
     cell and the low-texture accumulation zones) means. False (historical):
     it is an observation of ~zero velocity, so modelled ice flowing there is
     penalized. True: it is undefined and contributes nothing to the misfit.
+
+    With a `noise` model each component's residual is whitened by the Matérn
+    member (marginal std `sigma` = noise.sigma per component). The surge
+    marginal survives whitening by linearity: inside a glacier
+    z(η) = η·W(m·U_mod) − W(m·U_obs), so the marginal is evaluated on the
+    whitened stacks with unit sigma (exact away from glacier boundaries,
+    where the stencil mixes neighbouring labels). The valid mask m (v_mask
+    under `mask_unobserved`, times the `outlier_threshold` keep-mask) is
+    applied before whitening in both branches — note the diagonal surge
+    branch ignores `outlier_threshold`, the whitened one does not.
     """
 
     name = "vel"
@@ -180,7 +286,8 @@ class VelocityObservation(Observation):
     def __init__(self, *, u_obs, v_obs, v_mask, time: float, sigma: float,
                  nu: float, surge_biased: bool, weight: LossWeight,
                  outlier_threshold: float, alpha_surge: float = 2.0,
-                 alpha_nonsurge: float = 6.0, mask_unobserved: bool = False):
+                 alpha_nonsurge: float = 6.0, mask_unobserved: bool = False,
+                 noise: Optional[MaternNoise] = None, noise_model=None):
         super().__init__(weight=weight)
         self.alpha_surge = alpha_surge
         self.alpha_nonsurge = alpha_nonsurge
@@ -189,16 +296,90 @@ class VelocityObservation(Observation):
         self.v_obs = v_obs
         self.v_mask = v_mask
         self.time = time
-        self.sigma = sigma
+        self.sigma = sigma          # marginal std per component, both models
         self.nu = nu
         self.surge_biased = surge_biased
         self.outlier_threshold = outlier_threshold
+        self.noise = noise
+        self.noise_model = noise_model
 
     @property
     def required_times(self):
         return (self.time,)
 
+    @staticmethod
+    def _predicted(state):
+        """Cell-centred modelled surface velocity (u + ud/(n+1) under MOLHO;
+        the depth-averaged u under SSA), from the staggered fine fields."""
+        u_fine = state.u_surf_fine
+        v_fine = state.v_surf_fine
+        u_pred = (u_fine[:, 1:] + u_fine[:, :-1]) / 2.0
+        v_pred = (v_fine[1:, :] + v_fine[:-1, :]) / 2.0
+        return u_pred, v_pred
+
+    def _valid_mask(self) -> torch.Tensor:
+        """0/1 float mask of pixels that enter the whitened misfit."""
+        m = self.v_mask if self.mask_unobserved else torch.ones_like(self.v_mask)
+        if self.outlier_threshold is not None:
+            U_obs2 = self.u_obs ** 2 + self.v_obs ** 2
+            m = m * (U_obs2 <= self.outlier_threshold ** 2).to(m.dtype)
+        return m
+
+    def residuals(self, *, sim, physical, config, domain, mask, dx):
+        u_pred, v_pred = self._predicted(sim.at(self.time))
+        m = self._valid_mask()
+        raw_u = (u_pred - self.u_obs) * m
+        raw_v = (v_pred - self.v_obs) * m
+        out = {"r_u": raw_u / self.sigma, "r_v": raw_v / self.sigma}
+        if self.noise is not None:
+            out["z_u"] = _whiten(self.noise_model, raw_u)
+            out["z_v"] = _whiten(self.noise_model, raw_v)
+        else:
+            out["z_u"], out["z_v"] = out["r_u"], out["r_v"]
+        return out
+
+    def _loss_whitened(self, *, sim, config, domain, weight):
+        from numpy.polynomial.legendre import leggauss
+
+        scale = config.loss_scale
+        u_pred, v_pred = self._predicted(sim.at(self.time))
+        m = self._valid_mask()
+        W = self.noise_model
+        if self.surge_biased:
+            Z_obs = torch.stack((_whiten(W, m * self.u_obs).ravel(),
+                                 _whiten(W, m * self.v_obs).ravel()), dim=1)
+            Z_mod = torch.stack((_whiten(W, m * u_pred).ravel(),
+                                 _whiten(W, m * v_pred).ravel()), dim=1)
+            labels = domain.rgi_label.ravel()
+            sigma = torch.ones(Z_obs.shape[0], device='cuda',
+                               dtype=torch.float32)
+            nodes, weights = leggauss(10)
+            eta_nodes = torch.tensor((nodes + 1) / 2, device='cuda',
+                                     dtype=torch.float32)
+            w_gl = torch.tensor(weights / 2, device='cuda', dtype=torch.float32)
+
+            alpha = torch.where(domain.surge_type == 3,
+                                self.alpha_surge, self.alpha_nonsurge).cuda()
+
+            log_w_eff = (torch.log(w_gl)[:, None]
+                         + torch.log(alpha)[None, :]
+                         + (alpha[None, :] - 1) * torch.log(eta_nodes[:, None]))
+
+            return marginal_velocity_log_likelihood(
+                Z_obs, Z_mod, sigma, labels, eta_nodes, log_w_eff,
+                self.nu, weight, scale,
+            )
+        z_u = _whiten(W, (u_pred - self.u_obs) * m)
+        z_v = _whiten(W, (v_pred - self.v_obs) * m)
+        z2 = z_u ** 2 + z_v ** 2
+        return scale * weight * self.nu ** 2 * (
+            torch.sqrt(1 + z2 / self.nu ** 2) - 1).sum()
+
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
+        if self.noise is not None:
+            return self._loss_whitened(sim=sim, config=config, domain=domain,
+                                       weight=weight)
+
         from numpy.polynomial.legendre import leggauss
 
         scale = config.loss_scale * dx ** 2
@@ -249,14 +430,20 @@ class VelocityObservation(Observation):
     def randomized(self, *, eps_u=None, eps_v=None):
         eps_u = torch.randn_like(self.u_obs) if eps_u is None else eps_u
         eps_v = torch.randn_like(self.v_obs) if eps_v is None else eps_v
+        if self.noise is not None:
+            du = GGaPPMap.apply(self.noise_model, eps_u.contiguous())
+            dv = GGaPPMap.apply(self.noise_model, eps_v.contiguous())
+        else:
+            du, dv = eps_u * self.sigma, eps_v * self.sigma
         return VelocityObservation(
-            u_obs=self.u_obs + eps_u * self.sigma,
-            v_obs=self.v_obs + eps_v * self.sigma,
+            u_obs=self.u_obs + du,
+            v_obs=self.v_obs + dv,
             v_mask=self.v_mask, time=self.time, sigma=self.sigma, nu=self.nu,
             surge_biased=self.surge_biased, weight=self.weight,
             outlier_threshold=self.outlier_threshold,
             alpha_surge=self.alpha_surge, alpha_nonsurge=self.alpha_nonsurge,
-            mask_unobserved=self.mask_unobserved)
+            mask_unobserved=self.mask_unobserved,
+            noise=self.noise, noise_model=self.noise_model)
 
 
 class ExtentObservation(Observation):
@@ -424,7 +611,10 @@ class DhdtObservation(Observation):
         dHdt_model = (H(t1) - H(t0)) / (t1 - t0),
 
     compared against the observed rate (Hugonnet), with residuals normalized
-    by the per-pixel uncertainty floored at `sigma_floor`.
+    by the per-pixel uncertainty floored at `sigma_floor`. With a `noise`
+    model the normalized residual is whitened by a unit-sigma Matérn member,
+    and noise.sigma is a multiplier on the per-pixel std (σ=1 takes the
+    product's reported error as the marginal).
 
     `legacy_final_step` reproduces the historical behavior for input files
     without time attrs: the rate over the final emitted step,
@@ -436,7 +626,8 @@ class DhdtObservation(Observation):
 
     def __init__(self, *, dhdt, dhdt_err, dhdt_mask, t0: float, t1: float,
                  sigma_floor: float, nu: float, weight: LossWeight,
-                 legacy_final_step: bool = False):
+                 legacy_final_step: bool = False,
+                 noise: Optional[MaternNoise] = None, noise_model=None):
         super().__init__(weight=weight)
         self.dhdt = dhdt
         self.dhdt_err = dhdt_err
@@ -446,6 +637,8 @@ class DhdtObservation(Observation):
         self.sigma_floor = sigma_floor
         self.nu = nu
         self.legacy_final_step = legacy_final_step
+        self.noise = noise
+        self.noise_model = noise_model
 
     @property
     def required_times(self):
@@ -467,7 +660,27 @@ class DhdtObservation(Observation):
             return (s1.H_fine - s0.H_fine) / (self.t1 - self.t0)
         return (s1.H - s0.H) / (self.t1 - self.t0)
 
+    def _sigma_pixel(self) -> torch.Tensor:
+        """Per-pixel error std: the product's own error clamped at
+        `sigma_floor`, times the noise model's multiplier when present (the
+        Matérn member itself is registered with unit sigma)."""
+        sigma = torch.clamp(self.dhdt_err, min=self.sigma_floor)
+        if self.noise is not None:
+            sigma = sigma * self.noise.sigma
+        return sigma
+
+    def residuals(self, *, sim, physical, config, domain, mask, dx):
+        dhdt_model = self.model_rate(sim, "fine")
+        r = (dhdt_model - self.dhdt) / self._sigma_pixel() * self.dhdt_mask
+        z = _whiten(self.noise_model, r) if self.noise is not None else r
+        return {"r": r, "z": z}
+
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
+        if self.noise is not None:
+            dhdt_model = self.model_rate(sim, "fine")
+            r = (dhdt_model - self.dhdt) / self._sigma_pixel() * self.dhdt_mask
+            z = _whiten(self.noise_model, r)
+            return config.loss_scale * weight * _huber(z, self.nu).sum()
         scale = config.loss_scale * dx ** 2
         dhdt_model = self.model_rate(sim, "fine")
         sigma = torch.clamp(self.dhdt_err, min=self.sigma_floor)
@@ -476,12 +689,16 @@ class DhdtObservation(Observation):
 
     def randomized(self, *, eps_dhdt=None):
         eps_dhdt = torch.randn_like(self.dhdt) if eps_dhdt is None else eps_dhdt
-        sigma = torch.clamp(self.dhdt_err, min=self.sigma_floor)
+        sigma = self._sigma_pixel()
+        if self.noise is not None:
+            # Unit-sigma correlated field, scaled by the per-pixel std.
+            eps_dhdt = GGaPPMap.apply(self.noise_model, eps_dhdt.contiguous())
         return DhdtObservation(
             dhdt=self.dhdt + eps_dhdt * sigma * self.dhdt_mask,
             dhdt_err=self.dhdt_err, dhdt_mask=self.dhdt_mask,
             t0=self.t0, t1=self.t1, sigma_floor=self.sigma_floor, nu=self.nu,
-            weight=self.weight, legacy_final_step=self.legacy_final_step)
+            weight=self.weight, legacy_final_step=self.legacy_final_step,
+            noise=self.noise, noise_model=self.noise_model)
 
     def diagnostics(self):
         return {"dhdt": self.dhdt, "dhdt_err": self.dhdt_err,
@@ -654,24 +871,33 @@ def _resolve_time(override: Optional[float], da, *, fallback: float,
 @dataclass(frozen=True)
 class SurfaceSpec:
     weight: LossWeight = 2e-5
-    sigma: float = 10.0
-    nu: float = 1.0
+    sigma: float = 10.0             # ignored when `noise` is set (noise.sigma)
+    nu: float = 1.0                 # pseudo-Huber threshold (NOT noise.nu)
     time: Optional[float] = None    # override; None -> file attr -> t_end
+    # Correlated error model: whitened misfit, weight must be 1 (see the
+    # module-level note on MaternNoise).
+    noise: Optional[MaternNoise] = None
 
     def build(self, ctx: ObservationBuildContext) -> SurfaceObservation:
         cfg = ctx.config
         time = _resolve_time(self.time, ctx.gridded_data.elevation,
                              fallback=cfg.t_end, what="surface DEM (elevation)")
+        sigma, noise_model = self.sigma, None
+        if self.noise is not None:
+            noise_model = _require_priors(ctx, "SurfaceSpec") \
+                .noise_model("srf", self.noise)
+            sigma = self.noise.sigma
         return SurfaceObservation(
             S_obs=torch.clamp(ctx.domain.dem, min=0.0), time=time,
-            sigma=self.sigma, nu=self.nu, weight=self.weight)
+            sigma=sigma, nu=self.nu, weight=self.weight,
+            noise=self.noise, noise_model=noise_model)
 
 
 @dataclass(frozen=True)
 class VelocitySpec:
     weight: LossWeight = 2e-5
-    sigma: float = 10.0
-    nu: float = 1.0
+    sigma: float = 10.0             # ignored when `noise` is set (noise.sigma)
+    nu: float = 1.0                 # pseudo-Huber threshold (NOT noise.nu)
     surge_biased: bool = False
     time: Optional[float] = None
     outlier_threshold: Optional[float] = None
@@ -682,10 +908,17 @@ class VelocitySpec:
     # False (historical): v_mask == 0 pixels are observations of ~0 velocity.
     # True: they are undefined and dropped from the misfit.
     mask_unobserved: bool = False
+    # Correlated error model per component: whitened misfit, weight must be 1.
+    noise: Optional[MaternNoise] = None
 
     def build(self, ctx: ObservationBuildContext) -> VelocityObservation:
         cfg = ctx.config
         gd = ctx.gridded_data
+        sigma, noise_model = self.sigma, None
+        if self.noise is not None:
+            noise_model = _require_priors(ctx, "VelocitySpec") \
+                .noise_model("vel", self.noise)
+            sigma = self.noise.sigma
         domain_mask = ctx.domain.domain_mask
         time = _resolve_time(self.time, gd.vx, fallback=cfg.t_end,
                              what="velocity mosaic (vx)")
@@ -697,10 +930,11 @@ class VelocitySpec:
             .nan_to_num().masked_fill(~domain_mask, 0.0)
         return VelocityObservation(
             u_obs=u_obs, v_obs=v_obs, v_mask=v_mask, time=time,
-            sigma=self.sigma, nu=self.nu, surge_biased=self.surge_biased,
+            sigma=sigma, nu=self.nu, surge_biased=self.surge_biased,
             weight=self.weight, outlier_threshold=self.outlier_threshold,
             alpha_surge=self.alpha_surge, alpha_nonsurge=self.alpha_nonsurge,
-            mask_unobserved=self.mask_unobserved)
+            mask_unobserved=self.mask_unobserved,
+            noise=self.noise, noise_model=noise_model)
 
 
 @dataclass(frozen=True)
@@ -785,14 +1019,21 @@ class SnowlineSpec:
 class DhdtSpec:
     weight: LossWeight = 2e-5
     sigma_floor: float = 0.5
-    nu: float = 1.0
+    nu: float = 1.0                 # pseudo-Huber threshold (NOT noise.nu)
     t0: Optional[float] = None    # override; None -> file attrs -> legacy mode
     t1: Optional[float] = None
+    # Correlated error model: noise.sigma multiplies the per-pixel product
+    # error (the Matérn member has unit sigma); whitened misfit, weight must be 1.
+    noise: Optional[MaternNoise] = None
 
     def build(self, ctx: ObservationBuildContext) -> Optional[DhdtObservation]:
         dd = ctx.dhdt_data
         if dd is None:
             return None
+        noise_model = None
+        if self.noise is not None:
+            noise_model = _require_priors(ctx, "DhdtSpec").noise_model(
+                "dhdt", dataclasses.replace(self.noise, sigma=1.0))
 
         expected = (ctx.ny, ctx.nx)
         if dd.dhdt.shape != expected:
@@ -835,7 +1076,8 @@ class DhdtSpec:
         return DhdtObservation(
             dhdt=dhdt, dhdt_err=dhdt_err, dhdt_mask=dhdt_mask, t0=t0, t1=t1,
             sigma_floor=self.sigma_floor, nu=self.nu, weight=self.weight,
-            legacy_final_step=legacy)
+            legacy_final_step=legacy,
+            noise=self.noise, noise_model=noise_model)
 
 
 @dataclass(frozen=True)

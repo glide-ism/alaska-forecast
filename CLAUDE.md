@@ -98,6 +98,52 @@ uniform spinup grid onto observation times, variable dt), and each misfit compar
 `(H(t1) − H(t0)) / (t1 − t0)` over the product window. The run horizon auto-extends to
 `max(t_end, latest observation time)`; observation times ≤ `t_start` raise.
 
+**Correlated observation errors (`MaternNoise`).** The three field likelihoods
+(`SurfaceSpec`, `VelocitySpec`, `DhdtSpec`) accept `noise=MaternNoise(sigma, l, nu)`
+(`config.py`): the residual field r = model − data is modelled as a zero-mean Matérn GP
+and the misfit is formed on the **whitened** residual `z = W r` (ggapp's `GGaPPWhiten` —
+one `(dx/τ)·L^{α/2}` stencil application, no solve, self-adjoint, milliseconds), with
+`loss = loss_scale·weight·Σ huber(z)` — **no `dx²`, and `weight == 1` by contract**
+(`GlacierProblem` raises via `validate_noise_weights`; a `Schedule` ramp may hold a term at
+0 during continuation but its `final` must be 1). Any up/down-weighting is a change to
+σ/l/ν, i.e. to the probabilistic model, not an ad-hoc factor — the old `weight·dx²` ≈ 0.016
+per pixel was an implicit "one datum per 0.5 km²". Whitening is not down-weighting: it keeps
+full weight on fine-scale residual structure (what constrains bed/β) and discounts only the
+smooth directions a correlated error can explain (where the scalars live). Semantics:
+`sigma` is the marginal std in product units (surface m; velocity m/yr per component);
+for dh/dt it is a dimensionless multiplier on the product's per-pixel error (the member is
+registered with unit σ, `DhdtObservation._sigma_pixel`). `l` is ggapp's correlation length
+(κ = √(8ν)/l, ρ(l) ≈ 0.1; an exponential variogram range a ↔ l ≈ 2.3a). `MaternNoise.nu`
+is the Matérn smoothness (positive **odd** int — ggapp truncates α//2 silently otherwise)
+and is distinct from the spec's `nu`, the pseudo-Huber threshold (now on z). **`nugget`**
+(std of an additional white per-pixel error, same units as σ) is not optional in practice:
+every product has pixel-scale noise (the variogram's c0), and a pure Matérn with a long l
+declares it impossible — its whitening filter amplifies white noise by ~(dx/τ)‖L‖ (45× for
+l = 9 km at 90 m; the old delta MAP's dh/dt residual whitened to std 3.7 without a nugget,
+0.9–1.4 with one), so the term would fit noise. With `nugget > 0` the model is
+`priors.SpectralMaternNoise`: ggapp's 5-point mirror-Neumann operator is diagonalized
+exactly by the orthonormal DCT-II, so `C = C_m + nugget²I` and its ±½ powers are spectral
+filters (`cupyx.scipy.fft.dctn`, O(N log N), exact — reproduces the stencil to ~1e-6 at
+nugget = 0); it exposes the same cupy `whiten`/`forward` as a ggapp member, so
+`GGaPPWhiten`/`GGaPPMap` and everything downstream are agnostic. Pure Matérn models are
+members `noise_<name>` on the shared `PriorCollection`; either way
+`GlacierPriors.noise_model(name, hp)` is the registry (idempotent per product;
+`ObservationBuildContext.priors` carries it — ad-hoc spec builds use `problem.build_ctx`). Under the surge marginal the whitened stacks
+`W(m·U_obs)`, `W(m·U_mod)` enter `marginal_velocity_log_likelihood` with unit sigma, exact
+inside a glacier by linearity (`z(η) = η·W(m·U_mod) − W(m·U_obs)`). Masks (`dhdt_mask`,
+`v_mask` under `mask_unobserved`, the outlier keep-mask — which the whitened surge branch
+honours while the diagonal one does not) are applied to r *before* whitening, so z carries a
+margin band at mask edges (amplitude ~ r_edge·l/(10dx)); inspect `*_z` in `residuals.pvd`
+(follow-up: mask taper). Diagonal terms (`noise=None`) are bit-identical to before. The
+RTO hooks map the white `eps_S/eps_u/eps_v/eps_dhdt` through `GGaPPMap` when a model is set.
+The Brier/prior-style terms (extent, snowline, bed picks, divide, bedslope) keep `weight·dx²`
+— they are not Gaussian field likelihoods. Because the whitened data terms are ~60× the
+old diagonal scale with their gradient power at fine scales, the SGD field learning rates
+(`lr_z_bed`, `lr_z_log_beta`) need retuning (delta/denali start ÷30). Enabled for delta
+and denali; fitted from `tools/residual_variograms.py` on the MAP residuals (2026-08-28):
+surface σ 16 m, l = bed-prior l, nugget 4 m; velocity σ 15/20 m yr⁻¹ per component,
+l 3 km, nugget 3; dh/dt σ 1 (× reported error), l 9/8 km, nugget 0.15.
+
 **Schedulable loss weights (continuation, inverse-only).** Per-observation weights
 (`weight=` on each spec) and the global `loss_scale` may be a constant *or* a
 `Schedule(final=, ramp=)`. This is a continuation device for the **initial MAP solve only**
@@ -159,17 +205,25 @@ The library the drivers sit on top of:
   DEM, masks, glacier labels shared by all terms), `WhitenedParameters` (the tensors
   optimized over), `PhysicalParameters`. `problem.required_times` is the union of all
   observation epochs; `problem.get_observation(name)` fetches one product by its `name`
-  ("srf", "vel", "extent", "bed", "snow", "dhdt", "divide").
+  ("srf", "vel", "extent", "bed", "snow", "dhdt", "divide"). `problem.build_ctx` is the
+  `ObservationBuildContext` (with `priors=`) for ad-hoc spec builds;
+  `problem.write_residuals(dir, sim, physical)` dumps every field likelihood's
+  `residuals()` (`srf_r, srf_z, vel_z_u, …, dhdt_z`) to a fine-grid `residuals.pvd` —
+  `inverse.py` calls it after each level's final simulate (only level 0's are
+  statistically meaningful; coarser levels compare prolonged fields).
 - `observations.py` — the `Observation` base class + seven subclasses (data, times,
-  hyperparameters, misfit, RTO noise hook) and their frozen spec dataclasses;
-  `read_time_attrs` handles the file-attr → `t_end` fallback.
+  hyperparameters, misfit, RTO noise hook, `residuals()` → `{"r": σ-normalized, "z":
+  whitened}` for the field likelihoods) and their frozen spec dataclasses;
+  `read_time_attrs` handles the file-attr → `t_end` fallback; `validate_noise_weights`
+  enforces the `MaternNoise` weight contract.
 - `scheduling.py` — `build_step_sequence` (uniform spinup grid ∪ observation times,
   variable dt, horizon extension) and `merge_times`. Pure Python floats so snapshot dict
   keys match requested times exactly.
 - `priors.py` — `GlacierPriors` (4 Matérn field priors + scalar SMB priors: log-normal
   mf/rf for the temperature-index model, log-normal H_atm and logit-normal clear-sky
-  fraction f for the enthalpy model). Cheap to build without `IceDynamics`; `posterior.py` uses it
-  directly to map samples back to physical space.
+  fraction f for the enthalpy model, plus the `noise_model(name, MaternNoise)` registry of
+  observation-error members on the same collection). Cheap to build without `IceDynamics`;
+  `posterior.py` uses it directly to map samples back to physical space.
 - `forward.py` — `simulate()` time-stepping loop (SMB → ice dynamics per step) over the
   snapped step sequence; emits a lazy-prolonging `ModelState` per requested time into
   `SimResult.states` (final state always recorded; `sim.at(t)` to fetch, compat properties
@@ -195,7 +249,10 @@ The library the drivers sit on top of:
   expresses trust in the product while the α's set how much a glacier's mosaic may
   under-read the model — tempering inside the marginal would flatten it into a
   symmetric pull toward `E[η]/E[η²]·U_obs`). Identical for MAP
-  (zero prior means) and RTO (nonzero whitened-space means via `PriorMeans`).
+  (zero prior means) and RTO (nonzero whitened-space means via `PriorMeans`). The prior
+  terms are exact negative log-densities `loss_scale·½‖z − mean‖²` (the ½ was missing
+  before 2026-08 — every prior was twice as stiff as its stated hyperparameters; MAPs from
+  before then were fit under the stiffer prior).
 - `io.py` — VTI/PVD diagnostic writers and whitened-parameter `save`/`load`.
 - `config.py`, `__init__.py` (`load_config(domain_dir)` imports a domain's `config.py` by path).
 
@@ -311,7 +368,9 @@ editing `results_subdir` in the domain config, not the drivers.
    MC or Sobol/QMC noise (budget-limited; consumed scalars-first). Per-sample cosine LR decay.
    **Pending migration to the time-stamped-observation API**: it still calls the removed
    `Observations.randomized` and reads removed `config.sigma_*` fields. Migrate by randomizing
-   per observation (`obs.randomized(eps_...=...)`, sigmas live on the objects; append any new
+   per observation (`obs.randomized(eps_...=...)`, sigmas live on the objects; the hooks
+   already map the white draws through `GGaPPMap` when a `MaternNoise` model is set, so the
+   driver only supplies `randn_like`-shaped fields; append any new
    QMC draws — e.g. the now-available dhdt perturbation — AFTER the existing draw order).
    The same migration should thread the enthalpy scalars through its five mf/rf touchpoints
    (`InitScheme`, noise draws, `PriorMeans`, init loop, Adam block — gated on
@@ -319,12 +378,21 @@ editing `results_subdir` in the domain config, not the drivers.
 3. **sensitivity.py** — loads RTO samples, projects forward (default +100 yr), uses
    ∂ΔV/∂(physical param) for a Stein-style information-gain metric. Optimizes in *physical*
    space (via `simulate_physical`), not whitened. Works with the new API via `volumes`
-   checkpoints, except one `config.sigma_s` read in the Stein denominators
-   (→ `problem.get_observation("srf").sigma`); pass `record_states_at=[]` for projection
+   checkpoints (its Stein denominators read `problem.get_observation("srf").sigma`, the
+   marginal std under either error model); pass `record_states_at=[]` for projection
    runs to skip observation snapshots. Its flattened parameter vector hardcodes the
    five-parameter (bed, pbias, log_beta, log_mf, log_rf) layout — extending it to the
    enthalpy scalars shifts that index arithmetic.
 4. **posterior.py** — empirical posterior covariance (SVD factorization) from RTO samples.
+
+**Tools.** `tools/residual_variograms.py domains/<name> [--results-subdir] [--level]
+[--use-saved-fields] [--no-plots] [--out]` re-runs a saved MAP and computes isotropic and
+flow-aligned/cross-flow semivariograms, per-glacier ANOVA, exponential fits (range a,
+Matérn l ≈ 2.3a, N_eff = A/(2πa²)) and per-glacier velocity under-read factors η for every
+field likelihood's `r` *and* `z`. Use the `r` statistics to fit a `MaternNoise` model and
+the `z` statistics as its post-hoc check: a well-specified model gives `std(z) → 1` and
+`γ_z(dx)/var(z) → 1` (no structure left). Outputs `residual_variograms.npz`,
+`residual_maps.png`, `variograms.png` under `level_<n>/` by default.
 
 ### Preprocessing pipeline
 
