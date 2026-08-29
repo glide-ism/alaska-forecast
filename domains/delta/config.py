@@ -89,14 +89,16 @@ CONFIG = GlacierConfig(
     bed_prior = PriorHyperparams(sigma=500,    l=1000.0, nu=1),
     # SGD field learning rates: the whitened data terms are ~1/(2e-6*dx^2) ~ 60x
     # the old diagonal scale and put their gradient power at fine scales, so
-    # the bed/beta steps start ~30x smaller. Retune on the level-2 loss trace.
-    lr_z_bed=0.0017,
+    # the bed/beta steps are ~3x smaller than under the diagonal likelihood
+    # (a 20-iteration level-2 delta trace was monotone at this value and ~6x
+    # faster than at /30). Retune on the full level-2 loss trace.
+    lr_z_bed=0.017,
     alpha_t2m=2.5,
     dt=20.0,
     tbias_enabled=True,
     mu_log_beta = np.log(5.0),
     log_beta_prior = PriorHyperparams(sigma=1./3.,    l=1000.0, nu=1),
-    lr_z_log_beta=0.05*9*9/30,
+    lr_z_log_beta=0.05*9*9/3,
     max_level=2,
     max_iters=(50,50,500),
     lr_z_pbias=Schedule(final=0.001, ramp=lambda i,level:0.0 if (i<50 and level==2) else 0.001),
