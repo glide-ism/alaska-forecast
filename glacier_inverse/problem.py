@@ -327,8 +327,13 @@ class GlacierProblem:
 
         _apply_solver_settings(model.forward_solver.fas_options, cfg.forward_solver)
         _apply_solver_settings(model.adjoint_solver.fas_options, cfg.adjoint_solver)
-        model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.01))
-        model.adjoint_solver.vanka_options.newton_options.shear_damping.set(cp.float32(0.01))
+        #model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.01))
+        #model.adjoint_solver.vanka_options.newton_options.shear_damping.set(cp.float32(0.01))
+        
+        model.forward_solver.vanka_options.omega.set(cp.float32(0.5))
+        model.forward_solver.vanka_options.newton_options.step_tolerance.set(cp.float32(1e-4))
+        #model.adjoint_solver.vanka_options.omega.set(cp.float32(0.5))
+
         #model.adjoint_solver._fas_config.maximum_vcycles=5
         #model.adjoint_solver.fas_options.maximum_vcycle.set(3)
         #model.forward_solver.vanka_options.newton_options.momentum_damping.set(
@@ -538,7 +543,8 @@ class GlacierProblem:
         ny, nx = self.ny, self.nx
 
         log_beta = torch.tensor(cp.log(self.mg[0].sliding.beta.data), device="cuda")
-        z_log_beta = GGaPPWhiten.apply(priors.log_beta_model, log_beta)
+        z_log_beta = GGaPPWhiten.apply(priors.log_beta_model,
+                                       log_beta - priors.mu_log_beta)
 
         bed = torch.tensor(self.mg[0].geometry.bed.data, device="cuda")
         bed_mean = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
@@ -596,7 +602,7 @@ class GlacierProblem:
         bed, bed_mean, bed_uncond = priors.bed_from_whitened(
             params.z_bed, params.z_bed_mean,
             data_override=self._bed_data_override)
-        log_beta = GGaPPMap.apply(priors.log_beta_model, params.z_log_beta)
+        log_beta = priors.log_beta_from_whitened(params.z_log_beta)
         pbias = GGaPPMap.apply(priors.pbias_model, params.z_pbias)
         # Additive temperature bias (K): mapped only when the term is enabled
         # (no Matern hierarchy exists otherwise); None keeps t2m untouched.

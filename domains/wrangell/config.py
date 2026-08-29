@@ -19,7 +19,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="wrangell",
-    results_subdir="inverse_test",
+    results_subdir="inverse_molho_v2",
     smb_model = "enthalpy",
     anomaly_integration="mean_anomaly",
     stress_scheme='molho',
@@ -42,8 +42,8 @@ CONFIG = GlacierConfig(
                          pcg_rtol=1e-3,
                          pcg_rtol_adjoint=1e-2),
     sliding_m=1./3.,
-    u_reg=1.0,
-    beta_init=10.0,
+    u_reg=10.0,
+    beta_init=3.0,
     init_from_observed_geometry = True,
     use_avalanche_model = True,
     avalanche_hoisted=True,
@@ -55,7 +55,7 @@ CONFIG = GlacierConfig(
     alpha_t2m=2.5,
     dt=20.0,
     lr_z_log_beta=0.05,
-    tbias_enabled=False
+    tbias_enabled=True
 )
 
 """

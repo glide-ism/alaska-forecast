@@ -248,16 +248,20 @@ for sample_idx in range(N_SAMPLES):
                          getattr(INIT_SCHEME, name))
 
     fac = 1.0
+    # Steady-state learning rates: any Schedule on an lr_z_* config field is
+    # an inverse-only continuation device and collapses to its `final` here
+    # (schedule=False), mirroring how the loss weights are treated below.
+    lr = config.learning_rates(schedule=False)
     optimizer_sgd = torch.optim.SGD([
-        {"params": params.z_bed,      "lr": fac * config.lr_z_bed},
-        {"params": params.z_bed_mean, "lr": fac * config.lr_z_bed_mean},
-        {"params": params.z_log_beta, "lr": fac * config.lr_z_log_beta},
+        {"params": params.z_bed,      "lr": fac * lr["lr_z_bed"]},
+        {"params": params.z_bed_mean, "lr": fac * lr["lr_z_bed_mean"]},
+        {"params": params.z_log_beta, "lr": fac * lr["lr_z_log_beta"]},
     ], momentum=0.5)
 
     optimizer_adam = torch.optim.Adam([
-        {"params": params.z_pbias,  "lr": fac * config.lr_z_pbias},
-        {"params": params.z_log_mf, "lr": fac * config.lr_z_log_mf},
-        {"params": params.z_log_rf, "lr": fac * config.lr_z_log_rf},
+        {"params": params.z_pbias,  "lr": fac * lr["lr_z_pbias"]},
+        {"params": params.z_log_mf, "lr": fac * lr["lr_z_log_mf"]},
+        {"params": params.z_log_rf, "lr": fac * lr["lr_z_log_rf"]},
     ], betas=(0.5, 0.99))
 
     # LambdaLR multiplies each param group's base LR by cosine_ratio(step),

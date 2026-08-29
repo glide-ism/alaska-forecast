@@ -209,6 +209,10 @@ class GlacierPriors:
                 rtol_adjoint=getattr(bc, "pcg_rtol_adjoint", None),
                 preconditioner=getattr(bc, "pcg_preconditioner", "shifted"))
 
+        # Scalar mean of the log_beta field prior (the Matern prior acts on
+        # log_beta - mu_log_beta).
+        self.mu_log_beta = getattr(config, "mu_log_beta", 0.0)
+
         self.mu_log_rf = float(np.log(config.mu_rf))
         self.mu_log_mf = float(np.log(config.mu_mf))
         self.sigma_log_rf = config.sigma_log_rf
@@ -229,6 +233,11 @@ class GlacierPriors:
         self.sigma_tau = config.sigma_tau
         self.mu_z0 = config.mu_z0
         self.sigma_z0 = config.sigma_z0
+
+    def log_beta_from_whitened(self, z_log_beta):
+        """THE whitened -> log_beta map (mu_log_beta + Map(z)), shared by
+        problem.physical_from, posterior.py, and sensitivity.py."""
+        return self.mu_log_beta + GGaPPMap.apply(self.log_beta_model, z_log_beta)
 
     @property
     def bed_parametrization(self) -> str:

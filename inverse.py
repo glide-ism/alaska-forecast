@@ -33,39 +33,60 @@ if WARM_START_PATH is not None:
 # Dump the observational products once, alongside the finest-level diagnostics.
 problem.write_observations(f"{OUTPUT_PATH}/level_{config.min_level}/vti")
 
+# Each param group is named after its config lr field so the per-iteration
+# refresh below can apply scheduled learning rates (Schedule / callable on any
+# `lr_z_*` in the domain config). The initial values are the iteration-0,
+# coarsest-level ones purely for construction; refresh_learning_rates()
+# overwrites them before every step.
+lr0 = config.learning_rates(0, config.max_level, schedule=True)
+
 optimizer_sgd = torch.optim.SGD([
-    {"params": params.z_bed,      "lr": config.lr_z_bed},
-    {"params": params.z_bed_mean, "lr": config.lr_z_bed_mean},
-    {"params": params.z_log_beta, "lr": config.lr_z_log_beta},
+    {"params": params.z_bed,      "lr": lr0["lr_z_bed"],      "name": "lr_z_bed"},
+    {"params": params.z_bed_mean, "lr": lr0["lr_z_bed_mean"], "name": "lr_z_bed_mean"},
+    {"params": params.z_log_beta, "lr": lr0["lr_z_log_beta"], "name": "lr_z_log_beta"},
 ], momentum=0.5)
 
 adam_groups = [
-    {"params": params.z_pbias,  "lr": config.lr_z_pbias},
+    {"params": params.z_pbias,  "lr": lr0["lr_z_pbias"], "name": "lr_z_pbias"},
 ]
 if config.tbias_enabled:
     # Additive temperature bias field; inert (z = 0) when disabled.
     adam_groups += [
-        {"params": params.z_tbias, "lr": config.lr_z_tbias},
+        {"params": params.z_tbias, "lr": lr0["lr_z_tbias"], "name": "lr_z_tbias"},
     ]
 if config.smb_model == "enthalpy":
     # Enthalpy SMB scalars replace the temperature-index mf/rf pair — the
     # inactive model's z never enter the forward graph and get no gradient.
     adam_groups += [
-        {"params": params.z_log_H_atm,   "lr": config.lr_z_log_H_atm},
-        {"params": params.z_logit_cloud, "lr": config.lr_z_logit_cloud},
+        {"params": params.z_log_H_atm,   "lr": lr0["lr_z_log_H_atm"],   "name": "lr_z_log_H_atm"},
+        {"params": params.z_logit_cloud, "lr": lr0["lr_z_logit_cloud"], "name": "lr_z_logit_cloud"},
     ]
 else:
     adam_groups += [
-        {"params": params.z_log_mf, "lr": config.lr_z_log_mf},
-        {"params": params.z_log_rf, "lr": config.lr_z_log_rf},
+        {"params": params.z_log_mf, "lr": lr0["lr_z_log_mf"], "name": "lr_z_log_mf"},
+        {"params": params.z_log_rf, "lr": lr0["lr_z_log_rf"], "name": "lr_z_log_rf"},
     ]
 if config.precip_lapse_enabled:
     # Elevation-dependent precip depletion: learn tau/z0 in the Adam block.
     adam_groups += [
-        {"params": params.z_tau, "lr": config.lr_z_tau},
-        {"params": params.z_z0,  "lr": config.lr_z_z0},
+        {"params": params.z_tau, "lr": lr0["lr_z_tau"], "name": "lr_z_tau"},
+        {"params": params.z_z0,  "lr": lr0["lr_z_z0"],  "name": "lr_z_z0"},
     ]
 optimizer_adam = torch.optim.Adam(adam_groups, betas=(0.5, 0.99))
+
+
+def refresh_learning_rates(i, level):
+    """Resolve every scheduled lr at (i, level) and push it into the matching
+    optimizer param group. An lr of 0.0 freezes that parameter for the step
+    (optimizer state — SGD momentum, Adam moments — still accumulates, so the
+    step is well-conditioned when the schedule switches the lr on). Returns
+    the resolved dict so callers can log it."""
+    lrs = config.learning_rates(i, level, schedule=True)
+    for opt in (optimizer_sgd, optimizer_adam):
+        for group in opt.param_groups:
+            group["lr"] = lrs[group["name"]]
+    return lrs
+
 
 def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     bed_mean_coarse = differentiable_restriction(physical.bed_mean, level)
@@ -92,6 +113,7 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
 
+prev_lrs = None
 for level in range(config.max_level, config.min_level - 1, -1):
     problem.model.set_top_level(level)
     diag = make_diagnostic_fields(problem.mg[level])
@@ -102,6 +124,13 @@ for level in range(config.max_level, config.min_level - 1, -1):
     for i in range(config.max_iters[level]):
         optimizer_sgd.zero_grad()
         optimizer_adam.zero_grad()
+        # Scheduled learning rates share the loss-weight continuation contract:
+        # ramps are honored here (schedule=True) and nowhere else.
+        lrs = refresh_learning_rates(i, level)
+        if i == 0 or lrs != prev_lrs:
+            print("learning rates:",
+                  ", ".join(f"{k[3:]}={v:.3g}" for k, v in lrs.items()))
+        prev_lrs = lrs
 
         # Periodically emit a per-time-step VTI series.
         time_writer = (make_time_vti_writer(problem.mg[level], level_dir)

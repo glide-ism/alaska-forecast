@@ -15,6 +15,20 @@ from typing import Callable, Optional, Union
 # specs (see observations.py) and are resolved by Observation.weight_at.
 SCHEDULABLE_WEIGHTS = ("loss_scale",)
 
+# Per-parameter learning rates follow the same contract: a constant, or a
+# Schedule(final=, ramp=) honored only by the initial MAP solve (inverse.py
+# refreshes each optimizer param group's lr from GlacierConfig.learning_rates
+# every iteration). RTO warm-starts from the MAP and uses `final`. Setting a
+# ramp to 0.0 freezes that parameter for those iterations, e.g.
+#   lr_z_log_mf=Schedule(final=0.01, ramp=lambda i: 0.0 if i < 100 else 0.01)
+# holds the melt factor for the first 100 iterations of every level.
+SCHEDULABLE_LRS = (
+    "lr_z_bed", "lr_z_bed_mean", "lr_z_log_beta",
+    "lr_z_pbias", "lr_z_tbias", "lr_z_log_mf", "lr_z_log_rf",
+    "lr_z_log_H_atm", "lr_z_logit_cloud",
+    "lr_z_tau", "lr_z_z0",
+)
+
 
 def _accepts_two_positional(fn: Callable) -> bool:
     """True if `fn` can be called with two positional args, f(i, level); False if
@@ -31,13 +45,16 @@ def _accepts_two_positional(fn: Callable) -> bool:
 
 @dataclass(frozen=True)
 class Schedule:
-    """A loss weight that follows a continuation ramp during the initial MAP
-    solve only, collapsing to a single steady-state value everywhere else.
+    """A scalar hyperparameter (loss weight or learning rate) that follows a
+    continuation ramp during the initial MAP solve only, collapsing to a single
+    steady-state value everywhere else.
 
-    `final` is the contract weight shared by all four tasks: RTO, posterior, and
-    sensitivity always use it, so they target the same objective the MAP solve
-    converges to. `ramp` is a callable f(i) or f(i, level) honored only when a
-    driver opts into scheduling (inverse.py); it should asymptote to `final`.
+    `final` is the contract value shared by all four tasks: RTO, posterior, and
+    sensitivity always use it, so they target the same objective (and, for
+    learning rates, the same optimizer step) the MAP solve converges to. `ramp`
+    is a callable f(i) or f(i, level) honored only when a driver opts into
+    scheduling (inverse.py); it should asymptote to `final`. Note `i` resets at
+    each multigrid level and `level` runs coarsest -> 0 (finest).
     """
     final: float
     ramp: Callable[..., float]
@@ -47,15 +64,19 @@ class Schedule:
         return fn(iteration, level) if _accepts_two_positional(fn) else fn(iteration)
 
 
-# A schedulable loss weight. `schedule=` on GlacierConfig.at_iteration selects
+# A schedulable scalar. `schedule=` on GlacierConfig.at_iteration selects
 # whether continuation is honored (the initial inverse solve) or the steady-state
-# value is used (RTO / posterior / sensitivity).
-LossWeight = Union[float, Schedule, Callable[..., float]]
+# value is used (RTO / posterior / sensitivity). Loss weights and learning rates
+# share the type and the resolution rule.
+Scheduled = Union[float, Schedule, Callable[..., float]]
+LossWeight = Scheduled
+LearningRate = Scheduled
 
 
-def resolve_weight(value: LossWeight, iteration: int, level: int, *,
-                   schedule: bool) -> float:
-    """Resolve a (possibly scheduled) loss weight to a float.
+def resolve_weight(value: Scheduled, iteration: int, level: int, *,
+                   schedule: bool, what: str = "loss weight") -> float:
+    """Resolve a (possibly scheduled) scalar (loss weight or learning rate) to
+    a float.
 
     * constants pass through unchanged;
     * a Schedule yields its continuation value when `schedule` is True, else its
@@ -69,7 +90,7 @@ def resolve_weight(value: LossWeight, iteration: int, level: int, *,
     if callable(value):
         if not schedule:
             raise TypeError(
-                "loss weight is a bare schedule callable, but this task does not "
+                f"{what} is a bare schedule callable, but this task does not "
                 "use scheduling. Wrap it as Schedule(final=..., ramp=...) so the "
                 "steady-state value is defined for RTO / posterior / sensitivity."
             )
@@ -213,8 +234,15 @@ class GlacierConfig:
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,    l=1000.0,  nu=1)
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0,   l=10000.0, nu=1)
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,      l=1000.0,  nu=1)
-    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.05,     l=10000.0, nu=1)
+    pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
     tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
+
+    # Scalar prior mean of the log_beta field: the Matern prior (and its
+    # whitened representation) applies to log_beta - mu_log_beta, so the
+    # zero-loss state is beta = exp(mu_log_beta) rather than beta = 1.
+    # Checkpointed z_log_beta is relative to this mean — changing it shifts
+    # the physical field a warm start maps to.
+    mu_log_beta: float = 0.0
 
     # Optional additive temperature bias field (units: K). A Matern GP field
     # added to the monthly t2m before the anomaly shift — the spatial,
@@ -265,13 +293,13 @@ class GlacierConfig:
     # both from the same f. Physical values passed to the model are converted
     # to J m-2 yr-1 (K-1) via SECONDS_PER_YEAR.
     mu_H_atm:          float = 10.0   # W m-2 K-1, prior median
-    sigma_log_H_atm:   float = 0.4
+    sigma_log_H_atm:   float = 0.2
     # Prior median of the clear-sky fraction f. 0.35 ~ interior-Alaska summer
     # cloud fraction 0.65; with k_diffuse_* below it reproduces the station
     # June climatology (horizontal direct ~100, diffuse ~120, global ~220 W m-2
     # at 63 N). Maritime domains sit lower (~0.2).
     mu_cloud_factor:   float = 0.35
-    sigma_logit_cloud: float = 0.5
+    sigma_logit_cloud: float = 0.25
 
     # Enthalpy-model fixed constants (not inverted; per-second SI units,
     # converted by SECONDS_PER_YEAR where they are fluxes).
@@ -457,27 +485,35 @@ class GlacierConfig:
     # by the prior curvature, so a domain that changes a prior typically has
     # to retune the corresponding lr. SGD on the field params, Adam on the
     # scalar / smooth params.
-    lr_z_bed:      float = 0.5
-    lr_z_bed_mean: float = 0.5
-    lr_z_log_beta: float = 0.05
+    #
+    # Each may be a constant or a Schedule(final=, ramp=) (see SCHEDULABLE_LRS
+    # at the top of this module): the ramp is a continuation device for the
+    # initial MAP solve only — inverse.py refreshes each optimizer group's lr
+    # from `learning_rates(i, level, schedule=True)` every iteration, so a ramp
+    # of 0.0 freezes that parameter (its optimizer state still accumulates,
+    # which warms Adam's moments for when the lr switches on). RTO reads the
+    # steady-state `final` — as with the loss weights, `final` is the contract.
+    lr_z_bed:      LearningRate = 0.5
+    lr_z_bed_mean: LearningRate = 0.5
+    lr_z_log_beta: LearningRate = 0.05
 
-    lr_z_pbias:    float = 0.001
-    lr_z_tbias:    float = 0.001
-    lr_z_log_mf:   float = 0.01
-    lr_z_log_rf:   float = 0.01
+    lr_z_pbias:    LearningRate = 0.001
+    lr_z_tbias:    LearningRate = 0.001
+    lr_z_log_mf:   LearningRate = 0.01
+    lr_z_log_rf:   LearningRate = 0.01
     # Enthalpy-model scalars (Adam block, used in place of z_log_mf/z_log_rf
     # when smb_model == "enthalpy").
-    lr_z_log_H_atm:   float = 0.05
-    lr_z_logit_cloud: float = 0.05
+    lr_z_log_H_atm:   LearningRate = 0.05
+    lr_z_logit_cloud: LearningRate = 0.05
     # Elevation-dependent precip depletion scalars (Adam block, only added to
     # the optimizer when precip_lapse_enabled). See the prior widths above.
-    lr_z_tau:      float = 0.01
-    lr_z_z0:       float = 0.01
+    lr_z_tau:      LearningRate = 0.01
+    lr_z_z0:       LearningRate = 0.01
 
     def at_iteration(self, iteration: int, level: int = 0, *,
                      schedule: bool = False) -> "GlacierConfig":
-        """Return a copy with every schedulable loss weight resolved to a float
-        at `(iteration, level)`.
+        """Return a copy with every schedulable loss weight and learning rate
+        resolved to a float at `(iteration, level)`.
 
         When `schedule` is False (the default, used by RTO / posterior /
         sensitivity) constants pass through and any Schedule collapses to its
@@ -490,9 +526,25 @@ class GlacierConfig:
         ramp=lambda i, level: 0.0 if level > 0 else 2e-4))`.
         """
         overrides = {name: resolve_weight(getattr(self, name), iteration, level,
-                                          schedule=schedule)
+                                          schedule=schedule, what=name)
                      for name in SCHEDULABLE_WEIGHTS}
+        overrides.update(self.learning_rates(iteration, level, schedule=schedule))
         return replace(self, **overrides)
+
+    def learning_rates(self, iteration: int = 0, level: int = 0, *,
+                       schedule: bool = False) -> dict:
+        """Every schedulable learning rate resolved to a float at
+        `(iteration, level)`, keyed by field name (`"lr_z_bed"`, ...).
+
+        Same contract as the loss weights: `schedule=True` (inverse.py) honors
+        Schedule ramps and bare callables; the default collapses each Schedule
+        to its steady-state `final`, which is what RTO warm-starting from the
+        MAP should use. Drivers name each optimizer param group after its
+        config field and refresh `group["lr"]` from this dict per iteration.
+        """
+        return {name: resolve_weight(getattr(self, name), iteration, level,
+                                     schedule=schedule, what=name)
+                for name in SCHEDULABLE_LRS}
 
     @property
     def output_dir(self) -> str:

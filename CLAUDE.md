@@ -64,6 +64,8 @@ config; per-task knobs (output paths, max iters, learning-rate schedules, warm-s
 live in the driver. When changing behavior, decide which side it belongs to. Note that
 learning rates are tightly coupled to prior hyperparameters (the natural step in whitened
 coordinates is set by prior curvature), so changing a prior usually means retuning its `lr`.
+Learning rates may also be `Schedule`s (see below), following the same `final`-is-the-contract
+rule as the loss weights.
 
 **Time-stamped observations.** Each observational product is an `Observation` subclass
 (`glacier_inverse/observations.py`) carrying its data tensors, its acquisition time(s)
@@ -123,6 +125,26 @@ from glacier_inverse import Schedule, SnowlineSpec
 SnowlineSpec(weight=Schedule(final=1e-5, ramp=lambda i: 0.0 if i < 100 else 1e-5)),
 # level-aware: snowline only on the finest grid during the solve
 SnowlineSpec(weight=Schedule(final=1e-5, ramp=lambda i, level: 1e-5 if level == 0 else 0.0)),
+```
+
+**Schedulable learning rates (same contract).** Every `lr_z_*` field on `GlacierConfig`
+(the tuple `SCHEDULABLE_LRS` in `config.py`) accepts the same `float | Schedule | callable`
+as a loss weight. `GlacierConfig.learning_rates(i, level, schedule=)` resolves them to a
+name→float dict (`at_iteration` resolves them too); `inverse.py` names each optimizer
+param group after its config field and calls `refresh_learning_rates(i, level)` before
+every step (`schedule=True`), printing the resolved set whenever it changes;
+`rto_sample.py` builds its optimizers from `learning_rates(schedule=False)`, i.e. `final`.
+A ramp value of `0.0` freezes that parameter for those iterations (optimizer state still
+accumulates — SGD momentum / Adam moments — so the first live step is well-conditioned).
+Because `i` resets per level, "hold the SMB scalars for the first 100 iterations" holds
+them for the first 100 iterations *of each level* unless the ramp also inspects `level`:
+
+```python
+# freeze the melt/radiation factors until the geometry has settled
+lr_z_log_mf=Schedule(final=0.01, ramp=lambda i: 0.0 if i < 100 else 0.01),
+lr_z_log_rf=Schedule(final=0.01, ramp=lambda i: 0.0 if i < 100 else 0.01),
+# only ever move pbias on the finest grid
+lr_z_pbias=Schedule(final=1e-3, ramp=lambda i, level: 1e-3 if level == 0 else 0.0),
 ```
 
 ### The reusable core: `glacier_inverse/`

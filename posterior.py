@@ -50,7 +50,7 @@ for d in Path(f"{INPUT_PATH}/rto_lr_decay/").iterdir():
         pbiases.append(GGaPPMap.apply(priors.pbias_model, data["precipitation_bias"]).cpu().detach())
         if priors.tbias_model is not None and "temperature_bias" in data:
             tbiases.append(GGaPPMap.apply(priors.tbias_model, data["temperature_bias"]).cpu().detach())
-        log_betas.append(GGaPPMap.apply(priors.log_beta_model, data["log_beta"]).cpu().detach())
+        log_betas.append(priors.log_beta_from_whitened(data["log_beta"]).cpu().detach())
         log_mfs.append(data["log_mf"].cpu().detach() * priors.sigma_log_mf + priors.mu_log_mf)
         log_rfs.append(data["log_rf"].cpu().detach() * priors.sigma_log_rf + priors.mu_log_rf)
     except FileNotFoundError:
