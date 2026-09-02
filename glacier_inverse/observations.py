@@ -26,6 +26,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Optional
 
+import cupy as cp
 import torch
 from torch.nn.functional import grid_sample
 
@@ -151,6 +152,143 @@ class ObservationBuildContext:
     nx: int
     config: object                       # GlacierConfig
     priors: object = None                # GlacierPriors (noise-model registry)
+
+
+def _pcg(A, b, M_inv, x0, rtol: float = 1e-3, maxiter: int = 100):
+    """Preconditioned conjugate gradients for SPD A (torch, no autograd)."""
+    x = x0.clone()
+    r = b - A(x)
+    z = M_inv(r)
+    p = z.clone()
+    rz = (r * z).sum()
+    b_norm = b.norm() + 1e-30
+    it = 0
+    for it in range(maxiter):
+        if r.norm() <= rtol * b_norm:
+            break
+        Ap = A(p)
+        alpha = rz / ((p * Ap).sum() + 1e-30)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        z = M_inv(r)
+        rz_new = (r * z).sum()
+        p = z + (rz_new / rz) * p
+        rz = rz_new
+    return x, it
+
+
+class LogitNuisance:
+    """Profiled GP nuisance on the logit of a Brier term.
+
+    Model: the observed class probability is p(η_model + ε) with a coherent
+    logit-error field ε ~ GP(0, Matérn(σ, l, ν)) — margin/snowline
+    misplacement that is correlated along the boundary is explained by ε at
+    prior cost ~ (L/l)·(δ·|∇η|/σ)² instead of per-pixel Brier cost, while
+    fine-scale, incoherent disagreement still pays the full Brier. ε is
+    PROFILED inside the loss evaluation (never exposed to the outer
+    optimizer): each call runs `inner_steps` damped Gauss–Newton updates of
+
+        min_ε  c·Σ ω (p(η+ε) − t)² + ½ εᵀ C_l⁻¹ ε,
+
+    each solving (C_l⁻¹ + D) ε₊ = D ε − ∇F_d by CG preconditioned with C_l
+    (both spectral operators via `SpectralMaternNoise`; the mild data
+    strength of a Brier term keeps the preconditioned condition number small,
+    so ~10 iterations suffice), warm-started from the last call — a lagged
+    iteration that tracks the exact profile ε*(m) as the outer solve
+    converges. The returned loss is the profile objective at the detached ε*
+    (envelope theorem: its m-gradient needs no differentiation through the
+    solve); the ½‖z_ε‖² prior cost is included so the loss trace shows the
+    total and absorption stays visible (`last` carries the pieces). Note the
+    deliberate omission of the Laplace log-det: its only content beyond
+    profiling is an Occam term whose gradient rewards steepening the
+    transition — the BCE sharpness pathology the Brier exists to avoid.
+
+    Per-level state: ε lives on the grid the term is evaluated on; a new
+    level warm-starts from the prolonged coarser ε. ε is not a checkpointed
+    parameter — after a warm start it re-converges within a few iterations.
+    """
+
+    def __init__(self, hp: MaternNoise, inner_steps: int = 2):
+        if hp.nugget != 0.0:
+            raise ValueError(
+                "LogitNuisance: the logit-error GP is a smooth model-error "
+                "field; a white nugget is meaningless here (the Brier term "
+                "itself prices per-pixel fuzz). Use MaternNoise(nugget=0).")
+        self.hp = hp
+        self.inner_steps = inner_steps
+        self._ops = {}    # level -> SpectralMaternNoise on that grid
+        self._eps = {}    # level -> ε (torch, detached)
+        self.last = {}
+
+    def _op(self, level, ny, nx, dx):
+        if level not in self._ops:
+            from .priors import SpectralMaternNoise
+            self._ops[level] = SpectralMaternNoise(self.hp, ny, nx, dx)
+        return self._ops[level]
+
+    @staticmethod
+    def _apply2(fn, v):
+        """fn∘fn on a torch field through cupy (C_l⁻¹ = whiten², C_l = forward²)."""
+        u = cp.asarray(v.detach().contiguous())
+        return torch.as_tensor(fn(fn(u)), device=v.device)
+
+    def eps_at(self, level):
+        return self._eps.get(level)
+
+    def solve(self, *, level, dx_level, p_g, omega, target, c) -> tuple:
+        """Update and return (ε*, prior_cost) for the current model logits.
+
+        `p_g(ε) -> (p, ∂p/∂ε)`; `omega`/`target` the Brier weights/targets on
+        the level grid; `c = weight · dx_level² / s_B²` (the resolved Brier
+        scale WITHOUT loss_scale, which cancels in the inner problem).
+        All under no_grad; the caller re-evaluates the loss at the returned
+        detached ε with the live graph.
+        """
+        ny, nx = target.shape
+        op = self._op(level, ny, nx, dx_level)
+        Q = lambda v: self._apply2(op.whiten, v)
+        C = lambda v: self._apply2(op.forward, v)
+        eps = self._eps.get(level)
+        if eps is None:
+            coarser = self._eps.get(level + 1)
+            if coarser is not None:
+                from .forward import differentiable_prolongation
+                eps = differentiable_prolongation(coarser, 1).contiguous()
+            else:
+                eps = torch.zeros(ny, nx, device=target.device)
+
+        def F(e):
+            p, _ = p_g(e)
+            return (c * (omega * (p - target) ** 2).sum()
+                    + 0.5 * (e * Q(e)).sum())
+
+        cg_total = 0
+        for _ in range(self.inner_steps):
+            p, g = p_g(eps)
+            D = 2.0 * c * omega * g * g
+            grad_d = 2.0 * c * omega * g * (p - target)
+            new, iters = _pcg(lambda v: Q(v) + D * v, D * eps - grad_d,
+                              C, x0=eps)
+            cg_total += iters + 1
+            # Gauss–Newton can overshoot where the sigmoid saturates: damp by
+            # backtracking on the true profile objective.
+            step = new - eps
+            f0 = F(eps)
+            accepted = eps
+            t = 1.0
+            for _ in range(4):
+                cand = eps + t * step
+                if F(cand) <= f0 + 1e-6 * abs(f0):
+                    accepted = cand
+                    break
+                t *= 0.5
+            eps = accepted
+        self._eps[level] = eps
+        prior = 0.5 * (eps * Q(eps)).sum()
+        self.last = dict(level=level, cg=cg_total,
+                         prior=float(prior),
+                         eps_absmax=float(eps.abs().max()))
+        return eps, prior
 
 
 def read_time_attrs(da, *, fallback: float, what: str):
@@ -526,16 +664,31 @@ class ExtentObservation(Observation):
     name = "extent"
 
     def __init__(self, *, time: float, s_H: float, smb_dt: float,
-                 weight: LossWeight, two_sided: bool = False):
+                 weight: LossWeight, two_sided: bool = False,
+                 logit_nuisance: Optional[LogitNuisance] = None):
         super().__init__(weight=weight)
         self.time = time
         self.s_H = s_H
         self.smb_dt = smb_dt
         self.two_sided = two_sided
+        self.logit_nuisance = logit_nuisance
 
     @property
     def required_times(self):
         return (self.time,)
+
+    def _p_g(self, H, smb, active, eps):
+        """Blended extent probability at logit shift ε, and ∂p/∂ε. ε shifts
+        both constituent logits — it is an error on the extent logit itself,
+        whichever branch supplies it."""
+        s_dyn = torch.sigmoid(H / self.s_H + eps)
+        s_smb = torch.sigmoid(self.smb_dt / self.s_H * smb + eps)
+        p_dyn = (2.0 * s_dyn - 1.0).clip(min=0.001, max=0.999)
+        p_smb = s_smb.clip(min=0.001, max=0.999)
+        p = p_dyn * (1 - active) + p_smb * active
+        g = (2.0 * s_dyn * (1 - s_dyn) * (1 - active)
+             + s_smb * (1 - s_smb) * active)
+        return p, g
 
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
         # Evaluated on the snapshot's own grid: coarse H / active / smb
@@ -547,19 +700,41 @@ class ExtentObservation(Observation):
         state = sim.at(self.time)
         level = state.level
         H = state.H
+        smb = state.smb_coarse
         active = state.active
-        p_extent_dyn = (2.0 / (1 + torch.exp(-H / self.s_H)) - 1
-                        ).clip(min=0.001, max=0.999)
-        p_extent_smb = (1 / (1 + torch.exp(-self.smb_dt / self.s_H * state.smb_coarse))
-                        ).clip(min=0.001, max=0.999)
-        p_extent = p_extent_dyn * (1 - active) + p_extent_smb * active
         mask_L = _restrict(mask, level)
         if self.two_sided:
-            domain_L = _restrict(domain.domain_mask.to(torch.float32), level)
-            brier = (domain_L * ((mask_L - p_extent) / 0.5) ** 2).sum()
+            omega = _restrict(domain.domain_mask.to(torch.float32), level)
+            target = mask_L
         else:
-            brier = (mask_L * ((1 - p_extent) / 0.5) ** 2).sum()
-        return config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
+            omega = mask_L
+            target = torch.ones_like(mask_L)
+
+        eps = 0.0
+        prior = None
+        if self.logit_nuisance is not None and weight > 0.0:
+            with torch.no_grad():
+                Hd, smbd, ad = H.detach(), smb.detach(), active.detach()
+                eps, prior = self.logit_nuisance.solve(
+                    level=level, dx_level=dx * 2 ** level,
+                    p_g=lambda e: self._p_g(Hd, smbd, ad, e),
+                    omega=omega, target=target,
+                    c=weight * (dx * 2 ** level) ** 2 / 0.5 ** 2)
+
+        p_extent = self._p_g(H, smb, active, eps)[0]
+        brier = (omega * ((target - p_extent) / 0.5) ** 2).sum()
+        J = config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
+        if prior is not None:
+            # Profile objective: the (detached) ε prior cost keeps absorption
+            # visible in the loss trace.
+            J = J + config.loss_scale * prior
+        return J
+
+    def residuals(self, *, sim, physical, config, domain, mask, dx):
+        if self.logit_nuisance is None:
+            return {}
+        eps = self.logit_nuisance.eps_at(sim.at(self.time).level)
+        return {} if eps is None else {"logit_eps": eps}
 
 
 class BedObservation(Observation):
@@ -645,8 +820,10 @@ class SnowlineObservation(Observation):
     name = "snow"
 
     def __init__(self, *, snow_label, snow_mask, time: float, s_smb: float,
-                 weight: LossWeight, two_sided: bool = False):
+                 weight: LossWeight, two_sided: bool = False,
+                 logit_nuisance: Optional[LogitNuisance] = None):
         super().__init__(weight=weight)
+        self.logit_nuisance = logit_nuisance
         self.snow_label = snow_label
         self.snow_mask = snow_mask
         self.time = time
@@ -673,13 +850,38 @@ class SnowlineObservation(Observation):
         state = sim.at(self.time)
         level = state.level
         logits = state.smb_coarse / self.s_smb
-        y = torch.nn.functional.sigmoid(logits)
         snow_mask, snow_label = self._target_at(level)
         if self.two_sided:
-            brier = (snow_mask * ((y - snow_label) / 0.25) ** 2).sum()
+            omega, target = snow_mask, snow_label
         else:
-            brier = (snow_mask * snow_label * ((1.0 - y) / 0.25) ** 2).sum()
-        return config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
+            omega, target = snow_mask * snow_label, torch.ones_like(snow_label)
+
+        eps = 0.0
+        prior = None
+        if self.logit_nuisance is not None and weight > 0.0:
+            with torch.no_grad():
+                ld = logits.detach()
+
+                def p_g(e):
+                    s = torch.sigmoid(ld + e)
+                    return s, s * (1 - s)
+                eps, prior = self.logit_nuisance.solve(
+                    level=level, dx_level=dx * 2 ** level,
+                    p_g=p_g, omega=omega, target=target,
+                    c=weight * (dx * 2 ** level) ** 2 / 0.25 ** 2)
+
+        y = torch.sigmoid(logits + eps)
+        brier = (omega * ((target - y) / 0.25) ** 2).sum()
+        J = config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
+        if prior is not None:
+            J = J + config.loss_scale * prior
+        return J
+
+    def residuals(self, *, sim, physical, config, domain, mask, dx):
+        if self.logit_nuisance is None:
+            return {}
+        eps = self.logit_nuisance.eps_at(sim.at(self.time).level)
+        return {} if eps is None else {"logit_eps": eps}
 
     def diagnostics(self):
         return {"snow_label": self.snow_label, "snow_mask": self.snow_mask}
@@ -1028,14 +1230,22 @@ class ExtentSpec:
     smb_dt: Optional[float] = None  # None -> config.dt (the historical factor)
     time: Optional[float] = None
     two_sided: bool = False         # False: penalize missing ice only
+    # Profiled GP nuisance on the extent logit (see LogitNuisance): sigma in
+    # logit units (a margin misplacement δ is ε ≈ δ·|∇H|/s_H), l the
+    # along-margin coherence of the extent error; nugget must be 0.
+    logit_error: Optional[MaternNoise] = None
+    nuisance_inner_steps: int = 2
 
     def build(self, ctx: ObservationBuildContext) -> ExtentObservation:
         cfg = ctx.config
         time = _resolve_time(self.time, ctx.gridded_data.rgi_mask,
                              fallback=cfg.t_end, what="RGI extent (rgi_mask)")
         smb_dt = cfg.dt if self.smb_dt is None else self.smb_dt
+        nuis = (LogitNuisance(self.logit_error, self.nuisance_inner_steps)
+                if self.logit_error is not None else None)
         return ExtentObservation(time=time, s_H=self.s_H, smb_dt=smb_dt,
-                                 weight=self.weight, two_sided=self.two_sided)
+                                 weight=self.weight, two_sided=self.two_sided,
+                                 logit_nuisance=nuis)
 
 
 @dataclass(frozen=True)
@@ -1068,6 +1278,10 @@ class SnowlineSpec:
     s_smb: float = 0.2
     time: Optional[float] = None
     two_sided: bool = False         # False: penalize missing snow only
+    # Profiled GP nuisance on the SMB logit (coherent ELA-displacement error);
+    # sigma in logit units (ELA shift ΔELA·|∂smb/∂z|/s_smb); nugget must be 0.
+    logit_error: Optional[MaternNoise] = None
+    nuisance_inner_steps: int = 2
 
     def build(self, ctx: ObservationBuildContext) -> Optional[SnowlineObservation]:
         sd = ctx.snowline_data
@@ -1096,7 +1310,10 @@ class SnowlineSpec:
         snow_label = snow_label.masked_fill(snow_mask == 0.0, 0.0)
         return SnowlineObservation(
             snow_label=snow_label, snow_mask=snow_mask, time=time,
-            s_smb=self.s_smb, weight=self.weight, two_sided=self.two_sided)
+            s_smb=self.s_smb, weight=self.weight, two_sided=self.two_sided,
+            logit_nuisance=(LogitNuisance(self.logit_error,
+                                          self.nuisance_inner_steps)
+                            if self.logit_error is not None else None))
 
 
 @dataclass(frozen=True)

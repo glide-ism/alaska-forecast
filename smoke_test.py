@@ -23,6 +23,10 @@ cheap consistency checks:
      Matérn member round-trips W(Map(ε)) ≈ ε with unit whitened variance,
      the coarse-level model is the physical model re-discretized with
      nugget/2^L, and the weight == 1 / smoothness contracts are enforced.
+  7c. The profiled logit nuisance on the Brier terms: the profile objective
+     is finite, never exceeds the plain Brier, is non-increasing under warm
+     starts, collapses to the plain Brier as sigma_eps -> 0, passes an
+     envelope gradient to z_bed, and exposes the fitted eps field.
   8. The enthalpy SMB backend (smb_model="enthalpy") builds, runs, is
      deterministic (fixed weather realization), and is differentiable w.r.t.
      its two whitened scalars (skipped if the installed glare predates it).
@@ -478,6 +482,61 @@ def main() -> int:
         check("MaternNoise rejects nu <= 0", False)
     except ValueError:
         check("MaternNoise rejects nu <= 0", True)
+    header("7c. Profiled logit nuisance (extent/snowline)")
+    from glacier_inverse.observations import ExtentSpec, SnowlineSpec
+    nuis_noise = MaternNoise(sigma=3.0, l=2000.0, nu=1)
+    ext_plain = ExtentSpec(weight=2e-4, s_H=10.0).build(problem.build_ctx)
+    ext_nuis = ExtentSpec(weight=2e-4, s_H=10.0,
+                          logit_error=nuis_noise).build(problem.build_ctx)
+    kw = dict(sim=sim, physical=physical, config=cfg0, domain=domain,
+              mask=mask, dx=problem.dx, weight=2e-4)
+    J_plain = ext_plain.loss(**kw)
+    J_n1 = ext_nuis.loss(**kw)
+    J_n2 = ext_nuis.loss(**kw)
+    st = ext_nuis.logit_nuisance.last
+    check("profiled extent loss is finite and includes a prior cost >= 0",
+          torch.isfinite(J_n1).item() and st["prior"] >= 0.0,
+          f"J_plain={J_plain.item():.3f} J_nuis={J_n1.item():.3f} "
+          f"prior={st['prior']:.3f} |eps|max={st['eps_absmax']:.2f} cg={st['cg']}")
+    check("profile objective <= plain Brier (eps = 0 is feasible)",
+          J_n1.item() <= J_plain.item() * (1 + 1e-4))
+    check("warm-started second call does not increase the profile",
+          J_n2.item() <= J_n1.item() * (1 + 1e-4))
+    ext_tiny = ExtentSpec(weight=2e-4, s_H=10.0,
+                          logit_error=MaternNoise(0.01, 2000.0)) \
+        .build(problem.build_ctx)
+    J_tiny = ext_tiny.loss(**kw)
+    check("sigma_eps -> 0 recovers the plain Brier",
+          abs(J_tiny.item() - J_plain.item()) < 0.02 * abs(J_plain.item()) + 1e-3,
+          f"J_tiny={J_tiny.item():.3f} vs J_plain={J_plain.item():.3f}")
+    params.z_bed.grad = None
+    J_n2.backward(retain_graph=True)
+    check("profiled extent loss gives z_bed a finite gradient (envelope)",
+          params.z_bed.grad is not None
+          and torch.isfinite(params.z_bed.grad).all().item(),
+          f"grad norm = {params.z_bed.grad.norm().item():.3e}"
+          if params.z_bed.grad is not None else "no grad")
+    params.z_bed.grad = None
+    res_n = ext_nuis.residuals(sim=sim, physical=physical, config=cfg0,
+                               domain=domain, mask=mask, dx=problem.dx)
+    fL = 2 ** level
+    check("residuals() exposes the fitted logit_eps on the level grid",
+          set(res_n) == {"logit_eps"}
+          and res_n["logit_eps"].shape == (problem.ny // fL, problem.nx // fL))
+    if snow is not None:
+        snow_nuis = SnowlineSpec(weight=1e-4, s_smb=0.5,
+                                 logit_error=MaternNoise(2.0, 3000.0)) \
+            .build(problem.build_ctx)
+        J_s = snow_nuis.loss(**{**kw, "weight": 1e-4})
+        check("profiled snowline loss is finite",
+              torch.isfinite(J_s).item(), f"J_snow_nuis={J_s.item():.3f}")
+    try:
+        LN_bad = MaternNoise(3.0, 2000.0, nugget=1.0)
+        ExtentSpec(weight=2e-4, logit_error=LN_bad).build(problem.build_ctx)
+        check("LogitNuisance rejects a nugget", False)
+    except ValueError:
+        check("LogitNuisance rejects a nugget", True)
+
     try:
         MaternNoise(10.0, 1000.0, nugget=-1.0)
         check("MaternNoise rejects a negative nugget", False)
@@ -499,6 +558,8 @@ def main() -> int:
         del problem, params, srf, vel, bed, snow, dhdt, domain, priors
         srf_w = again = res = J_w = corr = z_back = pert = None
         spec0 = spec_n = z_spec = z_n = white = spec_h = z_h = None
+        ext_plain = ext_nuis = ext_tiny = J_plain = J_n1 = J_n2 = J_tiny = None
+        res_n = snow_nuis = None
         torch.cuda.empty_cache()
 
         import dataclasses

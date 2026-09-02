@@ -182,6 +182,28 @@ fields) stays 10⁴–10⁵× the prior's, because the scalar sensitivity fields
 at glacier scales; what limits the scalars in the joint problem is their degeneracy with
 the fields, i.e. the field priors, not the error model.
 
+**Profiled logit nuisance for the Brier terms (`LogitNuisance`).** `ExtentSpec` and
+`SnowlineSpec` accept `logit_error=MaternNoise(sigma, l, nu)` (nugget must be 0; σ in
+logit units): the class probability becomes `p(η_model + ε)` with a coherent logit-error
+field ε ~ GP — margin/ELA misplacement correlated along the boundary is explained by ε at
+prior cost ~ (L/l)(δ·|∇η|/σ)² instead of per-pixel Brier cost, while incoherent
+fine-scale disagreement still pays the full `weight·dx_L²` Brier. ε is **profiled inside
+the loss evaluation** (never exposed to the optimizer): `nuisance_inner_steps` damped
+Gauss–Newton updates per call, each a C-preconditioned torch PCG on `(C_l⁻¹ + D)` with
+spectral operators, warm-started per level (new levels prolong the coarser ε; ε is not
+checkpointed and re-converges after warm starts; ~100 ms per term per evaluation). The
+returned loss is the profile objective at the detached ε* (envelope theorem — no
+differentiation through the solve) *plus* the ½‖z_ε‖² prior cost, so absorption stays
+visible in the trace; the Laplace log-det is deliberately omitted (its gradient rewards
+steepening the transition — the BCE sharpness pathology the Brier avoids). The fitted ε̂
+lands in `residuals.pvd` as `extent_logit_eps`/`snow_logit_eps` — the map of coherent
+extent/snowline model error; check it for small glaciers being "explained away" (a
+glacier ≲ l is one correlation area — on delta's old MAP σ = 3/2 absorbs most of both
+terms, so σ is the knob balancing outline trust against the anti-disappearance role of
+the one-sided extent term). Fixed points match the joint-MAP nuisance formulation; the
+profile just feels the correctly discounted objective from iteration 0. Enabled for
+delta (extent σ 3, l 2 km; snowline σ 2, l 3 km).
+
 **Schedulable loss weights (continuation, inverse-only).** Per-observation weights
 (`weight=` on each spec) and the global `loss_scale` may be a constant *or* a
 `Schedule(final=, ramp=)`. This is a continuation device for the **initial MAP solve only**
