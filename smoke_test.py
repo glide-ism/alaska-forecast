@@ -26,7 +26,9 @@ cheap consistency checks:
   7c. The profiled logit nuisance on the Brier terms: the profile objective
      is finite, never exceeds the plain Brier, is non-increasing under warm
      starts, collapses to the plain Brier as sigma_eps -> 0, passes an
-     envelope gradient to z_bed, and exposes the fitted eps field.
+     envelope gradient to z_bed, and exposes the fitted eps field; the
+     sigma_p reparametrization reproduces the legacy weight exactly and
+     enforces the weight == 1 contract.
   8. The enthalpy SMB backend (smb_model="enthalpy") builds, runs, is
      deterministic (fixed weather realization), and is differentiable w.r.t.
      its two whitened scalars (skipped if the installed glare predates it).
@@ -537,6 +539,25 @@ def main() -> int:
     except ValueError:
         check("LogitNuisance rejects a nugget", True)
 
+    # sigma_p reparametrization: exactly the legacy weight·dx²/s_B² form
+    # under sigma_p = s_B/sqrt(2·w·dx²), and weight == 1 by contract.
+    import math as _math
+    w_leg = 2e-4
+    sp_eq = 0.5 / _math.sqrt(2.0 * w_leg * problem.dx ** 2)
+    ext_sp = ExtentSpec(weight=1.0, s_H=10.0, sigma_p=sp_eq) \
+        .build(problem.build_ctx)
+    J_sp = ext_sp.loss(**{**kw, "weight": 1.0})
+    check("sigma_p form reproduces the legacy weighted Brier exactly",
+          abs(J_sp.item() - J_plain.item()) < 1e-3 * abs(J_plain.item()),
+          f"J_sigma_p={J_sp.item():.4f} vs J_legacy={J_plain.item():.4f} "
+          f"(sigma_p={sp_eq:.3f})")
+    try:
+        validate_noise_weights([ExtentSpec(weight=2e-4, sigma_p=0.3)
+                                .build(problem.build_ctx)])
+        check("sigma_p with weight != 1 raises", False)
+    except ValueError:
+        check("sigma_p with weight != 1 raises", True)
+
     try:
         MaternNoise(10.0, 1000.0, nugget=-1.0)
         check("MaternNoise rejects a negative nugget", False)
@@ -559,6 +580,7 @@ def main() -> int:
         srf_w = again = res = J_w = corr = z_back = pert = None
         spec0 = spec_n = z_spec = z_n = white = spec_h = z_h = None
         ext_plain = ext_nuis = ext_tiny = J_plain = J_n1 = J_n2 = J_tiny = None
+        ext_sp = J_sp = None
         res_n = snow_nuis = None
         torch.cuda.empty_cache()
 

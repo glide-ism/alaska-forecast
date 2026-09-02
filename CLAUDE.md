@@ -195,14 +195,19 @@ checkpointed and re-converges after warm starts; ~100 ms per term per evaluation
 returned loss is the profile objective at the detached ε* (envelope theorem — no
 differentiation through the solve) *plus* the ½‖z_ε‖² prior cost, so absorption stays
 visible in the trace; the Laplace log-det is deliberately omitted (its gradient rewards
-steepening the transition — the BCE sharpness pathology the Brier avoids). The fitted ε̂
-lands in `residuals.pvd` as `extent_logit_eps`/`snow_logit_eps` — the map of coherent
+steepening the transition — the BCE sharpness pathology the Brier avoids). The white
+per-pixel component is `sigma_p` (class-probability noise std, the nugget of the binary
+error model): setting it replaces `weight·dx_L²/s_B²` with `4^L/(2σ_p²)` (independent
+pixel errors average under restriction — level-consistent with no dx²) and pins
+`weight == 1` under the same contract as the field terms (legacy weight ↔ σ_p =
+s_B/√(2·weight·dx²); the historical 2e-5 was σ_p ≈ 0.88, near-uninformative pixels). The
+fitted ε̂ lands in `residuals.pvd` as `extent_logit_eps`/`snow_logit_eps` — the map of coherent
 extent/snowline model error; check it for small glaciers being "explained away" (a
 glacier ≲ l is one correlation area — on delta's old MAP σ = 3/2 absorbs most of both
 terms, so σ is the knob balancing outline trust against the anti-disappearance role of
 the one-sided extent term). Fixed points match the joint-MAP nuisance formulation; the
 profile just feels the correctly discounted objective from iteration 0. Enabled for
-delta (extent σ 3, l 2 km; snowline σ 2, l 3 km).
+delta (extent σ 3, l 2 km; snowline σ 2, l 3 km; both σ_p 0.3).
 
 **Schedulable loss weights (continuation, inverse-only).** Per-observation weights
 (`weight=` on each spec) and the global `loss_scale` may be a constant *or* a

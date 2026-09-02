@@ -118,15 +118,17 @@ def validate_noise_weights(observations) -> None:
     steady-state (`final`) weight is checked; a Schedule ramp may still hold a
     term at 0 during continuation."""
     for obs in observations:
-        if getattr(obs, "noise", None) is None:
+        modelled = getattr(obs, "noise", None) is not None \
+            or getattr(obs, "sigma_p", None) is not None
+        if not modelled:
             continue
         w = obs.weight_at(0, 0, schedule=False)
         if w != 1.0:
             raise ValueError(
-                f"observation {obs.name!r} carries a MaternNoise error model "
-                f"but its (final) weight is {w!r}; whitened terms have "
-                f"weight == 1 by contract — express trust in the product "
-                f"through MaternNoise(sigma, l, nu) instead.")
+                f"observation {obs.name!r} carries an explicit error model "
+                f"(MaternNoise / sigma_p) but its (final) weight is {w!r}; "
+                f"such terms have weight == 1 by contract — express trust in "
+                f"the product through the error model's parameters instead.")
 
 
 @dataclass
@@ -665,13 +667,26 @@ class ExtentObservation(Observation):
 
     def __init__(self, *, time: float, s_H: float, smb_dt: float,
                  weight: LossWeight, two_sided: bool = False,
-                 logit_nuisance: Optional[LogitNuisance] = None):
+                 logit_nuisance: Optional[LogitNuisance] = None,
+                 sigma_p: Optional[float] = None):
         super().__init__(weight=weight)
         self.time = time
         self.s_H = s_H
         self.smb_dt = smb_dt
         self.two_sided = two_sided
         self.logit_nuisance = logit_nuisance
+        self.sigma_p = sigma_p
+
+    def _c_data(self, level: int, dx: float, weight: float) -> float:
+        """Scale of the per-pixel Brier quadratic. With `sigma_p` (per-pixel
+        class-probability noise std, weight == 1 by contract) it is
+        4^L/(2σ_p²) — independent pixel errors average under restriction, so
+        this is level-consistent by construction and carries no dx² or s_B.
+        The legacy form weight·dx_L²/s_B² is identical under
+        σ_p = s_B/√(2·weight·dx²)."""
+        if self.sigma_p is not None:
+            return weight * 4.0 ** level / (2.0 * self.sigma_p ** 2)
+        return weight * (dx * 2 ** level) ** 2 / 0.5 ** 2
 
     @property
     def required_times(self):
@@ -710,6 +725,7 @@ class ExtentObservation(Observation):
             omega = mask_L
             target = torch.ones_like(mask_L)
 
+        c_data = self._c_data(level, dx, weight)
         eps = 0.0
         prior = None
         if self.logit_nuisance is not None and weight > 0.0:
@@ -718,12 +734,10 @@ class ExtentObservation(Observation):
                 eps, prior = self.logit_nuisance.solve(
                     level=level, dx_level=dx * 2 ** level,
                     p_g=lambda e: self._p_g(Hd, smbd, ad, e),
-                    omega=omega, target=target,
-                    c=weight * (dx * 2 ** level) ** 2 / 0.5 ** 2)
+                    omega=omega, target=target, c=c_data)
 
         p_extent = self._p_g(H, smb, active, eps)[0]
-        brier = (omega * ((target - p_extent) / 0.5) ** 2).sum()
-        J = config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
+        J = config.loss_scale * c_data * (omega * (target - p_extent) ** 2).sum()
         if prior is not None:
             # Profile objective: the (detached) ε prior cost keeps absorption
             # visible in the loss trace.
@@ -821,9 +835,11 @@ class SnowlineObservation(Observation):
 
     def __init__(self, *, snow_label, snow_mask, time: float, s_smb: float,
                  weight: LossWeight, two_sided: bool = False,
-                 logit_nuisance: Optional[LogitNuisance] = None):
+                 logit_nuisance: Optional[LogitNuisance] = None,
+                 sigma_p: Optional[float] = None):
         super().__init__(weight=weight)
         self.logit_nuisance = logit_nuisance
+        self.sigma_p = sigma_p
         self.snow_label = snow_label
         self.snow_mask = snow_mask
         self.time = time
@@ -856,6 +872,10 @@ class SnowlineObservation(Observation):
         else:
             omega, target = snow_mask * snow_label, torch.ones_like(snow_label)
 
+        if self.sigma_p is not None:
+            c_data = weight * 4.0 ** level / (2.0 * self.sigma_p ** 2)
+        else:
+            c_data = weight * (dx * 2 ** level) ** 2 / 0.25 ** 2
         eps = 0.0
         prior = None
         if self.logit_nuisance is not None and weight > 0.0:
@@ -867,12 +887,10 @@ class SnowlineObservation(Observation):
                     return s, s * (1 - s)
                 eps, prior = self.logit_nuisance.solve(
                     level=level, dx_level=dx * 2 ** level,
-                    p_g=p_g, omega=omega, target=target,
-                    c=weight * (dx * 2 ** level) ** 2 / 0.25 ** 2)
+                    p_g=p_g, omega=omega, target=target, c=c_data)
 
         y = torch.sigmoid(logits + eps)
-        brier = (omega * ((target - y) / 0.25) ** 2).sum()
-        J = config.loss_scale * weight * (dx * 2 ** level) ** 2 * brier
+        J = config.loss_scale * c_data * (omega * (target - y) ** 2).sum()
         if prior is not None:
             J = J + config.loss_scale * prior
         return J
@@ -1235,17 +1253,24 @@ class ExtentSpec:
     # along-margin coherence of the extent error; nugget must be 0.
     logit_error: Optional[MaternNoise] = None
     nuisance_inner_steps: int = 2
+    # Per-pixel class-probability noise std (the white component of the error
+    # model). Setting it replaces the legacy weight·dx²/s_B² scale with
+    # 4^L/(2σ_p²) and pins weight == 1 by contract (GlacierProblem raises);
+    # the legacy weight corresponds to σ_p = s_B/√(2·weight·dx²).
+    sigma_p: Optional[float] = None
 
     def build(self, ctx: ObservationBuildContext) -> ExtentObservation:
         cfg = ctx.config
         time = _resolve_time(self.time, ctx.gridded_data.rgi_mask,
                              fallback=cfg.t_end, what="RGI extent (rgi_mask)")
         smb_dt = cfg.dt if self.smb_dt is None else self.smb_dt
+        if self.sigma_p is not None and not self.sigma_p > 0.0:
+            raise ValueError(f"ExtentSpec.sigma_p must be > 0, got {self.sigma_p}")
         nuis = (LogitNuisance(self.logit_error, self.nuisance_inner_steps)
                 if self.logit_error is not None else None)
         return ExtentObservation(time=time, s_H=self.s_H, smb_dt=smb_dt,
                                  weight=self.weight, two_sided=self.two_sided,
-                                 logit_nuisance=nuis)
+                                 logit_nuisance=nuis, sigma_p=self.sigma_p)
 
 
 @dataclass(frozen=True)
@@ -1282,6 +1307,9 @@ class SnowlineSpec:
     # sigma in logit units (ELA shift ΔELA·|∂smb/∂z|/s_smb); nugget must be 0.
     logit_error: Optional[MaternNoise] = None
     nuisance_inner_steps: int = 2
+    # Per-pixel snow-fraction noise std; same contract as ExtentSpec.sigma_p
+    # (legacy weight ↔ σ_p = 0.25/√(2·weight·dx²)).
+    sigma_p: Optional[float] = None
 
     def build(self, ctx: ObservationBuildContext) -> Optional[SnowlineObservation]:
         sd = ctx.snowline_data
@@ -1313,7 +1341,8 @@ class SnowlineSpec:
             s_smb=self.s_smb, weight=self.weight, two_sided=self.two_sided,
             logit_nuisance=(LogitNuisance(self.logit_error,
                                           self.nuisance_inner_steps)
-                            if self.logit_error is not None else None))
+                            if self.logit_error is not None else None),
+            sigma_p=self.sigma_p)
 
 
 @dataclass(frozen=True)

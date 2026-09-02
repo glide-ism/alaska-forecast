@@ -86,11 +86,18 @@ CONFIG = GlacierConfig(
         # the old MAP these values absorb most of the extent/snowline misfit
         # (27.9 -> 6.0 / 14.9 -> 0.8), so tighten sigma if the one-sided
         # extent term needs to keep its grip against glacier disappearance.
-        ExtentSpec(weight=2e-5, s_H=10.0,
+        # sigma_p is the white per-pixel class-probability noise (the nugget
+        # of the binary error model; weight == 1 by contract, no dx^2). The
+        # legacy weight 2e-5 corresponded to sigma_p ~ 0.88 -- pixels nearly
+        # uninformative, the only guard against over-counting coherent error.
+        # With eps absorbing coherence, an honest per-pixel fuzz ~0.3 applies
+        # (~9x the old per-pixel information).
+        ExtentSpec(weight=1.0, s_H=10.0, sigma_p=0.3,
                    logit_error=MaternNoise(sigma=3.0, l=2000.0)),
         BedSpec(weight=0.0e-6),
-        SnowlineSpec(weight=Schedule(final=1e-5, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1e-5),
-                     s_smb=0.5, logit_error=MaternNoise(sigma=2.0, l=3000.0)),
+        SnowlineSpec(weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0),
+                     s_smb=0.5, sigma_p=0.3,
+                     logit_error=MaternNoise(sigma=2.0, l=3000.0)),
         DhdtSpec(noise=MaternNoise(sigma=0.5, l=3000.0, nu=0.5, nugget=0.5),
                  weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0)),
         BedSlopeSpec(weight=1e-5,s_scale=5.0),
