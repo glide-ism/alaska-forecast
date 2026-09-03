@@ -20,7 +20,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="delta",
-    results_subdir="inverse_coarsened_obs_v2",
+    results_subdir="inverse_sgd_pbias",
     smb_model = "enthalpy",
     # Constant (non-albedo-scaled) surface-flux offset: a-priori interior sky
     # longwave deficit + evaporative cooling. With the offset explicit, H_atm is
@@ -28,7 +28,14 @@ CONFIG = GlacierConfig(
     # sensible+latent+longwave value and the prior is widened to honest ignorance.
     q_lw0=-40.0,
     mu_H_atm=15.0,
-    sigma_log_H_atm=0.1,
+    # Legacy scalar sigma (checkpoint conversion only); the live pointwise
+    # prior std is h_atm_prior.sigma below — kept at the same 0.01 pin.
+    sigma_log_H_atm=0.01,
+    # H_atm / clear-sky fraction are (ny,nx) GP fields; sigma preserves the
+    # scalar-era pointwise std (H_atm effectively pinned at the median),
+    # l = the synoptic/orographic decorrelation scale.
+    h_atm_prior=PriorHyperparams(sigma=0.01, l=80000.0, nu=1),
+    cloud_prior=PriorHyperparams(sigma=0.25, l=80000.0, nu=1),
     # Shortwave: the inverted scalar f is the CLEAR-SKY fraction (1 - cloud
     # fraction); direct = f*S0*I (S0 = q_sw_clear = 1361, tau^airmass lives in
     # the direct potential I) and diffuse = (f*k_clr + (1-f)*k_cld)*S0*I_dif from
@@ -93,11 +100,12 @@ CONFIG = GlacierConfig(
         # With eps absorbing coherence, an honest per-pixel fuzz ~0.3 applies
         # (~9x the old per-pixel information).
         ExtentSpec(weight=1.0, s_H=10.0, sigma_p=0.3,
-                   logit_error=MaternNoise(sigma=3.0, l=2000.0)),
+                   logit_error=MaternNoise(sigma=0.3, l=1000.0),nuisance_inner_steps=2),
         BedSpec(weight=0.0e-6),
         SnowlineSpec(weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0),
                      s_smb=0.5, sigma_p=0.3,
-                     logit_error=MaternNoise(sigma=2.0, l=3000.0)),
+                     logit_error=MaternNoise(sigma=0.3, l=1000.0),
+                     nuisance_inner_steps=2),
         DhdtSpec(noise=MaternNoise(sigma=0.5, l=3000.0, nu=0.5, nugget=0.5),
                  weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0)),
         BedSlopeSpec(weight=1e-5,s_scale=5.0),
@@ -131,10 +139,12 @@ CONFIG = GlacierConfig(
     lr_z_log_beta=0.05*9*9,
     max_level=2,
     max_iters=(50,50,500),
-    lr_z_pbias=Schedule(final=0.001, ramp=lambda i,level:0.0 if (i<50 and level==2) else 0.001),
-    lr_z_tbias=Schedule(final=0.001,ramp=lambda i,level:0.0 if (i<50 and level==2) else 0.001),
-    lr_z_log_H_atm=Schedule(final=0.05,ramp=lambda i,level:0.0 if (i<50 and level==2) else 0.05),
-    lr_z_logit_cloud=Schedule(final=0.05,ramp=lambda i,level:0.0 if (i<50 and level==2) else 0.05),
+    lr_z_pbias=Schedule(final=0.05, ramp=lambda i,level:0.0 if (i<0 and level==2) else 0.05),
+    lr_z_tbias=Schedule(final=1.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1.0),
+    # SGD-on-whitened-field lrs (the 0.05 finals were Adam-era scalar steps);
+    # start conservative and retune on the level-2 trace.
+    lr_z_log_H_atm=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<50 and level==2) else 1e-3),
+    lr_z_logit_cloud=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<50 and level==2) else 1e-3),
 )
 
 """

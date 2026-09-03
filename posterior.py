@@ -32,6 +32,8 @@ tbiases = []
 log_betas = []
 log_mfs = []
 log_rfs = []
+log_H_atms = []
+f_clears = []
 
 for d in Path(f"{INPUT_PATH}/rto_lr_decay/").iterdir():
     try:
@@ -50,6 +52,21 @@ for d in Path(f"{INPUT_PATH}/rto_lr_decay/").iterdir():
         pbiases.append(GGaPPMap.apply(priors.pbias_model, data["precipitation_bias"]).cpu().detach())
         if priors.tbias_model is not None and "temperature_bias" in data:
             tbiases.append(GGaPPMap.apply(priors.tbias_model, data["temperature_bias"]).cpu().detach())
+        # Enthalpy parameter fields — mapped like tbias when both the model
+        # and a field-shaped sample exist (0-d entries are pre-field RTO
+        # samples; skip them rather than misinterpret).
+        if (priors.h_atm_model is not None and "log_H_atm" in data
+                and data["log_H_atm"].dim() == 2):
+            log_H_atms.append(
+                (priors.mu_log_H_atm
+                 + GGaPPMap.apply(priors.h_atm_model, data["log_H_atm"])
+                 ).cpu().detach())
+        if (priors.cloud_model is not None and "logit_cloud" in data
+                and data["logit_cloud"].dim() == 2):
+            f_clears.append(torch.sigmoid(
+                priors.mu_logit_cloud
+                + GGaPPMap.apply(priors.cloud_model, data["logit_cloud"])
+                ).cpu().detach())
         log_betas.append(priors.log_beta_from_whitened(data["log_beta"]).cpu().detach())
         log_mfs.append(data["log_mf"].cpu().detach() * priors.sigma_log_mf + priors.mu_log_mf)
         log_rfs.append(data["log_rf"].cpu().detach() * priors.sigma_log_rf + priors.mu_log_rf)
@@ -75,3 +92,9 @@ L_pbias, s_pbias = _centered_factor(pbias_samples)
 if tbiases:
     tbias_samples = torch.stack(tbiases[:MAX_SAMPLES], axis=0)
     L_tbias, s_tbias = _centered_factor(tbias_samples)
+if log_H_atms:
+    log_H_atm_samples = torch.stack(log_H_atms[:MAX_SAMPLES], axis=0)
+    L_h_atm, s_h_atm = _centered_factor(log_H_atm_samples)
+if f_clears:
+    f_clear_samples = torch.stack(f_clears[:MAX_SAMPLES], axis=0)
+    L_f_clear, s_f_clear = _centered_factor(f_clear_samples)

@@ -40,51 +40,56 @@ if WARM_START_PATH is not None:
 # overwrites them before every step.
 lr0 = config.learning_rates(0, config.max_level, schedule=True)
 
-optimizer_sgd = torch.optim.SGD([
-    {"params": params.z_bed,      "lr": lr0["lr_z_bed"],      "name": "lr_z_bed"},
+# Every parameter is SGD in whitened coordinates (prior-natural gradient:
+# an SGD step in z is a C-preconditioned physical step, so updates carry the
+# prior's spectrum and likelihood-null directions relax to the prior mean).
+# There is no Adam block — Adam's per-coordinate RMS normalization undoes
+# exactly the geometry the whitening encodes.
+sgd_groups = []
+
+sgd_groups += [{"params": params.z_bed,      "lr": lr0["lr_z_bed"],      "name": "lr_z_bed"},
     {"params": params.z_bed_mean, "lr": lr0["lr_z_bed_mean"], "name": "lr_z_bed_mean"},
     {"params": params.z_log_beta, "lr": lr0["lr_z_log_beta"], "name": "lr_z_log_beta"},
-], momentum=0.5)
-
-adam_groups = [
-    {"params": params.z_pbias,  "lr": lr0["lr_z_pbias"], "name": "lr_z_pbias"},
 ]
+
+sgd_groups += [{"params": params.z_pbias,  "lr": lr0["lr_z_pbias"], "name": "lr_z_pbias"},]
+
 if config.tbias_enabled:
     # Additive temperature bias field; inert (z = 0) when disabled.
-    adam_groups += [
+    sgd_groups += [
         {"params": params.z_tbias, "lr": lr0["lr_z_tbias"], "name": "lr_z_tbias"},
     ]
 if config.smb_model == "enthalpy":
-    # Enthalpy SMB scalars replace the temperature-index mf/rf pair — the
-    # inactive model's z never enter the forward graph and get no gradient.
-    adam_groups += [
+    # Enthalpy SMB parameter fields (log H_atm, logit clear-sky fraction)
+    # replace the temperature-index mf/rf pair — the inactive model's z never
+    # enter the forward graph and get no gradient.
+    sgd_groups += [
         {"params": params.z_log_H_atm,   "lr": lr0["lr_z_log_H_atm"],   "name": "lr_z_log_H_atm"},
         {"params": params.z_logit_cloud, "lr": lr0["lr_z_logit_cloud"], "name": "lr_z_logit_cloud"},
     ]
 else:
-    adam_groups += [
+    sgd_groups += [
         {"params": params.z_log_mf, "lr": lr0["lr_z_log_mf"], "name": "lr_z_log_mf"},
         {"params": params.z_log_rf, "lr": lr0["lr_z_log_rf"], "name": "lr_z_log_rf"},
     ]
 if config.precip_lapse_enabled:
-    # Elevation-dependent precip depletion: learn tau/z0 in the Adam block.
-    adam_groups += [
+    # Elevation-dependent precip depletion scalars.
+    sgd_groups += [
         {"params": params.z_tau, "lr": lr0["lr_z_tau"], "name": "lr_z_tau"},
         {"params": params.z_z0,  "lr": lr0["lr_z_z0"],  "name": "lr_z_z0"},
     ]
-optimizer_adam = torch.optim.Adam(adam_groups, betas=(0.5, 0.99))
 
+optimizer_sgd = torch.optim.SGD(sgd_groups, momentum=0.5)
 
 def refresh_learning_rates(i, level):
     """Resolve every scheduled lr at (i, level) and push it into the matching
     optimizer param group. An lr of 0.0 freezes that parameter for the step
-    (optimizer state — SGD momentum, Adam moments — still accumulates, so the
-    step is well-conditioned when the schedule switches the lr on). Returns
-    the resolved dict so callers can log it."""
+    (optimizer state — SGD momentum — still accumulates, so the step is
+    well-conditioned when the schedule switches the lr on). Returns the
+    resolved dict so callers can log it."""
     lrs = config.learning_rates(i, level, schedule=True)
-    for opt in (optimizer_sgd, optimizer_adam):
-        for group in opt.param_groups:
-            group["lr"] = lrs[group["name"]]
+    for group in optimizer_sgd.param_groups:
+        group["lr"] = lrs[group["name"]]
     return lrs
 
 
@@ -95,6 +100,16 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
         problem.effective_log_pbias(physical), level)
     tbias_coarse = (differentiable_restriction(physical.tbias, level)
                     if physical.tbias is not None else None)
+    # Fitted enthalpy parameter fields in physical units (H_atm in W m-2 K-1,
+    # f_clear in (0,1)) — inspect these for compensation of bed/dynamics error
+    # masquerading as climatology.
+    if config.smb_model == "enthalpy":
+        H_atm_coarse = differentiable_restriction(
+            torch.exp(physical.log_H_atm), level)
+        f_clear_coarse = differentiable_restriction(
+            torch.sigmoid(physical.logit_cloud), level)
+    else:
+        H_atm_coarse = f_clear_coarse = None
     S_obs_coarse = differentiable_restriction(
         torch.clamp(problem.domain.dem, min=0.0), level)
     # The model rate over the same interval the dhdt misfit uses (the
@@ -109,7 +124,8 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
         dhdt_coarse = (sim.H - sim.H_prev) / sim.final.dt_step
     update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
                              pbias_coarse, pbias_total_coarse, dhdt_coarse,
-                             tbias_=tbias_coarse)
+                             tbias_=tbias_coarse,
+                             H_atm_=H_atm_coarse, f_clear_=f_clear_coarse)
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
 

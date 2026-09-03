@@ -31,7 +31,8 @@ cheap consistency checks:
      enforces the weight == 1 contract.
   8. The enthalpy SMB backend (smb_model="enthalpy") builds, runs, is
      deterministic (fixed weather realization), and is differentiable w.r.t.
-     its two whitened scalars (skipped if the installed glare predates it).
+     its two whitened (ny, nx) parameter fields — log_H_atm and the logit
+     clear-sky fraction (skipped if the installed glare predates it).
 
 Prints PASS/FAIL per check; exits non-zero on any failure.
 
@@ -147,6 +148,29 @@ def main() -> int:
         _round_trip(tpriors.tbias_model, "tbias (enabled)")
         del tpriors
 
+    # The enthalpy SMB parameter fields (log H_atm, logit clear-sky fraction):
+    # Matern members gated on smb_model == "enthalpy"; under ETIM they must be
+    # None (the z fields sit inert at 0).
+    if priors.h_atm_model is not None:
+        _prior_matches(priors.h_atm_model, config.h_atm_prior, "h_atm")
+        _round_trip(priors.h_atm_model, "h_atm")
+        _prior_matches(priors.cloud_model, config.cloud_prior, "cloud")
+        _round_trip(priors.cloud_model, "cloud")
+        import dataclasses
+        from glacier_inverse.priors import GlacierPriors as _GP
+        # bed_conditioning=None: a conditioned config would reopen the input
+        # netCDF inside this process (the reopen-after-GC HDF hazard) — the
+        # throwaway build only needs to prove the SMB gate, not the bed.
+        etpriors = _GP(dataclasses.replace(config, smb_model="temperature_index",
+                                           bed_conditioning=None),
+                       problem.ny, problem.nx, problem.dx)
+        check("h_atm/cloud priors absent under temperature_index",
+              etpriors.h_atm_model is None and etpriors.cloud_model is None)
+        del etpriors
+    else:
+        check("h_atm/cloud priors absent under temperature_index",
+              priors.h_atm_model is None and priors.cloud_model is None)
+
     header("4. Initial whitened parameters")
     params = problem.params
     for name, tensor in [
@@ -163,6 +187,11 @@ def main() -> int:
         check(f"{name} on cuda + requires_grad",
               tensor.is_cuda and tensor.requires_grad,
               f"device={tensor.device}, requires_grad={tensor.requires_grad}")
+    check("z_log_H_atm / z_logit_cloud are (ny, nx) fields",
+          params.z_log_H_atm.shape == (problem.ny, problem.nx)
+          and params.z_logit_cloud.shape == (problem.ny, problem.nx),
+          f"shapes {tuple(params.z_log_H_atm.shape)}, "
+          f"{tuple(params.z_logit_cloud.shape)}")
 
     header("5. Step scheduler")
     steps = build_step_sequence(t_start=1012.0, t_end=2012.0, dt_max=20.0)
@@ -326,6 +355,15 @@ def main() -> int:
     if dhdt is not None:
         check("dhdt term is active (non-zero)",
               float(loss_terms.data_terms["dhdt"]) != 0.0)
+    # The enthalpy-field priors are 0-d and exactly zero at z = 0 (the field
+    # parametrization coincides with the old scalar one at the prior median).
+    check("J_prior_h_atm / J_prior_cloud are 0-d and zero at z = 0",
+          loss_terms.J_prior_h_atm.dim() == 0
+          and loss_terms.J_prior_cloud.dim() == 0
+          and float(loss_terms.J_prior_h_atm) == 0.0
+          and float(loss_terms.J_prior_cloud) == 0.0,
+          f"J_prior_h_atm = {float(loss_terms.J_prior_h_atm):.4g}, "
+          f"J_prior_cloud = {float(loss_terms.J_prior_cloud):.4g}")
 
     J.backward(retain_graph=True)
     check("z_bed received a finite gradient",
@@ -333,6 +371,13 @@ def main() -> int:
           and torch.isfinite(params.z_bed.grad).all().item(),
           f"grad norm = {params.z_bed.grad.norm().item():.3e}"
           if params.z_bed.grad is not None else "no grad")
+    check("z_log_H_atm received a finite (ny, nx) gradient",
+          params.z_log_H_atm.grad is not None
+          and params.z_log_H_atm.grad.shape == (problem.ny, problem.nx)
+          and torch.isfinite(params.z_log_H_atm.grad).all().item()
+          and params.z_log_H_atm.grad.abs().sum() > 0,
+          f"|grad|_1 = {params.z_log_H_atm.grad.abs().sum().item():.3e}"
+          if params.z_log_H_atm.grad is not None else "no grad")
 
     header("7b. Correlated-noise (MaternNoise) likelihood")
     from glacier_inverse import Schedule
@@ -563,6 +608,46 @@ def main() -> int:
         check("MaternNoise rejects a negative nugget", False)
     except ValueError:
         check("MaternNoise rejects a negative nugget", True)
+
+    header("7d. Checkpoint save/load + scalar->field conversion")
+    import tempfile
+    from glacier_inverse.io import save_whitened_params, load_whitened_params_into
+    with tempfile.TemporaryDirectory() as tdir:
+        ckpt = f"{tdir}/torch_vars.p"
+        save_whitened_params(problem.params, ckpt,
+                             bed_parametrization=problem.priors.bed_parametrization)
+        fresh = problem.params.detach_clone()
+        fresh.z_log_H_atm += 1.0  # ensure the load actually overwrites
+        load_whitened_params_into(fresh, ckpt, priors=problem.priors)
+        check("field checkpoint round-trips (z_log_H_atm bit-identical)",
+              fresh.z_log_H_atm.shape == (problem.ny, problem.nx)
+              and torch.equal(fresh.z_log_H_atm.detach(),
+                              problem.params.z_log_H_atm.detach()))
+
+        # Legacy (pre-field) checkpoint: 0-d scalars, no tag. A constant is
+        # an eigenfunction of the mirror-Neumann Matern operator, so the
+        # whitening step of the conversion is exact; reading it back through
+        # Map (iterative multigrid solves) carries the usual round-trip
+        # error, so the tolerance matches the section-3 round-trip scale.
+        legacy = torch.load(ckpt)
+        del legacy["smb_scalar_parametrization"]
+        z0 = 0.7
+        legacy["log_H_atm"] = torch.tensor(z0, device="cuda")
+        legacy["logit_cloud"] = torch.tensor(-0.3, device="cuda")
+        torch.save(legacy, ckpt)
+        conv = problem.params.detach_clone()
+        load_whitened_params_into(conv, ckpt, priors=problem.priors)
+        if problem.priors.h_atm_model is not None:
+            v = problem.priors.sigma_log_H_atm * z0
+            mapped = GGaPPMap.apply(problem.priors.h_atm_model,
+                                    conv.z_log_H_atm.detach())
+            rel = (mapped - v).abs().max() / abs(v)
+            check("scalar->field conversion reproduces the constant offset",
+                  conv.z_log_H_atm.shape == (problem.ny, problem.nx)
+                  and rel.item() < 2e-2,
+                  f"max |Map(z) - v| / |v| = {rel.item():.3e} "
+                  f"(v = {v:.4g})")
+        del fresh, conv, legacy
 
     header("8. Enthalpy SMB backend")
     try:

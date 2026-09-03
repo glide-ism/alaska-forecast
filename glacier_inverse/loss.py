@@ -93,6 +93,8 @@ class LossTerms:
     J_prior_beta:     torch.Tensor = None
     J_prior_pbias:    torch.Tensor = None
     J_prior_tbias:    torch.Tensor = None
+    J_prior_h_atm:    torch.Tensor = None
+    J_prior_cloud:    torch.Tensor = None
     J_prior_smb:      torch.Tensor = None
 
     def _term(self, name: str):
@@ -121,7 +123,8 @@ class LossTerms:
     @property
     def J_prior(self):
         return (self.J_prior_bed + self.J_prior_bed_mean + self.J_prior_beta
-                + self.J_prior_pbias + self.J_prior_tbias + self.J_prior_smb)
+                + self.J_prior_pbias + self.J_prior_tbias
+                + self.J_prior_h_atm + self.J_prior_cloud + self.J_prior_smb)
 
     @property
     def J(self):
@@ -140,7 +143,9 @@ class LossTerms:
               f"Bed Mean Prior: {float(self.J_prior_bed_mean):.2f}, "
               f"Beta Prior: {float(self.J_prior_beta):.2f}, "
               f"Pbias Prior: {float(self.J_prior_pbias):.2f}, "
-              f"Tbias Prior: {float(self.J_prior_tbias):.2f}")
+              f"Tbias Prior: {float(self.J_prior_tbias):.2f}, "
+              f"H_atm Prior: {float(self.J_prior_h_atm):.2f}, "
+              f"Cloud Prior: {float(self.J_prior_cloud):.2f}")
         print(bar)
 
 
@@ -259,15 +264,18 @@ def compute_prior(
     # is computed unconditionally — exactly zero while the term is disabled
     # (z_tbias stays at 0 and out of the optimizer).
     J_prior_tbias = scale * 0.5 * ((params.z_tbias - prior_means.value("z_tbias", params.z_tbias)) ** 2).sum()
-    # Standard-normal whitened priors on every scalar, including the precip-
-    # depletion tau/z0 and the enthalpy-model H_atm/cloud pair (each inert when
-    # its model/term is disabled: those z stay at 0).
+    # Enthalpy SMB parameter fields (log H_atm, logit clear-sky fraction):
+    # whitened-space terms like tbias — no Matern model needed here, exactly
+    # zero while the fields sit at 0 (ETIM backend, or the prior median).
+    J_prior_h_atm = scale * 0.5 * ((params.z_log_H_atm - prior_means.value("z_log_H_atm", params.z_log_H_atm)) ** 2).sum()
+    J_prior_cloud = scale * 0.5 * ((params.z_logit_cloud - prior_means.value("z_logit_cloud", params.z_logit_cloud)) ** 2).sum()
+    # Standard-normal whitened priors on the remaining scalars (mf/rf and the
+    # precip-depletion tau/z0 — each inert at z = 0 when its model/term is
+    # disabled). The .sum() is a guard: every term here must stay 0-d.
     J_prior_smb = scale * 0.5 * ((params.z_log_rf - prior_means.value("z_log_rf", params.z_log_rf)) ** 2
                    + (params.z_log_mf - prior_means.value("z_log_mf", params.z_log_mf)) ** 2
                    + (params.z_tau - prior_means.value("z_tau", params.z_tau)) ** 2
-                   + (params.z_z0 - prior_means.value("z_z0", params.z_z0)) ** 2
-                   + (params.z_log_H_atm - prior_means.value("z_log_H_atm", params.z_log_H_atm)) ** 2
-                   + (params.z_logit_cloud - prior_means.value("z_logit_cloud", params.z_logit_cloud)) ** 2)
+                   + (params.z_z0 - prior_means.value("z_z0", params.z_z0)) ** 2).sum()
 
     return (J_prior_bed, J_prior_bed_mean, J_prior_beta, J_prior_pbias,
-            J_prior_tbias, J_prior_smb)
+            J_prior_tbias, J_prior_h_atm, J_prior_cloud, J_prior_smb)

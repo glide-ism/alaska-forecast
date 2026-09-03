@@ -307,6 +307,21 @@ class GlacierConfig:
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,      l=1000.0,  nu=1)
     pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
     tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
+    # Priors for the enthalpy SMB parameters, which are (ny, nx) GP FIELDS
+    # (log H_atm and logit clear-sky fraction; medians mu_H_atm /
+    # mu_cloud_factor below). sigma is the pointwise marginal std in log /
+    # logit space — the same number the old scalar priors used, so at a
+    # single point the prior is unchanged; what the field relaxes is the
+    # perfect-correlation-across-the-domain assertion of a scalar. l is
+    # anchored to the physical decorrelation scale of what the parameter
+    # lumps (synoptic cloudiness, orographically organized transfer:
+    # ~50-100 km), NOT to the domain size — that is what makes per-parameter
+    # curvature, learning rates, and prior information domain-size invariant
+    # and the hyperparameters transferable across ranges. nu must be a
+    # positive odd int (ggapp stencil). Active only under
+    # smb_model="enthalpy" (the Matern members are not built otherwise).
+    h_atm_prior:    PriorHyperparams = PriorHyperparams(sigma=0.2,     l=80000.0, nu=1)
+    cloud_prior:    PriorHyperparams = PriorHyperparams(sigma=0.25,    l=80000.0, nu=1)
 
     # Scalar prior mean of the log_beta field: the Matern prior (and its
     # whitened representation) applies to log_beta - mu_log_beta, so the
@@ -363,13 +378,21 @@ class GlacierConfig:
     # q_sw_dif = (f * k_diffuse_clear + (1 - f) * k_diffuse_cloud) * q_sw_clear,
     # both from the same f. Physical values passed to the model are converted
     # to J m-2 yr-1 (K-1) via SECONDS_PER_YEAR.
-    mu_H_atm:          float = 10.0   # W m-2 K-1, prior median
+    mu_H_atm:          float = 10.0   # W m-2 K-1, prior median (of the FIELD)
+    # LEGACY scalar sigma: the pointwise prior std now lives in
+    # h_atm_prior.sigma. This value is used only (a) to convert pre-field
+    # checkpoints (their 0-d z is de-whitened with THIS sigma before being
+    # re-whitened into the field parametrization) and (b) as the affine
+    # fallback in physical_from when no Matern member exists (ETIM domains,
+    # where the field sits inert at 0 anyway).
     sigma_log_H_atm:   float = 0.2
     # Prior median of the clear-sky fraction f. 0.35 ~ interior-Alaska summer
     # cloud fraction 0.65; with k_diffuse_* below it reproduces the station
     # June climatology (horizontal direct ~100, diffuse ~120, global ~220 W m-2
     # at 63 N). Maritime domains sit lower (~0.2).
     mu_cloud_factor:   float = 0.35
+    # LEGACY scalar sigma — same status as sigma_log_H_atm (conversion +
+    # fallback only); the live pointwise std is cloud_prior.sigma.
     sigma_logit_cloud: float = 0.25
 
     # Enthalpy-model fixed constants (not inverted; per-second SI units,
@@ -554,16 +577,23 @@ class GlacierConfig:
     # Per-parameter learning rates. These are tightly coupled to the prior
     # hyperparameters above — in whitened coordinates the natural step is set
     # by the prior curvature, so a domain that changes a prior typically has
-    # to retune the corresponding lr. SGD on the field params, Adam on the
-    # scalar / smooth params.
+    # to retune the corresponding lr. EVERY parameter is optimized by SGD in
+    # whitened coordinates (prior-natural gradient: an SGD step of size lr in
+    # z is a physical step -lr*C*grad, so updates are C-smoothed and
+    # unconstrained directions relax to the prior mean). There is no Adam
+    # block — Adam's per-coordinate RMS normalization equalizes step sizes
+    # across coordinates, which in whitened coordinates erases exactly the
+    # information the whitening encodes and random-walks likelihood-null
+    # directions at its noise floor.
     #
     # Each may be a constant or a Schedule(final=, ramp=) (see SCHEDULABLE_LRS
     # at the top of this module): the ramp is a continuation device for the
     # initial MAP solve only — inverse.py refreshes each optimizer group's lr
     # from `learning_rates(i, level, schedule=True)` every iteration, so a ramp
-    # of 0.0 freezes that parameter (its optimizer state still accumulates,
-    # which warms Adam's moments for when the lr switches on). RTO reads the
-    # steady-state `final` — as with the loss weights, `final` is the contract.
+    # of 0.0 freezes that parameter (its optimizer state — SGD momentum —
+    # still accumulates, so the first live step is well-conditioned). RTO
+    # reads the steady-state `final` — as with the loss weights, `final` is
+    # the contract.
     lr_z_bed:      LearningRate = 0.5
     lr_z_bed_mean: LearningRate = 0.5
     lr_z_log_beta: LearningRate = 0.05
@@ -572,12 +602,16 @@ class GlacierConfig:
     lr_z_tbias:    LearningRate = 0.001
     lr_z_log_mf:   LearningRate = 0.01
     lr_z_log_rf:   LearningRate = 0.01
-    # Enthalpy-model scalars (Adam block, used in place of z_log_mf/z_log_rf
-    # when smb_model == "enthalpy").
-    lr_z_log_H_atm:   LearningRate = 0.05
-    lr_z_logit_cloud: LearningRate = 0.05
-    # Elevation-dependent precip depletion scalars (Adam block, only added to
-    # the optimizer when precip_lapse_enabled). See the prior widths above.
+    # Enthalpy-model GP fields (SGD, used in place of z_log_mf/z_log_rf when
+    # smb_model == "enthalpy"). The 0.05 Adam-era default was retired with the
+    # scalar parametrization: under SGD on a whitened field the data curvature
+    # along the smooth modes is large (see CLAUDE.md on the scalar/field
+    # curvature), so start small and retune on the level-2 trace.
+    lr_z_log_H_atm:   LearningRate = 0.001
+    lr_z_logit_cloud: LearningRate = 0.001
+    # Elevation-dependent precip depletion scalars (SGD like everything else,
+    # only added to the optimizer when precip_lapse_enabled). See the prior
+    # widths above.
     lr_z_tau:      LearningRate = 0.01
     lr_z_z0:       LearningRate = 0.01
 

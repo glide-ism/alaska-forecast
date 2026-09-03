@@ -28,7 +28,13 @@ CONFIG = GlacierConfig(
     # sensible+latent+longwave value and the prior is widened to honest ignorance.
     q_lw0=-40.0,
     mu_H_atm=15.0,
+    # Legacy scalar sigma (checkpoint conversion only); the live pointwise
+    # prior std is h_atm_prior.sigma below.
     sigma_log_H_atm=0.35,
+    # H_atm / clear-sky fraction are (ny,nx) GP fields; sigma preserves the
+    # scalar-era pointwise std, l = the synoptic decorrelation scale.
+    h_atm_prior=PriorHyperparams(sigma=0.35, l=80000.0, nu=1),
+    cloud_prior=PriorHyperparams(sigma=0.25, l=80000.0, nu=1),
     # Shortwave: the inverted scalar f is the CLEAR-SKY fraction (1 - cloud
     # fraction); direct = f*S0*I (S0 = q_sw_clear = 1361, tau^airmass lives in
     # the direct potential I) and diffuse = (f*k_clr + (1-f)*k_cld)*S0*I_dif from
@@ -113,8 +119,10 @@ CONFIG = GlacierConfig(
     max_iters=(50,50,500),
     lr_z_pbias=Schedule(final=0.001, ramp=lambda i,level:0.0 if (i<25 and level==2) else 0.001),
     lr_z_tbias=Schedule(final=0.001,ramp=lambda i,level:0.0 if (i<25 and level==2) else 0.001),
-    lr_z_log_H_atm=Schedule(final=0.05,ramp=lambda i,level:0.0 if (i<25 and level==2) else 0.05),
-    lr_z_logit_cloud=Schedule(final=0.05,ramp=lambda i,level:0.0 if (i<25 and level==2) else 0.05),
+    # SGD-on-whitened-field lrs (the 0.05 finals were Adam-era scalar steps);
+    # start conservative and retune on the level-2 trace.
+    lr_z_log_H_atm=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1e-3),
+    lr_z_logit_cloud=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1e-3),
 )
 
 """

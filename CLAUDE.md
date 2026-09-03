@@ -246,7 +246,7 @@ param group after its config field and calls `refresh_learning_rates(i, level)` 
 every step (`schedule=True`), printing the resolved set whenever it changes;
 `rto_sample.py` builds its optimizers from `learning_rates(schedule=False)`, i.e. `final`.
 A ramp value of `0.0` freezes that parameter for those iterations (optimizer state still
-accumulates — SGD momentum / Adam moments — so the first live step is well-conditioned).
+accumulates — SGD momentum — so the first live step is well-conditioned).
 Because `i` resets per level, "hold the SMB scalars for the first 100 iterations" holds
 them for the first 100 iterations *of each level* unless the ramp also inspects `level`:
 
@@ -366,18 +366,43 @@ t2m is recomputed in backward and only an (ny,nx) gradient leaves each segment),
 spatial time-constant complement of the uniform anomaly record (absorbs
 lapse-correction/DEM error; t_base stays unbiased under the enthalpy backend; the z
 tensor always exists and
-is checkpointed as `"temperature_bias"`, but the Matérn hierarchy, the map, and its Adam
+is checkpointed as `"temperature_bias"`, but the Matérn hierarchy, the map, and its SGD
 group exist only when enabled, so disabled domains are bit-identical; sensitivity.py
-raises on tbias-enabled domains until its 5-block layout is extended) — plus the SMB
-scalars of the active backend: `z_log_mf` (melt factor) and
-`z_log_rf` (radiation factor) under `smb_model="temperature_index"`, or `z_log_H_atm`
-(log of the lumped sensible/longwave transfer coefficient in W m⁻² K⁻¹, prior median
-`mu_H_atm`) and `z_logit_cloud` (logit of the **clear-sky fraction** f = 1 − cloud
-fraction, prior median `mu_cloud_factor`; direct `q_sw_insol = f·S₀` and diffuse
+raises on tbias-enabled **and enthalpy** domains until its 5-block layout is extended) —
+plus the SMB parameters of the active backend: the scalars `z_log_mf` (melt factor) and
+`z_log_rf` (radiation factor) under `smb_model="temperature_index"`, or — under
+`smb_model="enthalpy"` — two more **(ny,nx) whitened GP fields**: `z_log_H_atm`
+(log of the lumped sensible/longwave transfer coefficient in W m⁻² K⁻¹, median
+`mu_H_atm`, Matérn prior `h_atm_prior`) and `z_logit_cloud` (logit of the **clear-sky
+fraction** f = 1 − cloud fraction, median `mu_cloud_factor`, prior `cloud_prior`; direct
+`q_sw_insol = f·S₀` and diffuse
 `q_sw_dif = (f·k_diffuse_clear + (1−f)·k_diffuse_cloud)·S₀` both derive from this one
-scalar, `S₀ = q_sw_clear` = 1361 W m⁻² extraterrestrial — the clear-sky τ^airmass
-attenuation lives in the direct potential, not in the base flux) under
-`smb_model="enthalpy"`. The enthalpy balance is
+field, `S₀ = q_sw_clear` = 1361 W m⁻² extraterrestrial — the clear-sky τ^airmass
+attenuation lives in the direct potential, not in the base flux). **Why fields, not
+scalars**: a scalar is the l→∞ GP limit and collects gradient signal *extensively* in
+domain area (twice the domain, twice the curvature — lr and prior meaning change per
+domain); a fixed-l GP is *intensive* (per-correlation-area curvature constant), so
+`h_atm_prior`/`cloud_prior` hyperparameters and lrs transfer across ranges, and the model
+is one stationary field over Alaska restricted per domain. l ≈ 80 km is the synoptic /
+orographic decorrelation scale of what the parameters lump (which happens to be ~ the
+Delta extent); pointwise σ equals the old scalar σ, so the prior at a single point is
+unchanged — what's relaxed is only the perfect-correlation-across-the-domain assertion.
+Identifiability vs the l = 10 km bias fields: the k ≈ 0 degeneracy existed with the
+scalars too; the (l_long/l_short)² ≈ 60× low-k prior-cost separation routes broad
+patterns to the smooth channel, and the mechanisms differ (H_atm acts on melt-season ΔT,
+tbias shifts the phase partition, pbias is multiplicative). Watch-item: a spatially
+varying H_atm can regionally compensate bed/dynamics error — the fitted physical fields
+are written as `H_atm`/`f_clear` in the per-iteration loss VTIs; inspect them like
+`extent_logit_eps`. Under ETIM the two z fields are inert at 0 and no Matérn members are
+built (`priors.h_atm_model is None`). `sigma_log_H_atm`/`sigma_logit_cloud` are the
+LEGACY scalar σ's, used only for checkpoint conversion and the model-less affine
+fallback. Checkpoints carry a `smb_scalar_parametrization` tag ("field"; untagged reads
+"scalar"): a legacy 0-d z converts **exactly** on load via one whitening — a constant is
+an eigenfunction of the mirror-Neumann Matérn operator (L·𝟙 = κ²·𝟙), so
+`z_field = Whiten(σ_legacy·z0·𝟙)` reproduces the constant physical offset (pass
+`priors=` to `load_whitened_params_into`; reading it back through the iterative Map
+carries the usual sub-percent solve error, larger near the κ² ≈ 1e-9 constant mode at
+l = 80 km — ~5% on delta, ~0.7% in physical H_atm). The enthalpy balance is
 `q = (1−α)(q_sw_bulk + q_sw_insol·I + q_sw_dif·I_dif) + q_lw0 + H_atm(T_air − T_s) + H_base(T_base − T_s)`,
 with `I = monthly_solar_potential_mean` (direct beam: incidence × shadow × τ^m) and
 `I_dif = monthly_diffuse_potential` (isotropic-sky view factor of the tilted,
@@ -393,11 +418,15 @@ latent exchange (clear-sky sky deficit, evaporation into sub-saturated air; nega
 default 0). It matters because without it a calibrated `H_atm` has to absorb the offset
 (fits at ~5 instead of a first-principles ~15 W m⁻² K⁻¹), which flattens the ablation-area
 balance gradient and the melt–temperature sensitivity; read `mu_H_atm` as the ΔT slope
-*given* the offset. All scalar z-tensors always
-exist (inactive ones sit at z = 0 = prior median, contribute zero prior loss, and are
-saved/loaded for checkpoint compatibility); only the active pair joins the Adam block.
-Fields use SGD, smooth/scalar params use Adam (see optimizer setup in
-`inverse.py`/`rto_sample.py`). The enthalpy backend draws one seeded `(12, n_substeps)`
+*given* the offset. All z-tensors always exist (inactive ones sit at z = 0 = prior
+median, contribute zero prior loss, and are saved/loaded for checkpoint compatibility);
+only the active backend's pair joins the optimizer. **Every parameter is SGD in whitened
+coordinates — there is no Adam block** (an SGD step of size η in z is the physical step
+−η·C·∇J: prior-natural gradient, C-smoothed updates, likelihood-null directions relaxing
+to the prior mean; Adam's per-coordinate RMS normalization equalizes step sizes across
+coordinates and thereby erases exactly the information the whitening encodes,
+random-walking unconstrained directions at its noise floor — see optimizer setup in
+`inverse.py`). The enthalpy backend draws one seeded `(12, n_substeps)`
 sub-monthly temperature-deviation realization at problem build (`enthalpy_seed`,
 `enthalpy_n_substeps`) and passes it through `EnthalpyStep` on every call, so the
 checkpointed objective is deterministic (an unseeded redraw would make the checkpoint's
@@ -437,17 +466,20 @@ editing `results_subdir` in the domain config, not the drivers.
    already map the white draws through `GGaPPMap` when a `MaternNoise` model is set, so the
    driver only supplies `randn_like`-shaped fields; append any new
    QMC draws — e.g. the now-available dhdt perturbation — AFTER the existing draw order).
-   The same migration should thread the enthalpy scalars through its five mf/rf touchpoints
-   (`InitScheme`, noise draws, `PriorMeans`, init loop, Adam block — gated on
-   `config.smb_model` like `inverse.py`), again appending new draws after the existing order.
+   The same migration should thread the enthalpy parameters through its five mf/rf
+   touchpoints (`InitScheme`, noise draws, `PriorMeans`, init loop, optimizer group —
+   gated on `config.smb_model` like `inverse.py`; note the pair are (ny,nx) whitened
+   FIELDS now, and there is no Adam block — everything is SGD), again appending new draws
+   after the existing order.
 3. **sensitivity.py** — loads RTO samples, projects forward (default +100 yr), uses
    ∂ΔV/∂(physical param) for a Stein-style information-gain metric. Optimizes in *physical*
    space (via `simulate_physical`), not whitened. Works with the new API via `volumes`
    checkpoints (its Stein denominators read `problem.get_observation("srf").sigma`, the
    marginal std under either error model); pass `record_states_at=[]` for projection
    runs to skip observation snapshots. Its flattened parameter vector hardcodes the
-   five-parameter (bed, pbias, log_beta, log_mf, log_rf) layout — extending it to the
-   enthalpy scalars shifts that index arithmetic.
+   five-parameter (bed, pbias, log_beta, log_mf, log_rf) layout — it raises on
+   tbias-enabled and enthalpy domains (the H_atm/cloud fields would add two (ny,nx)
+   blocks, a seven-block 5·ny·nx layout).
 4. **posterior.py** — empirical posterior covariance (SVD factorization) from RTO samples.
 
 **Tools.** `tools/residual_variograms.py domains/<name> [--results-subdir] [--level]

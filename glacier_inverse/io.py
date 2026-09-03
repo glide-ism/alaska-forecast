@@ -22,6 +22,8 @@ class DiagnosticFields:
     p_bias: Field          # spatial (Matern) log-precip bias only
     p_bias_total: Field    # joint bias: spatial minus elevation-depletion ramp
     t_bias: Field          # additive temperature bias (K); zeros when disabled
+    H_atm: Field           # atmospheric transfer coefficient (W m-2 K-1); zeros under ETIM
+    f_clear: Field         # clear-sky fraction sigmoid(logit_cloud); zeros under ETIM
     dhdt: Field
 
 
@@ -36,7 +38,8 @@ def make_diagnostic_fields(mg_level) -> DiagnosticFields:
         )
     return DiagnosticFields(delta=_empty(), srf=_empty(), bed_mean=_empty(),
                             p_bias=_empty(), p_bias_total=_empty(),
-                            t_bias=_empty(), dhdt=_empty())
+                            t_bias=_empty(), H_atm=_empty(), f_clear=_empty(),
+                            dhdt=_empty())
 
 
 def make_loss_vti_writer(mg_level, output_dir: str, base: str, diag: DiagnosticFields) -> VTIWriter:
@@ -55,6 +58,8 @@ def make_loss_vti_writer(mg_level, output_dir: str, base: str, diag: DiagnosticF
             "p_bias": diag.p_bias,
             "p_bias_total": diag.p_bias_total,
             "t_bias": diag.t_bias,
+            "H_atm": diag.H_atm,
+            "f_clear": diag.f_clear,
             "bed_mean": diag.bed_mean,
             "dhdt": diag.dhdt,
             "smb": mg_level.forcing.smb,
@@ -111,7 +116,8 @@ def write_static_vti(mg_level, output_dir: str, base: str,
 
 
 def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbias_,
-                             pbias_total_, dhdt_, tbias_=None) -> None:
+                             pbias_total_, dhdt_, tbias_=None,
+                             H_atm_=None, f_clear_=None) -> None:
     """Copy detached tensors into the cupy-backed diagnostic Fields.
 
     `pbias_` is the spatial (Matern) log-precip bias; `pbias_total_` is the joint
@@ -133,6 +139,17 @@ def update_diagnostic_fields(diag: DiagnosticFields, S_, S_obs_, bed_mean_, pbia
         diag.t_bias.data[:, :] = 0.0
     else:
         diag.t_bias.data[:, :] = cp.asarray(tbias_.detach())
+    # Fitted enthalpy parameter fields (physical units) — the direct read on
+    # whether the GP scalars are doing climatology or compensating model
+    # error; zeros under the temperature-index backend.
+    if H_atm_ is None:
+        diag.H_atm.data[:, :] = 0.0
+    else:
+        diag.H_atm.data[:, :] = cp.asarray(H_atm_.detach())
+    if f_clear_ is None:
+        diag.f_clear.data[:, :] = 0.0
+    else:
+        diag.f_clear.data[:, :] = cp.asarray(f_clear_.detach())
     diag.dhdt.data[:, :] = cp.asarray(dhdt_.detach())
 
 
@@ -161,6 +178,11 @@ def save_whitened_params(params, path: str, *, extras: dict = None,
         "log_H_atm": params.z_log_H_atm,
         "logit_cloud": params.z_logit_cloud,
         "bed_parametrization": bed_parametrization,
+        # How log_H_atm / logit_cloud are to be interpreted: "field" — (ny,nx)
+        # whitened GP fields (physical = mu + Map(z)). Untagged historical
+        # checkpoints read as "scalar" (0-d z, physical = mu + sigma_legacy*z)
+        # and are converted exactly on load.
+        "smb_scalar_parametrization": "field",
     }
     if extras:
         payload.update(extras)
@@ -213,6 +235,35 @@ def _convert_z_bed(z_bed, saved: str, current: str, priors):
     return torch.tensor(z_new)
 
 
+def _convert_smb_scalar_to_field(z_saved, name, model, legacy_sigma, like):
+    """Convert a legacy 0-d enthalpy-scalar checkpoint entry to the (ny,nx)
+    whitened-field parametrization, preserving the physical value exactly.
+
+    The legacy parametrization was `physical = mu + legacy_sigma * z0`, a
+    spatial constant. A constant plane is an eigenfunction of ggapp's
+    mirror-Neumann Matern operator (Delta·1 = 0, so L·1 = kappa²·1), so the
+    exact pre-image of the same constant offset under the field map is a
+    single whitening application: z = Whiten(model, v·1) — a stencil, no
+    solve. (Reading it back through Map is iterative multigrid and carries
+    the usual sub-percent round-trip error; the checkpoint itself is exact.)
+    Without
+    a Matern member (ETIM build) the affine fallback in physical_from
+    reproduces the constant from z = z0·1 directly.
+    """
+    z0 = float(z_saved.detach())
+    v = float(legacy_sigma) * z0
+    if model is None:
+        z_new = torch.full(like.shape, z0, dtype=torch.float32,
+                           device=like.device)
+    else:
+        const = cp.full((like.shape[0], like.shape[1]), v, dtype=cp.float32)
+        z_new = torch.tensor(model.whiten(const), device=like.device)
+    rms = float(z_new.detach().pow(2).mean().sqrt())
+    print(f"[io] {name}: converted scalar -> field checkpoint entry "
+          f"(z0 = {z0:.4g}, physical offset {v:.4g}, rms(z) = {rms:.3g})")
+    return z_new
+
+
 def load_whitened_params_into(params, path: str, *, priors=None) -> None:
     """In-place load: rebinds the existing parameter tensors so the optimizer
     (constructed afterwards) sees the warm-started values.
@@ -249,7 +300,27 @@ def load_whitened_params_into(params, path: str, *, priors=None) -> None:
         params.z_tau = d["tau"].requires_grad_()
     if "z0" in d:
         params.z_z0 = d["z0"].requires_grad_()
-    if "log_H_atm" in d:
-        params.z_log_H_atm = d["log_H_atm"].requires_grad_()
-    if "logit_cloud" in d:
-        params.z_logit_cloud = d["logit_cloud"].requires_grad_()
+    # Enthalpy SMB parameters: (ny,nx) whitened fields under the current
+    # format ("field"); untagged/pre-field checkpoints hold 0-d scalars and
+    # are converted exactly (see _convert_smb_scalar_to_field). The saved
+    # tensor's dim is the sanity check on the tag.
+    saved_smb = d.get("smb_scalar_parametrization", "scalar")
+    for key, attr, model_name, sigma_name in (
+            ("log_H_atm", "z_log_H_atm", "h_atm_model", "sigma_log_H_atm"),
+            ("logit_cloud", "z_logit_cloud", "cloud_model", "sigma_logit_cloud")):
+        if key not in d:
+            continue
+        z_saved = d[key]
+        if saved_smb == "field" or z_saved.dim() == 2:
+            setattr(params, attr, z_saved.requires_grad_())
+        else:
+            if priors is None:
+                raise ValueError(
+                    f"checkpoint {path} holds a scalar (0-d) {key!r} but the "
+                    f"current parametrization is a (ny,nx) field; pass "
+                    f"priors= to load_whitened_params_into for exact "
+                    f"conversion.")
+            z_new = _convert_smb_scalar_to_field(
+                z_saved, key, getattr(priors, model_name, None),
+                getattr(priors, sigma_name), getattr(params, attr))
+            setattr(params, attr, z_new.requires_grad_())

@@ -617,13 +617,17 @@ class GlacierProblem:
             z_log_mf = (log_mf - priors.mu_log_mf) / priors.sigma_log_mf
             z_log_rf = (log_rf - priors.mu_log_rf) / priors.sigma_log_rf
 
-        # Precip-depletion and enthalpy-model scalars start at the prior mean
-        # (z = 0). The inactive ones are inert, but always present so save/load
-        # and the prior term stay shape-consistent across tasks.
+        # Precip-depletion scalars start at the prior mean (z = 0); inactive
+        # ones are inert, but always present so save/load and the prior term
+        # stay shape-consistent across tasks.
         z_tau = torch.zeros((), dtype=torch.float32, device="cuda")
         z_z0 = torch.zeros((), dtype=torch.float32, device="cuda")
-        z_log_H_atm = torch.zeros((), dtype=torch.float32, device="cuda")
-        z_logit_cloud = torch.zeros((), dtype=torch.float32, device="cuda")
+        # Enthalpy SMB parameter FIELDS (log H_atm, logit clear-sky fraction):
+        # always allocated (ny, nx) like z_tbias — inert at 0 (= the prior
+        # median field) under the temperature-index backend, where no Matern
+        # member exists and they never enter the optimizer.
+        z_log_H_atm = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
+        z_logit_cloud = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
 
         params = WhitenedParameters(
             z_bed=z_bed, z_bed_mean=z_bed_mean, z_log_beta=z_log_beta,
@@ -663,10 +667,19 @@ class GlacierProblem:
         # Precip-depletion scalars: plain affine de-whitening of a normal prior.
         tau = priors.mu_tau + priors.sigma_tau * params.z_tau
         z0 = priors.mu_z0 + priors.sigma_z0 * params.z_z0
-        # Enthalpy-model scalars: log H_atm (in W m-2 K-1) and logit of the
-        # cloud factor. Exponentiation/sigmoid happens in simulate_physical.
-        log_H_atm = priors.mu_log_H_atm + priors.sigma_log_H_atm * params.z_log_H_atm
-        logit_cloud = priors.mu_logit_cloud + priors.sigma_logit_cloud * params.z_logit_cloud
+        # Enthalpy-model parameter fields: log H_atm (in W m-2 K-1) and logit
+        # of the clear-sky fraction — scalar median + smooth GP fluctuation,
+        # the log_beta pattern. Exponentiation/sigmoid happens in
+        # simulate_physical; under ETIM no member exists and the affine
+        # fallback keeps the (inert, z = 0) fields at the median.
+        log_H_atm = priors.mu_log_H_atm + (
+            GGaPPMap.apply(priors.h_atm_model, params.z_log_H_atm)
+            if priors.h_atm_model is not None
+            else priors.sigma_log_H_atm * params.z_log_H_atm)
+        logit_cloud = priors.mu_logit_cloud + (
+            GGaPPMap.apply(priors.cloud_model, params.z_logit_cloud)
+            if priors.cloud_model is not None
+            else priors.sigma_logit_cloud * params.z_logit_cloud)
         return PhysicalParameters(
             bed=bed, bed_mean=bed_mean, log_beta=log_beta,
             pbias=pbias, log_mf=log_mf, log_rf=log_rf, tau=tau, z0=z0,
@@ -937,7 +950,9 @@ class GlacierProblem:
             J_prior_beta=J_prior_terms[2],
             J_prior_pbias=J_prior_terms[3],
             J_prior_tbias=J_prior_terms[4],
-            J_prior_smb=J_prior_terms[5],
+            J_prior_h_atm=J_prior_terms[5],
+            J_prior_cloud=J_prior_terms[6],
+            J_prior_smb=J_prior_terms[7],
         )
 
 

@@ -27,6 +27,13 @@ if config.tbias_enabled:
         "(bed, pbias, log_beta, log_mf, log_rf) and would silently project "
         "without the temperature bias — extend collect_rto_samples and the "
         "downstream index arithmetic before running a tbias-enabled domain.")
+if config.smb_model == "enthalpy":
+    raise NotImplementedError(
+        "sensitivity.py's five-block layout has no blocks for the enthalpy "
+        "parameter fields (log_H_atm, logit_cloud are (ny,nx) GP fields) and "
+        "its PhysicalParameters would hand simulate_physical a None "
+        "log_H_atm — extend the layout to seven blocks (5·ny·nx) before "
+        "running an enthalpy domain.")
 INPUT_PATH = config.output_dir
 OUTPUT_PATH = f"{INPUT_PATH}/sens/"
 LEVEL = 2

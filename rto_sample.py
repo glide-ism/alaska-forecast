@@ -208,7 +208,10 @@ for sample_idx in range(N_SAMPLES):
     # a tbias-enabled domain also needs an eps_z_tbias draw — appended AFTER
     # the existing draw order (like eps_bed_cond below) so QMC dimension
     # assignment stays stable — plus PriorMeans(z_tbias=...), the init loop,
-    # and an Adam group gated on config.tbias_enabled.
+    # and an SGD group gated on config.tbias_enabled (there is no Adam block
+    # anymore — every parameter is SGD in whitened coordinates). Likewise the
+    # enthalpy pair z_log_H_atm/z_logit_cloud are now (ny, nx) whitened GP
+    # FIELDS (draws are randn_like the field), not scalars.
     eps_u_obs      = noise_source.randn_like(problem.observations.u_obs)
     eps_v_obs      = noise_source.randn_like(problem.observations.v_obs)
     eps_S_obs      = noise_source.randn_like(problem.observations.S_obs)

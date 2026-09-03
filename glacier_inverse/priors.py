@@ -202,6 +202,7 @@ class GlacierPriors:
         self.dx = dx
 
         tbias_enabled = getattr(config, "tbias_enabled", False)
+        enthalpy = getattr(config, "smb_model", "temperature_index") == "enthalpy"
         if PriorCollection is not None:
             # All field priors share one multigrid hierarchy + solver: the
             # SPDE solve is stateless between calls, and members differ only
@@ -225,6 +226,14 @@ class GlacierPriors:
             # case stays structurally identical (tbias_model is None).
             self.tbias_model = (_add("tbias", config.tbias_prior)
                                 if tbias_enabled else None)
+            # Enthalpy SMB parameter FIELDS (log H_atm, logit clear-sky
+            # fraction): very smooth GPs (l ~ synoptic scale) replacing the
+            # old scalars — same gate pattern as tbias, keyed to the active
+            # SMB backend.
+            self.h_atm_model = (_add("h_atm", config.h_atm_prior)
+                                if enthalpy else None)
+            self.cloud_model = (_add("cloud", config.cloud_prior)
+                                if enthalpy else None)
         else:
             self.prior_collection = None
             self.bed_model      = _build_matern_prior(config.bed_prior,      config.n_levels, ny, nx, dx)
@@ -236,6 +245,12 @@ class GlacierPriors:
             self.tbias_model = (
                 _build_matern_prior(config.tbias_prior, config.n_levels, ny, nx, dx)
                 if tbias_enabled else None)
+            self.h_atm_model = (
+                _build_matern_prior(config.h_atm_prior, config.n_levels, ny, nx, dx)
+                if enthalpy else None)
+            self.cloud_model = (
+                _build_matern_prior(config.cloud_prior, config.n_levels, ny, nx, dx)
+                if enthalpy else None)
 
         # Correlated observation-error models (MaternNoise on a spec), keyed
         # by product name; see noise_model(). They join the shared collection
@@ -270,9 +285,13 @@ class GlacierPriors:
         self.sigma_log_rf = config.sigma_log_rf
         self.sigma_log_mf = config.sigma_log_mf
 
-        # Enthalpy-model scalars: log-normal on H_atm (in W m-2 K-1) and
-        # logit-normal on the clear-sky fraction f (direct q_sw_insol = f * S0,
-        # diffuse q_sw_dif = (f k_clr + (1 - f) k_cld) * S0 from the same f).
+        # Enthalpy-model parameter fields: log-normal on H_atm (in W m-2 K-1)
+        # and logit-normal on the clear-sky fraction f (direct
+        # q_sw_insol = f * S0, diffuse q_sw_dif = (f k_clr + (1 - f) k_cld) * S0
+        # from the same f). The mu_* are the (spatially constant) medians of
+        # the h_atm_model / cloud_model GP fields; the sigma_* are the LEGACY
+        # scalar stds, kept only for checkpoint conversion and the model-less
+        # affine fallback in physical_from.
         self.mu_log_H_atm = float(np.log(config.mu_H_atm))
         self.sigma_log_H_atm = config.sigma_log_H_atm
         self.mu_logit_cloud = float(
