@@ -125,6 +125,16 @@ def compute_smb_enthalpy(smb_model, t2m, tbias, anomaly_terms, base_anomaly,
     # terms share one effective-precip field, which the glare adjoints
     # re-derive from the raw inputs each backward.
     precip_step = precip_ * precip_multiplier
+    # glare's EnthalpyStep takes H_atm / q_sw_insol / q_sw_dif as (ny, nx)
+    # parameter FIELDS. The scalars are broadcast here, inside the checkpoint
+    # (autograd's expand-backward sums the field gradient onto the 0-d scalar;
+    # the (ny, nx) copies are recomputed in backward, not retained per step).
+    # A future spatially-varying parameter passes through unchanged: expand is
+    # a no-op view on an already-(ny, nx) tensor.
+    shape = t_base.shape
+    H_atm = H_atm.expand(shape).contiguous()
+    q_sw_insol = q_sw_insol.expand(shape).contiguous()
+    q_sw_dif = q_sw_dif.expand(shape).contiguous()
     smb = None
     for a, w in anomaly_terms:
         shift = (a - base_anomaly) if tbias is None else tbias + (a - base_anomaly)
