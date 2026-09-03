@@ -369,9 +369,11 @@ shifted factor `(L+d)²`, `d = (τ/dx)√D`, held in a second multigrid hierarch
 `coefficients.shift` field; zero shift reproduces the plain operator exactly) — every
 solve then takes O(10) iterations independent of data strength, and conditioning costs
 under a second per iteration at St. Elias scale (`"prior"` falls back to the
-C-preconditioner, iterations ~ σ_prior/σ_obs). Enabled for `st_elias`. Beware: this environment can segfault (HDF5) when
-reopening a netCDF after other handles were GC'd — standalone consumers read via the
-eager `_cropped_inputs(config, variables=[...])` load-and-close path, never lazy handles.
+C-preconditioner, iterations ~ σ_prior/σ_obs). Enabled for `st_elias`. Note this HDF5
+stack corrupts state when a netCDF is reopened after other handles on it were GC'd —
+every reader therefore loads eagerly and closes before returning (`_open_eager` in
+problem.py for `GlacierProblem`, `_cropped_inputs(config, variables=[...])` for
+standalone consumers); never hold a long-lived lazy `xr.open_dataset` handle.
 The optimized parameters are the four fields `z_bed`, `z_bed_mean`, `z_log_beta`, `z_pbias`
 (precip bias) — plus, when `tbias_enabled`, a fifth field `z_tbias`: an **additive**
 temperature bias in K (Matérn prior `tbias_prior`, not logarithmized — it may be negative)

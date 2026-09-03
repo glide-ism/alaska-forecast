@@ -149,6 +149,22 @@ def _crop_to_factor(gridded_data: xr.Dataset, factor: int) -> xr.Dataset:
     )
 
 
+def _open_eager(path) -> xr.Dataset:
+    """Read a netCDF fully into memory and CLOSE the file before returning.
+
+    A long-lived lazy handle is a double hazard in this environment: (a)
+    reopening the same file later in the process, after an earlier handle
+    was garbage-collected, corrupts HDF5 state ("NetCDF: HDF error" — this
+    was the smoke test's perpetual section-8 failure when it built a second
+    GlacierProblem); (b) an open handle in an interactive session makes any
+    in-place rewrite of the file truncate it to 0 bytes before the HDF5 lock
+    check fails. Everything downstream works from the in-memory Dataset;
+    the largest domain file is ~1 GB, so the host-RAM cost is modest.
+    """
+    with xr.open_dataset(path) as f:
+        return f.load()
+
+
 class GlacierProblem:
     """Full forward model + observations + whitened parameters."""
 
@@ -157,8 +173,8 @@ class GlacierProblem:
         cfg = config
 
         inputs_dir = Path(cfg.base_dir) / "model_inputs"
-        self.gridded_data = xr.open_dataset(inputs_dir / cfg.gridded_filename)
-        self.temperature_anomaly = xr.open_dataset(inputs_dir / cfg.anomaly_filename)
+        self.gridded_data = _open_eager(inputs_dir / cfg.gridded_filename)
+        self.temperature_anomaly = _open_eager(inputs_dir / cfg.anomaly_filename)
         flightlines_df = gpd.read_file(inputs_dir / cfg.flightline_filename)
 
         self.crs = pyproj.CRS(self.gridded_data.spatial_ref.crs_wkt)
@@ -170,14 +186,14 @@ class GlacierProblem:
         snowline_path = inputs_dir / cfg.snowline_filename
         if snowline_path.exists():
             self.snowline_data = _crop_to_factor(
-                xr.open_dataset(snowline_path), 2 ** cfg.n_levels)
+                _open_eager(snowline_path), 2 ** cfg.n_levels)
         else:
             self.snowline_data = None
 
         debris_path = inputs_dir / cfg.debris_filename
         if debris_path.exists():
             self.debris_data = _crop_to_factor(
-                xr.open_dataset(debris_path), 2 ** cfg.n_levels)
+                _open_eager(debris_path), 2 ** cfg.n_levels)
         else:
             self.debris_data = None
 
@@ -187,7 +203,7 @@ class GlacierProblem:
         dhdt_path = inputs_dir / cfg.dhdt_filename
         if dhdt_path.exists():
             self.dhdt_data = _crop_to_factor(
-                xr.open_dataset(dhdt_path), 2 ** cfg.n_levels)
+                _open_eager(dhdt_path), 2 ** cfg.n_levels)
         else:
             self.dhdt_data = None
 
@@ -254,7 +270,7 @@ class GlacierProblem:
         # scaling on the precip field at each time step.
         precip_anomaly_path = inputs_dir / cfg.precip_anomaly_filename
         if precip_anomaly_path.exists():
-            self.precip_anomaly = xr.open_dataset(precip_anomaly_path)
+            self.precip_anomaly = _open_eager(precip_anomaly_path)
             self.base_precip = self.precip_anomaly.sel(
                 time=cfg.base_precip_year).precip_anomaly.item()
             self.alpha_precip = torch.tensor(cfg.alpha_precip, device="cuda")

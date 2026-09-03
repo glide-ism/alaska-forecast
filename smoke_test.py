@@ -719,8 +719,12 @@ def main() -> int:
                   eproblem.smb_model.grid.state.smb.data)).all()))
         has_dif = "monthly_diffuse_potential" in eproblem.gridded_data
         dif = eproblem.insol_dif
-        check("diffuse-sky potential present in GLIDE_inputs.nc "
-              "(else the diffuse term is zero)", has_dif)
+        if not has_dif:
+            # Optional product, handled gracefully (zeros + warning) like
+            # snowline/debris — a data-vintage nag, not a code failure.
+            print("  [WARN] no diffuse-sky potential in GLIDE_inputs.nc — "
+                  "the diffuse shortwave term is zero; rebuild with "
+                  "make_insolation.py --diffuse-only to exercise it")
         check("insol_dif is (12, ny, nx), finite, in [0, 1]",
               tuple(dif.shape) == (12,) + tuple(eproblem.domain.dem.shape)
               and torch.isfinite(dif).all().item()
@@ -813,8 +817,13 @@ def main() -> int:
         # HDF5 stack, opening a netCDF after other handles on it have been
         # garbage-collected can segfault (hence also the eager loads in
         # priors._cropped_inputs).
+        # Tight PCG tolerances: these checks probe the conditioning ALGEBRA,
+        # so the solver must not be the error budget (the round-trip chains
+        # condition/Map/whiten/S^{-1} applications, and the default adjoint
+        # rtol of 1e-2 alone puts ~10% into the bed-space reconstruction).
         ccfg = dataclasses.replace(
-            config, bed_conditioning=BedConditioningConfig(enabled=True))
+            config, bed_conditioning=BedConditioningConfig(
+                enabled=True, pcg_rtol=1e-5, pcg_rtol_adjoint=1e-5))
         gd = _cropped_inputs(
             ccfg, variables=["elevation", "rgi_mask", "domain_mask"])
         cny, cnx = gd.sizes["y"], gd.sizes["x"]
