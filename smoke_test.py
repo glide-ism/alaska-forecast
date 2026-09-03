@@ -584,6 +584,39 @@ def main() -> int:
     except ValueError:
         check("LogitNuisance rejects a nugget", True)
 
+    # Bounded nuisance (eps_max): ε = eps_max·tanh(u/eps_max). Below the
+    # bound it is the same Gaussian model; a full class flip is unreachable,
+    # so the constrained profile sits between the unbounded profile and the
+    # plain Brier, and |ε| stays strictly inside the bound.
+    ext_bnd = ExtentSpec(weight=2e-4, s_H=10.0, logit_error=nuis_noise,
+                         eps_max=0.5).build(problem.build_ctx)
+    J_b1 = ext_bnd.loss(**kw)
+    J_b = ext_bnd.loss(**kw)   # warm-started second call
+    st_b = ext_bnd.logit_nuisance.last
+    check("bounded nuisance: |eps| <= eps_max and profile between "
+          "unbounded and plain",
+          st_b["eps_absmax"] <= 0.5 + 1e-6
+          and J_b.item() >= J_n2.item() * (1 - 1e-3)
+          and J_b.item() <= J_plain.item() * (1 + 1e-4),
+          f"J_plain={J_plain.item():.3f} >= J_bounded={J_b.item():.3f} >= "
+          f"J_unbounded={J_n2.item():.3f}, |eps|max={st_b['eps_absmax']:.3f}")
+    check("bounded nuisance reports saturation where the data over-asks",
+          st_b.get("saturated_frac", 0.0) > 0.0,
+          f"saturated_frac={st_b.get('saturated_frac'):.3f}")
+    ext_inf = ExtentSpec(weight=2e-4, s_H=10.0, logit_error=nuis_noise,
+                         eps_max=1e6).build(problem.build_ctx)
+    ext_inf.loss(**kw)
+    J_inf = ext_inf.loss(**kw)
+    check("eps_max -> inf recovers the unbounded profile",
+          abs(J_inf.item() - J_n2.item()) < 1e-3 * abs(J_n2.item()) + 1e-4,
+          f"J_inf={J_inf.item():.4f} vs J_unbounded={J_n2.item():.4f}")
+    try:
+        ExtentSpec(weight=2e-4, logit_error=nuis_noise, eps_max=0.0) \
+            .build(problem.build_ctx)
+        check("LogitNuisance rejects eps_max <= 0", False)
+    except ValueError:
+        check("LogitNuisance rejects eps_max <= 0", True)
+
     # sigma_p reparametrization: exactly the legacy weight·dx²/s_B² form
     # under sigma_p = s_B/sqrt(2·w·dx²), and weight == 1 by contract.
     import math as _math

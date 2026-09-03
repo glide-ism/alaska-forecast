@@ -205,22 +205,58 @@ class LogitNuisance:
     profiling is an Occam term whose gradient rewards steepening the
     transition — the BCE sharpness pathology the Brier exists to avoid.
 
-    Per-level state: ε lives on the grid the term is evaluated on; a new
-    level warm-starts from the prolonged coarser ε. ε is not a checkpointed
-    parameter — after a warm start it re-converges within a few iterations.
+    Optional amplitude bound (`eps_max`): a Gaussian ε prices coherence but
+    not cause — its cost is linear in area, exactly like the Brier's, so for
+    any coherent miss larger than l the contest is area-independent and
+    (σ·l vs class-gap·σ_p·dx) decides it for EVERY such feature at once: at
+    honest outline-error σ's, whole missing tongues get explained away and
+    the envelope gradient on the physics collapses. With `eps_max` set the
+    field is saturated, ε = eps_max·tanh(u/eps_max) with u ~ GP(0, Matérn):
+    below the bound this is the same Gaussian model (outline-scale coherent
+    error priced identically), but a full class flip becomes unreachable —
+    p(η+ε) ≤ p(η+eps_max), so a truly missing tongue keeps a floor of Brier
+    residual and gradient forever. Read eps_max as the largest CREDIBLE
+    outline misplacement in logits (≈ 3·δ_max/W_t, with W_t the
+    margin-to-3·s_H transition width); ε̂ pinned at the bound along a feature
+    is the diagnostic for a real outline error larger than δ_max. eps_max =
+    None (default) is the unbounded model, bit-identical to before.
+
+    Per-level state: the latent u lives on the grid the term is evaluated
+    on; a new level warm-starts from the prolonged coarser u. u is not a
+    checkpointed parameter — after a warm start it re-converges within a few
+    iterations.
     """
 
-    def __init__(self, hp: MaternNoise, inner_steps: int = 2):
+    def __init__(self, hp: MaternNoise, inner_steps: int = 2,
+                 eps_max: Optional[float] = None):
         if hp.nugget != 0.0:
             raise ValueError(
                 "LogitNuisance: the logit-error GP is a smooth model-error "
                 "field; a white nugget is meaningless here (the Brier term "
                 "itself prices per-pixel fuzz). Use MaternNoise(nugget=0).")
+        if eps_max is not None and not eps_max > 0.0:
+            raise ValueError(
+                f"LogitNuisance: eps_max must be positive (or None for the "
+                f"unbounded model), got {eps_max!r}.")
         self.hp = hp
         self.inner_steps = inner_steps
+        self.eps_max = eps_max
         self._ops = {}    # level -> SpectralMaternNoise on that grid
-        self._eps = {}    # level -> ε (torch, detached)
+        self._u = {}      # level -> latent u (torch, detached); ε = _eps_of(u)
         self.last = {}
+
+    def _eps_of(self, u):
+        """The logit-error field for latent u (identity when unbounded)."""
+        if self.eps_max is None:
+            return u
+        return self.eps_max * torch.tanh(u / self.eps_max)
+
+    def _deps_du(self, u):
+        """∂ε/∂u = 1 − (ε/eps_max)² (1 when unbounded)."""
+        if self.eps_max is None:
+            return None
+        t = torch.tanh(u / self.eps_max)
+        return 1.0 - t * t
 
     def _op(self, level, ny, nx, dx):
         if level not in self._ops:
@@ -235,61 +271,77 @@ class LogitNuisance:
         return torch.as_tensor(fn(fn(u)), device=v.device)
 
     def eps_at(self, level):
-        return self._eps.get(level)
+        u = self._u.get(level)
+        return None if u is None else self._eps_of(u)
 
     def solve(self, *, level, dx_level, p_g, omega, target, c) -> tuple:
-        """Update and return (ε*, prior_cost) for the current model logits.
+        """Update the latent u and return (ε*, prior_cost) for the current
+        model logits.
 
         `p_g(ε) -> (p, ∂p/∂ε)`; `omega`/`target` the Brier weights/targets on
         the level grid; `c = weight · dx_level² / s_B²` (the resolved Brier
         scale WITHOUT loss_scale, which cancels in the inner problem).
-        All under no_grad; the caller re-evaluates the loss at the returned
-        detached ε with the live graph.
+        The Gauss–Newton runs in u (the GP latent): the model Jacobian is
+        ∂p/∂u = g·(∂ε/∂u), and the prior term is on u — under the bound this
+        is the pushforward prior on ε. All under no_grad; the caller
+        re-evaluates the loss at the returned detached ε with the live graph.
         """
         ny, nx = target.shape
         op = self._op(level, ny, nx, dx_level)
         Q = lambda v: self._apply2(op.whiten, v)
         C = lambda v: self._apply2(op.forward, v)
-        eps = self._eps.get(level)
-        if eps is None:
-            coarser = self._eps.get(level + 1)
+        u = self._u.get(level)
+        if u is None:
+            coarser = self._u.get(level + 1)
             if coarser is not None:
                 from .forward import differentiable_prolongation
-                eps = differentiable_prolongation(coarser, 1).contiguous()
+                u = differentiable_prolongation(coarser, 1).contiguous()
             else:
-                eps = torch.zeros(ny, nx, device=target.device)
+                u = torch.zeros(ny, nx, device=target.device)
 
-        def F(e):
-            p, _ = p_g(e)
+        def F(v):
+            p, _ = p_g(self._eps_of(v))
             return (c * (omega * (p - target) ** 2).sum()
-                    + 0.5 * (e * Q(e)).sum())
+                    + 0.5 * (v * Q(v)).sum())
 
         cg_total = 0
         for _ in range(self.inner_steps):
-            p, g = p_g(eps)
-            D = 2.0 * c * omega * g * g
-            grad_d = 2.0 * c * omega * g * (p - target)
-            new, iters = _pcg(lambda v: Q(v) + D * v, D * eps - grad_d,
-                              C, x0=eps)
+            p, g = p_g(self._eps_of(u))
+            tprime = self._deps_du(u)
+            J = g if tprime is None else g * tprime
+            D = 2.0 * c * omega * J * J
+            grad_d = 2.0 * c * omega * J * (p - target)
+            new, iters = _pcg(lambda v: Q(v) + D * v, D * u - grad_d,
+                              C, x0=u)
             cg_total += iters + 1
-            # Gauss–Newton can overshoot where the sigmoid saturates: damp by
-            # backtracking on the true profile objective.
-            step = new - eps
-            f0 = F(eps)
-            accepted = eps
+            # Gauss–Newton can overshoot where the sigmoid (or the amplitude
+            # bound) saturates: damp by backtracking on the true profile
+            # objective.
+            step = new - u
+            f0 = F(u)
+            accepted = u
             t = 1.0
             for _ in range(4):
-                cand = eps + t * step
+                cand = u + t * step
                 if F(cand) <= f0 + 1e-6 * abs(f0):
                     accepted = cand
                     break
                 t *= 0.5
-            eps = accepted
-        self._eps[level] = eps
-        prior = 0.5 * (eps * Q(eps)).sum()
+            u = accepted
+        self._u[level] = u
+        eps = self._eps_of(u)
+        prior = 0.5 * (u * Q(u)).sum()
         self.last = dict(level=level, cg=cg_total,
                          prior=float(prior),
                          eps_absmax=float(eps.abs().max()))
+        if self.eps_max is not None:
+            # Fraction of the scored region pinned at the bound — the
+            # diagnostic for real outline errors larger than the budget.
+            scored = omega > 0
+            if scored.any():
+                self.last["saturated_frac"] = float(
+                    (eps.abs()[scored] > 0.95 * self.eps_max)
+                    .float().mean())
         return eps, prior
 
 
@@ -1253,6 +1305,16 @@ class ExtentSpec:
     # along-margin coherence of the extent error; nugget must be 0.
     logit_error: Optional[MaternNoise] = None
     nuisance_inner_steps: int = 2
+    # Amplitude bound on the logit-error field (logits): ε = eps_max·tanh(u/
+    # eps_max). Below the bound the Gaussian model is unchanged; full class
+    # flips become unreachable, so a coherent missing tongue keeps a Brier
+    # floor instead of being explained away (the Gaussian cost is linear in
+    # area, like the Brier's, so WITHOUT the bound every coherent miss larger
+    # than l is absorbed or fought as one block, area-independently). Read as
+    # the largest credible outline misplacement: eps_max ≈ 3·δ_max/W_t with
+    # W_t the margin transition width (distance for H to reach ~3·s_H).
+    # None = unbounded (the historical model).
+    eps_max: Optional[float] = None
     # Per-pixel class-probability noise std (the white component of the error
     # model). Setting it replaces the legacy weight·dx²/s_B² scale with
     # 4^L/(2σ_p²) and pins weight == 1 by contract (GlacierProblem raises);
@@ -1266,7 +1328,8 @@ class ExtentSpec:
         smb_dt = cfg.dt if self.smb_dt is None else self.smb_dt
         if self.sigma_p is not None and not self.sigma_p > 0.0:
             raise ValueError(f"ExtentSpec.sigma_p must be > 0, got {self.sigma_p}")
-        nuis = (LogitNuisance(self.logit_error, self.nuisance_inner_steps)
+        nuis = (LogitNuisance(self.logit_error, self.nuisance_inner_steps,
+                              eps_max=self.eps_max)
                 if self.logit_error is not None else None)
         return ExtentObservation(time=time, s_H=self.s_H, smb_dt=smb_dt,
                                  weight=self.weight, two_sided=self.two_sided,
@@ -1307,6 +1370,9 @@ class SnowlineSpec:
     # sigma in logit units (ELA shift ΔELA·|∂smb/∂z|/s_smb); nugget must be 0.
     logit_error: Optional[MaternNoise] = None
     nuisance_inner_steps: int = 2
+    # Amplitude bound on the logit-error field (see ExtentSpec.eps_max): the
+    # largest credible coherent ELA misplacement in logits; None = unbounded.
+    eps_max: Optional[float] = None
     # Per-pixel snow-fraction noise std; same contract as ExtentSpec.sigma_p
     # (legacy weight ↔ σ_p = 0.25/√(2·weight·dx²)).
     sigma_p: Optional[float] = None
@@ -1340,7 +1406,8 @@ class SnowlineSpec:
             snow_label=snow_label, snow_mask=snow_mask, time=time,
             s_smb=self.s_smb, weight=self.weight, two_sided=self.two_sided,
             logit_nuisance=(LogitNuisance(self.logit_error,
-                                          self.nuisance_inner_steps)
+                                          self.nuisance_inner_steps,
+                                          eps_max=self.eps_max)
                             if self.logit_error is not None else None),
             sigma_p=self.sigma_p)
 

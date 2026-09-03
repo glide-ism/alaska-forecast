@@ -202,12 +202,28 @@ pixel errors average under restriction — level-consistent with no dx²) and pi
 `weight == 1` under the same contract as the field terms (legacy weight ↔ σ_p =
 s_B/√(2·weight·dx²); the historical 2e-5 was σ_p ≈ 0.88, near-uninformative pixels). The
 fitted ε̂ lands in `residuals.pvd` as `extent_logit_eps`/`snow_logit_eps` — the map of coherent
-extent/snowline model error; check it for small glaciers being "explained away" (a
-glacier ≲ l is one correlation area — on delta's old MAP σ = 3/2 absorbs most of both
-terms, so σ is the knob balancing outline trust against the anti-disappearance role of
-the one-sided extent term). Fixed points match the joint-MAP nuisance formulation; the
-profile just feels the correctly discounted objective from iteration 0. Enabled for
-delta (extent σ 3, l 2 km; snowline σ 2, l 3 km; both σ_p 0.3).
+extent/snowline model error; check it for glaciers being "explained away". **A Gaussian ε
+prices coherence, not cause**: its cost is linear in area exactly like the Brier's, so
+for any coherent miss larger than l the contest is area-independent — absorption wins iff
+`σ·l ≳ 0.8·a·σ_p·dx` (a = the logit gap, ≈ 3 for a full class flip at `s_H`; ≈ 65
+m·logits at σ_p 0.3, dx 90) — and at any honest outline-error σ that condition holds, so
+whole missing tongues are absorbed and the envelope gradient on the physics collapses
+(denali: Ruth/Tokositna/Eldridge at |ε̂| ≈ 4; features below w* ≈ √(a·σ_p·dx·l/σ) ~ 500 m
+are retained by the (l/w)² anti-smoothness penalty). **`eps_max`** (per spec) is the fix:
+ε = eps_max·tanh(u/eps_max) with u ~ GP — below the bound the Gaussian model is
+unchanged; a full flip becomes unreachable, so p(η+ε) ≤ p(η+eps_max) and a truly missing
+tongue keeps a permanent Brier floor and gradient (at eps_max = 1, s_H = 10: p_dyn caps
+at 0.46 over missing ice — ~88% of the plain-Brier objective retained on the wrangell
+smoke vs ~2% unbounded). Read eps_max as the largest *credible* outline misplacement in
+logits (≈ 3·δ_max/W_t, W_t = margin-to-3·s_H transition width; note a δ-m stale outline
+and a δ-m model shortfall need the *same* ε — amplitude can't separate them, the bound
+just caps the damage at the trust level you choose). The GN runs in the latent u
+(Jacobian gains the factor 1 − (ε/eps_max)²; same PCG, same warm starts);
+`last["saturated_frac"]` and ε̂ pinned at the bound flag real outline errors larger than
+δ_max; `eps_max=None` (default) is the historical unbounded model, bit-identical. Fixed
+points match the joint-MAP nuisance formulation; the profile just feels the correctly
+discounted objective from iteration 0. Enabled for delta (both terms σ 0.3, l 1 km, σ_p
+0.3, unbounded) and denali (same + `eps_max=1.0`).
 
 **Schedulable loss weights (continuation, inverse-only).** Per-observation weights
 (`weight=` on each spec) and the global `loss_scale` may be a constant *or* a
