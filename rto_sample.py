@@ -213,7 +213,7 @@ for sample_idx in range(N_SAMPLES):
     # enthalpy pair z_log_H_atm/z_logit_cloud are now (ny, nx) whitened GP
     # FIELDS (draws are randn_like the field), not scalars. The migration
     # must also apply config.smb_data_influence (semi-modular eta) to that
-    # block's data gradient per step — loss.apply_smb_influence, as in
+    # block's data gradient per step — loss.apply_influence_control (eta and influence_cap), as in
     # inverse.py — so samples target the same semi-modular posterior the
     # MAP converged to.
     eps_u_obs      = noise_source.randn_like(problem.observations.u_obs)

@@ -433,8 +433,32 @@ class GlacierConfig:
     # equilibrium is a fixed point of a non-conservative field (same formal
     # status as the warm-started profiled nuisances); the pull-table
     # stationarity test still applies blockwise. RTO must apply the same eta
-    # when it is migrated (noted in rto_sample.py).
+    # when it is migrated (noted in rto_sample.py). CAUTION: the balancing
+    # eta scales with the state-dependent misspecified pull AND with
+    # loss_scale-vs-whitened units (a 1e-3 factor that has already been
+    # fumbled once) — prefer influence_cap below, which needs neither.
     smb_data_influence: float = 1.0
+    # Bounded-influence (robust) cap on the whitened data score, per
+    # parameter: {z_attr_name: C_z} with C_z in PRIOR-STD units, e.g.
+    # {"z_log_H_atm": 2.0, "z_logit_cloud": 2.0}. The block's data gradient
+    # is radially saturated at loss_scale*C_z (tanh), i.e. ADAPTIVE
+    # tempering eta(w) = tanh(x)/x: inside the prior's C_z contour the
+    # likelihood acts essentially unmodified; demands that would carry the
+    # block outside its typical set are discounted as implausible requests
+    # of the misspecified model. Equilibrium theorem: at stationarity
+    # ||z*|| <= C_z regardless of the misspecification magnitude — the
+    # bound is stated in prior geometry, needs no pull-table calibration,
+    # and transfers across domains unchanged. Direction preserved. Lineage:
+    # bounded influence functions (Huber's psi), generalized Bayes under
+    # misspecification (Jewson, Smith & Holmes 2018; beta/gamma-divergence
+    # posteriors). Behaviorally, a saturated cap pins the block near the
+    # C_z contour — an emergent soft boundary, justified likelihood-side
+    # (the prior itself is untouched, and a well-specified likelihood with
+    # modest demands never feels it). Leave parameters DESIGNED to absorb
+    # local structural error (tbias, log_beta, pbias) uncapped. The
+    # saturation factor x is printed by inverse.py as the audit trail.
+    # See loss.apply_influence_control.
+    influence_cap: Optional[dict] = None
 
     # Scalar prior mean of the log_beta field: the Matern prior (and its
     # whitened representation) applies to log_beta - mu_log_beta, so the

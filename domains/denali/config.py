@@ -23,7 +23,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="denali",
-    results_subdir="inverse_discrepency_v2",
+    results_subdir="inverse_tempered",
     smb_model = "enthalpy",
     q_lw0=-40.0,
     mu_H_atm=15.0,
@@ -35,15 +35,16 @@ CONFIG = GlacierConfig(
     # l = the synoptic/orographic decorrelation scale.
     h_atm_prior=PriorHyperparams(sigma=0.2, l=80000.0, nu=1),
     cloud_prior=PriorHyperparams(sigma=0.25, l=80000.0, nu=1),
-    # Semi-modular influence of the data on the H_atm/f block: the measured
-    # pull on these parameters is ~1e2 per prior std (pull table; extent-
-    # dominated, ~75 after extent sigma_p=0.5) against the prior's ~1 — an
-    # exchange rate the misspecified melt channel hasn't earned. eta = 0.01
-    # makes the block's data and prior pulls comparable; the fields still
-    # see the full posterior. Verify with the pull table at the new
-    # equilibrium (total block pull O(1) at stationarity). See
-    # GlacierConfig.smb_data_influence for semantics and references.
-    smb_data_influence=0.01,
+    # Bounded-influence cap on the H_atm/f blocks (supersedes the eta
+    # experiment, whose balancing value scales with the state-dependent
+    # pull and was mis-calibrated once already): the whitened data score is
+    # tanh-saturated at C_z prior-stds, so at stationarity ||z|| <= C_z
+    # regardless of how hard the misspecified melt channels push (measured
+    # pull/prior ratio ~1e4-1e5). Inside the C_z contour the likelihood
+    # acts nearly unmodified; the saturation factor printed by inverse.py
+    # is the implausibility audit. tbias/log_beta/pbias stay uncapped —
+    # they are designed to absorb local structural error.
+    influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud": 2.0},
     # Shortwave: the inverted scalar f is the CLEAR-SKY fraction (1 - cloud
     # fraction); direct = f*S0*I (S0 = q_sw_clear = 1361, tau^airmass lives in
     # the direct potential I) and diffuse = (f*k_clr + (1-f)*k_cld)*S0*I_dif from
@@ -82,7 +83,7 @@ CONFIG = GlacierConfig(
         # outlines to ~W_t/3 (~100 m of margin at a 300 m transition width);
         # check last["saturated_frac"] / eps pinned at the bound in
         # extent_logit_eps for real outline errors larger than that.
-        ExtentSpec(weight=1.0, s_H=10.0, sigma_p=0.5,
+        ExtentSpec(weight=1.0, s_H=10.0, sigma_p=0.3,
                    logit_error=MaternNoise(sigma=0.3, l=1000.0),
                    nuisance_inner_steps=2, eps_max=1.0),
         BedSpec(weight=0.0e-6),
@@ -126,11 +127,11 @@ CONFIG = GlacierConfig(
     lr_z_log_beta=0.05*9*9,
     max_level=2,
     max_iters=(50,50,500),
-    lr_z_pbias=Schedule(final=0.05, ramp=lambda i,level:0.0 if (i<25 and level==2) else 0.05),
-    lr_z_tbias=Schedule(final=1.0,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1.0),
+    lr_z_pbias=Schedule(final=0.05, ramp=lambda i,level:0.0 if (i<0 and level==2) else 0.05),
+    lr_z_tbias=Schedule(final=1.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1.0),
     # SGD-on-whitened-field lrs (the 0.05 finals were Adam-era scalar steps);
     # start conservative and retune on the level-2 trace.
-    lr_z_log_H_atm=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1e-3),
-    lr_z_logit_cloud=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1e-3),
+    lr_z_log_H_atm=Schedule(final=1e-1,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1e-1),
+    lr_z_logit_cloud=Schedule(final=5e-0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 5e-0),
 )
 

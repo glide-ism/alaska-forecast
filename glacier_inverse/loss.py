@@ -6,6 +6,7 @@ The per-product data misfits live on the Observation subclasses in
 terms, and the `LossTerms` container. The same loss is used by deterministic
 MAP (zero prior means) and RTO sampling (non-zero whitened-space means).
 """
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -149,36 +150,86 @@ class LossTerms:
         print(bar)
 
 
-def apply_smb_influence(params, *, eta: float, loss_scale: float) -> None:
-    """Semi-modular gradient surgery for the enthalpy SMB parameter block.
+_SMB_BLOCK = ("z_log_H_atm", "z_logit_cloud")
 
-    After a full backward pass, rescale the DATA component of the gradient on
-    z_log_H_atm / z_logit_cloud by eta while leaving the prior component (and
-    every other parameter) untouched:
 
-        g  <-  eta * (g - g_prior) + g_prior,   g_prior = loss_scale * z
+def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
+                            caps: dict = None) -> dict:
+    """Likelihood-side influence control on whitened parameter blocks —
+    gradient surgery after a full backward pass. Two mechanisms, composable:
 
-    (exact: the whitened prior is loss_scale * 0.5 * ||z||^2 with zero mean
-    in the MAP solve, so its gradient is analytic and separable from the one
-    backward pass). The resulting fixed point is the parameter-blocked
-    semi-modular posterior — fields under the full posterior, this block
-    under prior * likelihood^eta given the fields; see
-    GlacierConfig.smb_data_influence for semantics, references, and how to
-    choose eta. eta = 1 is a no-op (full Bayes); eta = 0 freezes the block's
-    data response exactly (cut posterior).
+    * `eta` — semi-modular tempering of the enthalpy SMB block
+      (z_log_H_atm, z_logit_cloud): the DATA component of the gradient is
+      scaled by eta, the prior component untouched. eta = 1 no-op (full
+      Bayes), eta = 0 cut posterior. Fragile in practice: the balancing eta
+      scales with the (state-dependent) misspecified pull, so it needs
+      per-problem calibration.
+
+    * `caps` — bounded-influence (robust, Huber-psi-style) cap, per
+      parameter: {z_attr_name: C_z} with C_z in PRIOR-STD units. The block's
+      whitened data score is radially saturated,
+
+          g_data  <-  C~ * tanh(|g_data| / C~) * g_data/|g_data|,
+          C~ = loss_scale * C_z,
+
+      i.e. adaptive tempering eta(w) = tanh(x)/x, x = |g_data|/C~: inside
+      the prior's C_z contour the likelihood acts essentially unmodified; a
+      demand that would carry the block outside its typical set is discounted
+      as an implausible request of the misspecified model. Equilibrium
+      theorem: at stationarity g_prior = -capped(g_data), so
+      ||z*|| <= C_z REGARDLESS of the misspecification magnitude — the
+      bound is stated in prior geometry and transfers across domains
+      unchanged. Direction is preserved (the data still says WHERE, just not
+      how far). Lineage: bounded influence functions (Huber), generalized
+      Bayes under misspecification (Jewson, Smith & Holmes 2018;
+      beta/gamma-divergence posteriors). Leave parameters DESIGNED to absorb
+      structural error (tbias, log_beta, pbias) uncapped.
+
+    In both cases the prior gradient is analytic (loss_scale * z, zero mean
+    in the MAP solve) so the data component separates exactly from one
+    backward pass. When both are set for a parameter, eta applies first,
+    then the cap. The fixed point is that of a non-conservative field (same
+    formal status as the warm-started profiled nuisances); the pull-table
+    stationarity test applies blockwise.
+
+    Returns {name: x} saturation factors (x = |g_data|/C~) for the capped
+    parameters — the audit trail of how implausible the likelihood's current
+    request is (x <= 1: essentially full Bayes; x >> 1: pinned near the C_z
+    contour).
     """
     if not (0.0 <= eta <= 1.0):
         raise ValueError(
             f"smb_data_influence must be in [0, 1] (1 = full Bayes, "
             f"0 = cut posterior), got {eta!r}")
-    if eta == 1.0:
-        return
+    caps = caps or {}
+    for name, C in caps.items():
+        if not hasattr(params, name):
+            raise ValueError(
+                f"influence_cap key {name!r} is not a whitened parameter "
+                f"(expected a WhitenedParameters attribute name like "
+                f"'z_log_H_atm')")
+        if not (C > 0.0):
+            raise ValueError(f"influence_cap[{name!r}] must be > 0, got {C!r}")
+    sat = {}
     with torch.no_grad():
-        for z in (params.z_log_H_atm, params.z_logit_cloud):
+        for name in dict.fromkeys(list(_SMB_BLOCK) + list(caps)):
+            z = getattr(params, name)
             if z.grad is None:
                 continue
             g_prior = loss_scale * z.detach()
-            z.grad.sub_(g_prior).mul_(eta).add_(g_prior)
+            g_data = z.grad - g_prior
+            if name in _SMB_BLOCK and eta != 1.0:
+                g_data = eta * g_data
+            C = caps.get(name)
+            if C is not None:
+                C_t = loss_scale * C
+                n = float(g_data.norm())
+                x = n / C_t
+                sat[name] = x
+                if n > 0.0:
+                    g_data = g_data * (C_t * math.tanh(x) / n)
+            z.grad.copy_(g_data + g_prior)
+    return sat
 
 
 def marginal_velocity_log_likelihood(

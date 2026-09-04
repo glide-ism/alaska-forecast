@@ -258,7 +258,24 @@ fixed point of a non-conservative field (same status as the warm-started profile
 nuisances). Within-domain posterior *width* along these directions remains
 uninterpretable regardless — the honest width is the cross-range scatter of the fitted
 parameters (the all-Alaska replication). RTO must apply the same η when migrated.
-Enabled for denali (η = 0.01).
+**Caveat that bit once**: the balancing η is `loss_scale`-unit-sensitive and scales with
+the state-dependent pull (the pull table is in J units where the prior's 1σ pull is
+`loss_scale·1` = 1e-3, so pull-parity needs η ~ 1e-5–1e-4, not 1e-2) — prefer the cap
+below. **`influence_cap` (bounded-influence cap — the recommended mechanism)**:
+`{z_attr_name: C_z}` in PRIOR-STD units; the block's whitened data score is radially
+tanh-saturated at `loss_scale·C_z` — adaptive tempering η(w) = tanh(x)/x that is ≈ 1 for
+plausible demands and engages only under saturation. Equilibrium theorem: at
+stationarity ‖z*‖ ≤ C_z *regardless of the misspecification magnitude* — the bound is
+stated in prior geometry, needs no pull-table calibration, and transfers across domains
+unchanged (a saturated cap behaves as an emergent soft boundary at the C_z contour,
+justified likelihood-side; a well-specified likelihood never feels it). Direction
+preserved; per-GP-block norms; lineage: Huber's bounded influence functions,
+generalized Bayes under misspecification (Jewson–Smith–Holmes 2018, β/γ-divergence
+posteriors). Both mechanisms live in `loss.apply_influence_control` (exact surgery; η
+first, then cap; returns saturation factors x = the implausibility audit, printed by
+`inverse.py` every 25 iters). Leave parameters *designed* to absorb local structural
+error (tbias, log_beta, pbias) uncapped. Enabled for denali
+(`influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud": 2.0}`, η retired).
 
 **Profiled logit nuisance for the Brier terms (`LogitNuisance`).** `ExtentSpec` and
 `SnowlineSpec` accept `logit_error=MaternNoise(sigma, l, nu)` (nugget must be 0; σ in
