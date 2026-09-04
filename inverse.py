@@ -10,7 +10,9 @@ import torch
 import xarray as xr
 
 from glacier_inverse import GlacierProblem, load_config
+from glacier_inverse.config import resolve_weight
 from glacier_inverse.forward import differentiable_restriction
+from glacier_inverse.loss import apply_smb_influence
 from glacier_inverse.io import (
     load_whitened_params_into, make_diagnostic_fields, make_loss_vti_writer,
     make_time_vti_writer, save_whitened_params, update_diagnostic_fields,
@@ -172,6 +174,15 @@ for level in range(config.max_level, config.min_level - 1, -1):
         write_loss_vti(diag, vti_writer, sim, physical, level, i)
         
         loss_terms.J.backward()
+        # Semi-modular influence on the enthalpy SMB block: rescale that
+        # block's DATA gradient by eta, prior gradient untouched (exact —
+        # the whitened prior gradient is analytic). No-op at eta = 1.
+        # See GlacierConfig.smb_data_influence.
+        if config.smb_model == "enthalpy" and config.smb_data_influence != 1.0:
+            apply_smb_influence(
+                params, eta=config.smb_data_influence,
+                loss_scale=resolve_weight(config.loss_scale, i, level,
+                                          schedule=True, what="loss_scale"))
         optimizer_sgd.step()
         #optimizer_adam.step()
 

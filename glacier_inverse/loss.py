@@ -149,6 +149,38 @@ class LossTerms:
         print(bar)
 
 
+def apply_smb_influence(params, *, eta: float, loss_scale: float) -> None:
+    """Semi-modular gradient surgery for the enthalpy SMB parameter block.
+
+    After a full backward pass, rescale the DATA component of the gradient on
+    z_log_H_atm / z_logit_cloud by eta while leaving the prior component (and
+    every other parameter) untouched:
+
+        g  <-  eta * (g - g_prior) + g_prior,   g_prior = loss_scale * z
+
+    (exact: the whitened prior is loss_scale * 0.5 * ||z||^2 with zero mean
+    in the MAP solve, so its gradient is analytic and separable from the one
+    backward pass). The resulting fixed point is the parameter-blocked
+    semi-modular posterior — fields under the full posterior, this block
+    under prior * likelihood^eta given the fields; see
+    GlacierConfig.smb_data_influence for semantics, references, and how to
+    choose eta. eta = 1 is a no-op (full Bayes); eta = 0 freezes the block's
+    data response exactly (cut posterior).
+    """
+    if not (0.0 <= eta <= 1.0):
+        raise ValueError(
+            f"smb_data_influence must be in [0, 1] (1 = full Bayes, "
+            f"0 = cut posterior), got {eta!r}")
+    if eta == 1.0:
+        return
+    with torch.no_grad():
+        for z in (params.z_log_H_atm, params.z_logit_cloud):
+            if z.grad is None:
+                continue
+            g_prior = loss_scale * z.detach()
+            z.grad.sub_(g_prior).mul_(eta).add_(g_prior)
+
+
 def marginal_velocity_log_likelihood(
     u_obs,          # (N, 2) observed velocity, flattened raster
     u_mod,          # (N, 2) modeled velocity

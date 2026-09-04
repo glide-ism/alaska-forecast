@@ -23,12 +23,8 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="denali",
-    results_subdir="inverse_discrepency",
+    results_subdir="inverse_discrepency_v2",
     smb_model = "enthalpy",
-    # Constant (non-albedo-scaled) surface-flux offset: a-priori interior sky
-    # longwave deficit + evaporative cooling. With the offset explicit, H_atm is
-    # the pure dT slope, so its prior median moves to the first-principles
-    # sensible+latent+longwave value and the prior is widened to honest ignorance.
     q_lw0=-40.0,
     mu_H_atm=15.0,
     # Legacy scalar sigma (checkpoint conversion only); the live pointwise
@@ -39,17 +35,15 @@ CONFIG = GlacierConfig(
     # l = the synoptic/orographic decorrelation scale.
     h_atm_prior=PriorHyperparams(sigma=0.2, l=80000.0, nu=1),
     cloud_prior=PriorHyperparams(sigma=0.25, l=80000.0, nu=1),
-    # Rank-few model-error marginalization along the measured H_atm/f
-    # sensitivity fingerprints (leading prior modes, whitened units): the
-    # srf/dhdt data may at most double the prior precision on these modes
-    # (s = 1 -> info floor 1/s^2 = one prior's worth), instead of the
-    # measured 10^4-10^6x pinning. The fitted c-hat (printed at each
-    # refresh) is the amount of each parameter's pattern attributed to
-    # model error, in prior-std units. refresh=0: re-measure fingerprints
-    # at each level start only.
-    fingerprint_nuisance=FingerprintNuisance(
-        params=("log_H_atm", "logit_cloud"), s=(1.0, 1.0),
-        n_modes=4, refresh=0),
+    # Semi-modular influence of the data on the H_atm/f block: the measured
+    # pull on these parameters is ~1e2 per prior std (pull table; extent-
+    # dominated, ~75 after extent sigma_p=0.5) against the prior's ~1 — an
+    # exchange rate the misspecified melt channel hasn't earned. eta = 0.01
+    # makes the block's data and prior pulls comparable; the fields still
+    # see the full posterior. Verify with the pull table at the new
+    # equilibrium (total block pull O(1) at stationarity). See
+    # GlacierConfig.smb_data_influence for semantics and references.
+    smb_data_influence=0.01,
     # Shortwave: the inverted scalar f is the CLEAR-SKY fraction (1 - cloud
     # fraction); direct = f*S0*I (S0 = q_sw_clear = 1361, tau^airmass lives in
     # the direct potential I) and diffuse = (f*k_clr + (1-f)*k_cld)*S0*I_dif from
@@ -76,12 +70,9 @@ CONFIG = GlacierConfig(
         # n~1 samples at 80 km). Fine-scale weight (what constrains bed/beta)
         # is untouched. This is what stops the smooth SMB fields being pinned
         # through the domain-mean surface channel.
-        SurfaceSpec(noise=MaternNoise(sigma=12.0, l=1000.0, nu=0.5, nugget=10.0,
-                                      discrepancy=MaternNoise(sigma=20.0, l=80000.0, nu=1.0)),
+        SurfaceSpec(noise=MaternNoise(sigma=12.0, l=1000.0, nu=0.5, nugget=10.0),
                     weight=1.0, nu=3),
-        VelocitySpec(noise=MaternNoise(sigma=12.0, l=3000.0, nugget=10.0,
-        discrepancy=MaternNoise(sigma=20.0, l=80000.0, nu=1.0)
-), weight=1.0,
+        VelocitySpec(noise=MaternNoise(sigma=12.0, l=3000.0, nugget=10.0), weight=1.0,
                      surge_biased=True, nu=3, alpha_nonsurge=20),
         # eps_max bounds the coherent logit error (eps = eps_max*tanh(u/
         # eps_max)): below the bound the Gaussian model is unchanged, but a
@@ -91,7 +82,7 @@ CONFIG = GlacierConfig(
         # outlines to ~W_t/3 (~100 m of margin at a 300 m transition width);
         # check last["saturated_frac"] / eps pinned at the bound in
         # extent_logit_eps for real outline errors larger than that.
-        ExtentSpec(weight=1.0, s_H=10.0, sigma_p=0.3,
+        ExtentSpec(weight=1.0, s_H=10.0, sigma_p=0.5,
                    logit_error=MaternNoise(sigma=0.3, l=1000.0),
                    nuisance_inner_steps=2, eps_max=1.0),
         BedSpec(weight=0.0e-6),
@@ -107,8 +98,7 @@ CONFIG = GlacierConfig(
         # This is the domain-mean melt-rate channel through which the smooth
         # SMB fields (H_atm, f) were pinned; the experiment tests whether
         # that pinning was real.
-        DhdtSpec(noise=MaternNoise(sigma=0.5, l=3000.0, nu=0.5, nugget=0.5,
-                                   discrepancy=MaternNoise(sigma=1.0, l=80000.0, nu=1.0)),
+        DhdtSpec(noise=MaternNoise(sigma=0.5, l=3000.0, nu=0.5, nugget=0.5),
                  weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0)),
         BedSlopeSpec(weight=1e-5,s_scale=5.0),
     ),
@@ -136,11 +126,11 @@ CONFIG = GlacierConfig(
     lr_z_log_beta=0.05*9*9,
     max_level=2,
     max_iters=(50,50,500),
-    lr_z_pbias=Schedule(final=0.05, ramp=lambda i,level:0.0 if (i<0 and level==2) else 0.05),
-    lr_z_tbias=Schedule(final=1.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1.0),
+    lr_z_pbias=Schedule(final=0.05, ramp=lambda i,level:0.0 if (i<25 and level==2) else 0.05),
+    lr_z_tbias=Schedule(final=1.0,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1.0),
     # SGD-on-whitened-field lrs (the 0.05 finals were Adam-era scalar steps);
     # start conservative and retune on the level-2 trace.
-    lr_z_log_H_atm=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1e-3),
-    lr_z_logit_cloud=Schedule(final=1e-1,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1e-1),
+    lr_z_log_H_atm=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1e-3),
+    lr_z_logit_cloud=Schedule(final=1e-3,ramp=lambda i,level:0.0 if (i<25 and level==2) else 1e-3),
 )
 

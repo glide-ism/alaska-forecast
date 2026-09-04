@@ -225,8 +225,40 @@ balance. Velocity is deliberately excluded (its surge marginal's per-glacier η 
 absorbs glacier speed levels; needs its own treatment). Not a KOH method per se:
 confounding phenomenology per Brynjarsdóttir & O'Hagan (2014), span geometry the mirror
 of Plumlee (2017)'s orthogonal discrepancy, downdate algebra = astrophysics template
-marginalization (Rybicki & Press 1992; van Haasteren & Levin 2013). Enabled for denali
-(both params, s = 1, n_modes = 4, refresh at level starts).
+marginalization (Rybicki & Press 1992; van Haasteren & Levin 2013). **Currently disabled
+everywhere**: applied to srf/dhdt only it caused runaway (it marginalized the
+*restraints*; the pull table showed the dominant pusher is the extent term, +190–208
+per prior std across two MAPs, with velocity opposing at −13 and dh/dt neutral — a
+stable property of the problem), and its per-term ĉ's decoupled the inter-term
+negotiation (srf and dhdt disagreed, opposite signs on the f-modes). The complete
+version (one c shared across ALL terms incl. the Brier logits) remains the generative
+endpoint; the pragmatic replacement is `smb_data_influence` below. The pull table
+(scratch `fieldparams/pull_table.py` — worth promoting to tools/) doubles as a
+stationarity test: at a true MAP the total pull per smooth mode ≈ 0; both "converged"
+denali MAPs measured +220–235, i.e. the smooth directions were trajectory-truncated,
+which is why their values looked lr-dependent.
+
+**Semi-modular SMB influence (`smb_data_influence`).** The honest resolution of the
+"prior is irrelevant for the smooth parameters" problem: the melt channels are
+misspecification-dominated (data pull ~10² per prior std vs the prior's 1), and no
+within-domain error model can earn that exchange rate down (the level discrepancies and
+fingerprints were measured trying). `smb_data_influence = η ∈ [0, 1]` makes the
+enthalpy SMB block (z_log_H_atm, z_logit_cloud) see `prior · likelihood^η` GIVEN the
+fields, while the fields keep the full posterior — a parameter-blocked semi-modular
+posterior (Carmona & Nicholls 2020; Bissiri–Holmes–Walker belief-update semantics;
+generative shadow: the saturated-regime marginalization of a θ-mimicking model-error
+nuisance with s = 1/√(η·I)). Implemented as EXACT gradient surgery
+(`loss.apply_smb_influence`, called by `inverse.py` after backward: the whitened prior
+gradient is analytic `loss_scale·z`, so the data component separates from one backward
+pass) — unlike a learning rate it changes the block's *equilibrium*, not its speed.
+η = 1 is bit-identical full Bayes; η = 0 the cut posterior (block calibrated by prior
+alone). Choose η ≈ 1/(measured pull per prior std) so block data and prior pulls are
+comparable; verify with the pull table at the new equilibrium. The equilibrium is a
+fixed point of a non-conservative field (same status as the warm-started profiled
+nuisances). Within-domain posterior *width* along these directions remains
+uninterpretable regardless — the honest width is the cross-range scatter of the fitted
+parameters (the all-Alaska replication). RTO must apply the same η when migrated.
+Enabled for denali (η = 0.01).
 
 **Profiled logit nuisance for the Brier terms (`LogitNuisance`).** `ExtentSpec` and
 `SnowlineSpec` accept `logit_error=MaternNoise(sigma, l, nu)` (nugget must be 0; σ in

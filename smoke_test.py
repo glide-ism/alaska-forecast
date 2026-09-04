@@ -755,6 +755,40 @@ def main() -> int:
     except ValueError:
         check("FingerprintNuisance rejects mismatched s/params", True)
 
+    header("7f. Semi-modular SMB influence (block gradient surgery)")
+    from glacier_inverse.loss import apply_smb_influence
+    ls = float(cfg0.loss_scale)
+    # Nonzero z so the prior-gradient path is nontrivial.
+    with torch.no_grad():
+        params.z_log_H_atm.add_(0.3)
+    gH0 = params.z_log_H_atm.grad.detach().clone()
+    gC0 = params.z_logit_cloud.grad.detach().clone()
+    gpH = ls * params.z_log_H_atm.detach()
+    gpC = ls * params.z_logit_cloud.detach()
+    apply_smb_influence(params, eta=0.25, loss_scale=ls)
+    errH = (params.z_log_H_atm.grad - (0.25 * (gH0 - gpH) + gpH)).abs().max()
+    errC = (params.z_logit_cloud.grad - (0.25 * (gC0 - gpC) + gpC)).abs().max()
+    check("eta = 0.25: data component scaled, prior component exact",
+          errH.item() < 1e-10 and errC.item() < 1e-10,
+          f"max err = {max(errH.item(), errC.item()):.2e}")
+    params.z_log_H_atm.grad.copy_(gH0)
+    apply_smb_influence(params, eta=0.0, loss_scale=ls)
+    check("eta = 0 (cut): block gradient collapses to the prior's exactly",
+          torch.equal(params.z_log_H_atm.grad, gpH))
+    params.z_log_H_atm.grad.copy_(gH0)
+    apply_smb_influence(params, eta=1.0, loss_scale=ls)
+    check("eta = 1 (full Bayes) is a bit-identical no-op",
+          torch.equal(params.z_log_H_atm.grad, gH0))
+    try:
+        apply_smb_influence(params, eta=1.5, loss_scale=ls)
+        check("eta outside [0, 1] raises", False)
+    except ValueError:
+        check("eta outside [0, 1] raises", True)
+    with torch.no_grad():
+        params.z_log_H_atm.sub_(0.3)
+    params.z_log_H_atm.grad = None
+    params.z_logit_cloud.grad = None
+
     header("7d. Checkpoint save/load + scalar->field conversion")
     import tempfile
     from glacier_inverse.io import save_whitened_params, load_whitened_params_into

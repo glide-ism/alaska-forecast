@@ -211,7 +211,11 @@ for sample_idx in range(N_SAMPLES):
     # and an SGD group gated on config.tbias_enabled (there is no Adam block
     # anymore — every parameter is SGD in whitened coordinates). Likewise the
     # enthalpy pair z_log_H_atm/z_logit_cloud are now (ny, nx) whitened GP
-    # FIELDS (draws are randn_like the field), not scalars.
+    # FIELDS (draws are randn_like the field), not scalars. The migration
+    # must also apply config.smb_data_influence (semi-modular eta) to that
+    # block's data gradient per step — loss.apply_smb_influence, as in
+    # inverse.py — so samples target the same semi-modular posterior the
+    # MAP converged to.
     eps_u_obs      = noise_source.randn_like(problem.observations.u_obs)
     eps_v_obs      = noise_source.randn_like(problem.observations.v_obs)
     eps_S_obs      = noise_source.randn_like(problem.observations.S_obs)

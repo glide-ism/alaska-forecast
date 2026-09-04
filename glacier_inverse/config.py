@@ -413,6 +413,28 @@ class GlacierConfig:
     # Opt-in rank-few model-error marginalization along the smooth SMB
     # parameters' measured sensitivity fingerprints (see FingerprintNuisance).
     fingerprint_nuisance: Optional["FingerprintNuisance"] = None
+    # Semi-modular influence eta of the DATA on the enthalpy SMB parameter
+    # block (z_log_H_atm, z_logit_cloud) in the MAP solve: the fields see the
+    # full posterior; this block sees prior * likelihood^eta GIVEN the fields
+    # — a parameter-blocked semi-modular posterior (Carmona & Nicholls 2020;
+    # belief-update coherence per Bissiri, Holmes & Walker 2016). eta = 1 is
+    # full Bayes (bit-identical, the surgery is skipped); eta = 0 is the cut
+    # posterior (SMB block calibrated by the prior alone). Motivation: the
+    # melt channels are misspecification-dominated — the measured data pull
+    # on these parameters is ~10^2 per prior std against the prior's 1
+    # (tools pull table), an exchange rate the wrong model has not earned.
+    # Generative shadow: eta equals the saturated-regime marginalization of a
+    # theta-mimicking model-error nuisance with prior scale s = 1/sqrt(eta*I).
+    # Choose eta so the block's data and prior pulls are comparable:
+    # eta ~ 1/(measured pull per prior-std); verify with the pull table at
+    # the new equilibrium. Applied as EXACT gradient surgery in inverse.py
+    # (the whitened prior gradient is analytic: loss_scale * z), so unlike a
+    # learning rate it changes the block's equilibrium, not its speed. The
+    # equilibrium is a fixed point of a non-conservative field (same formal
+    # status as the warm-started profiled nuisances); the pull-table
+    # stationarity test still applies blockwise. RTO must apply the same eta
+    # when it is migrated (noted in rto_sample.py).
+    smb_data_influence: float = 1.0
 
     # Scalar prior mean of the log_beta field: the Matern prior (and its
     # whitened representation) applies to log_beta - mu_log_beta, so the
