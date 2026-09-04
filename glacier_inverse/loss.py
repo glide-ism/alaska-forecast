@@ -153,8 +153,19 @@ class LossTerms:
 _SMB_BLOCK = ("z_log_H_atm", "z_logit_cloud")
 
 
+_INFLUENCE_TRANSFERS = {
+    # psi(x): score gain at demand x = |g_data|/C~. Near-identity for x << 1;
+    # the tail encodes how displacement scales with likelihood demand at
+    # equilibrium — tanh: bounded (||z*|| <= C_z); log: C_z per e-fold
+    # (||z*|| = C_z*log(1+x), exponential information per sigma, defeasible).
+    "tanh": math.tanh,
+    "log": math.log1p,
+}
+
+
 def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
-                            caps: dict = None) -> dict:
+                            caps: dict = None,
+                            transfer: str = "tanh") -> dict:
     """Likelihood-side influence control on whitened parameter blocks —
     gradient surgery after a full backward pass. Two mechanisms, composable:
 
@@ -165,25 +176,30 @@ def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
       scales with the (state-dependent) misspecified pull, so it needs
       per-problem calibration.
 
-    * `caps` — bounded-influence (robust, Huber-psi-style) cap, per
+    * `caps` — influence-limited (robust, Huber-psi-style) cap, per
       parameter: {z_attr_name: C_z} with C_z in PRIOR-STD units. The block's
-      whitened data score is radially saturated,
+      whitened data score is radially transformed,
 
-          g_data  <-  C~ * tanh(|g_data| / C~) * g_data/|g_data|,
-          C~ = loss_scale * C_z,
+          g_data  <-  C~ * psi(|g_data| / C~) * g_data/|g_data|,
+          C~ = loss_scale * C_z,   psi per `transfer`,
 
-      i.e. adaptive tempering eta(w) = tanh(x)/x, x = |g_data|/C~: inside
-      the prior's C_z contour the likelihood acts essentially unmodified; a
-      demand that would carry the block outside its typical set is discounted
-      as an implausible request of the misspecified model. Equilibrium
-      theorem: at stationarity g_prior = -capped(g_data), so
-      ||z*|| <= C_z REGARDLESS of the misspecification magnitude — the
-      bound is stated in prior geometry and transfers across domains
-      unchanged. Direction is preserved (the data still says WHERE, just not
-      how far). Lineage: bounded influence functions (Huber), generalized
-      Bayes under misspecification (Jewson, Smith & Holmes 2018;
-      beta/gamma-divergence posteriors). Leave parameters DESIGNED to absorb
-      structural error (tbias, log_beta, pbias) uncapped.
+      i.e. adaptive tempering eta(w) = psi(x)/x, x = |g_data|/C~ — near 1
+      for plausible demands, engaging only when the likelihood would carry
+      the block out of its typical set (the discount read as an implausible
+      request of the misspecified model). At stationarity
+      g_prior = -C~*psi(x*), so:
+        transfer="tanh": ||z*|| <= C_z REGARDLESS of demand (bounded
+          influence — magnitude beyond the cap carries nothing; C_z ~ 2-3);
+        transfer="log":  ||z*|| = C_z*log(1+x*) — C_z prior-stds PER E-FOLD
+          of demand (exponential information per sigma; the flawed-model
+          hypothesis is defeasible; C_z is a rate, ~0.2-0.5).
+      Both are stated in prior geometry, need no pull-table calibration, and
+      transfer across domains unchanged. Direction is preserved (the data
+      still says WHERE, just not how far). Lineage: bounded/redescending
+      influence functions (Huber), generalized Bayes under misspecification
+      (Jewson, Smith & Holmes 2018; beta/gamma-divergence posteriors). Leave
+      parameters DESIGNED to absorb structural error (tbias, log_beta,
+      pbias) uncapped.
 
     In both cases the prior gradient is analytic (loss_scale * z, zero mean
     in the MAP solve) so the data component separates exactly from one
@@ -202,6 +218,11 @@ def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
             f"smb_data_influence must be in [0, 1] (1 = full Bayes, "
             f"0 = cut posterior), got {eta!r}")
     caps = caps or {}
+    psi = _INFLUENCE_TRANSFERS.get(transfer)
+    if psi is None:
+        raise ValueError(
+            f"influence_transfer must be one of "
+            f"{tuple(_INFLUENCE_TRANSFERS)}, got {transfer!r}")
     for name, C in caps.items():
         if not hasattr(params, name):
             raise ValueError(
@@ -213,21 +234,24 @@ def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
     sat = {}
     with torch.no_grad():
         for name in dict.fromkeys(list(_SMB_BLOCK) + list(caps)):
+            temper = name in _SMB_BLOCK and eta != 1.0
+            C = caps.get(name)
+            if not temper and C is None:
+                continue    # untouched: keep the gradient bit-identical
             z = getattr(params, name)
             if z.grad is None:
                 continue
             g_prior = loss_scale * z.detach()
             g_data = z.grad - g_prior
-            if name in _SMB_BLOCK and eta != 1.0:
+            if temper:
                 g_data = eta * g_data
-            C = caps.get(name)
             if C is not None:
                 C_t = loss_scale * C
                 n = float(g_data.norm())
                 x = n / C_t
                 sat[name] = x
                 if n > 0.0:
-                    g_data = g_data * (C_t * math.tanh(x) / n)
+                    g_data = g_data * (C_t * psi(x) / n)
             z.grad.copy_(g_data + g_prior)
     return sat
 

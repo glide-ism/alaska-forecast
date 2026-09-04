@@ -183,6 +183,7 @@ for level in range(config.max_level, config.min_level - 1, -1):
             sat = apply_influence_control(
                 params, eta=config.smb_data_influence,
                 caps=config.influence_cap,
+                transfer=config.influence_transfer,
                 loss_scale=resolve_weight(config.loss_scale, i, level,
                                           schedule=True, what="loss_scale"))
             if sat and i % 25 == 0:

@@ -271,11 +271,22 @@ unchanged (a saturated cap behaves as an emergent soft boundary at the C_z conto
 justified likelihood-side; a well-specified likelihood never feels it). Direction
 preserved; per-GP-block norms; lineage: Huber's bounded influence functions,
 generalized Bayes under misspecification (Jewson–Smith–Holmes 2018, β/γ-divergence
-posteriors). Both mechanisms live in `loss.apply_influence_control` (exact surgery; η
-first, then cap; returns saturation factors x = the implausibility audit, printed by
-`inverse.py` every 25 iters). Leave parameters *designed* to absorb local structural
-error (tbias, log_beta, pbias) uncapped. Enabled for denali
-(`influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud": 2.0}`, η retired).
+posteriors). **`influence_transfer`** selects the ψ shaping the score, g_data ←
+C̃·ψ(x)·ĝ: `"tanh"` (default) is the bounded cap above (equilibrium ‖z*‖ ≤ C_z — a hard
+information ceiling; C_z ~ 2–3); `"log"` (ψ = log(1+x)) is non-saturating: equilibrium
+‖z*‖ = C_z·log(1+x), i.e. **C_z prior-stds per e-fold of likelihood demand** —
+exponential information is required per σ of displacement but the flawed-model
+hypothesis is defeasible. Under "log", C_z is a RATE, not a bound: at the measured
+melt-channel demand (x ~ 4e4 ≈ 10.5 e-folds) C_z = 0.3 equilibrates near 3σ while
+C_z = 2 would allow ~21σ. (For locally constant demand the log rule is
+equilibrium-equivalent to a doubly-exponential-tailed prior on the block — every ψ is
+dual to a tail assumption; this one is stated in e-folds per σ.) Both mechanisms live
+in `loss.apply_influence_control` (exact surgery; η first, then cap; returns saturation
+factors x = the implausibility audit, printed by `inverse.py` every 25 iters). Leave
+parameters *designed* to absorb local structural error (tbias, log_beta, pbias)
+uncapped. Enabled for denali (`influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud":
+2.0}`, tanh; switch to `influence_transfer="log"` with C_z ~ 0.3 for the defeasible
+variant; η retired).
 
 **Profiled logit nuisance for the Brier terms (`LogitNuisance`).** `ExtentSpec` and
 `SnowlineSpec` accept `logit_error=MaternNoise(sigma, l, nu)` (nugget must be 0; σ in

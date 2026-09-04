@@ -805,6 +805,31 @@ def main() -> int:
           and cos > 1 - 1e-6 and sat["z_log_H_atm"] > 99.0,
           f"|g_data| = {float(gd.norm()):.3e} vs C~ = {ls*C_small:.3e}, "
           f"cos = {cos:.6f}, x = {sat['z_log_H_atm']:.0f}")
+    # Log transfer: non-saturating — |g_data| = C~*log(1+x), direction kept;
+    # near-identity when unsaturated (log1p(x)/x = 0.995 at x = 0.01).
+    params.z_log_H_atm.grad.copy_(gH0)
+    sat = apply_influence_control(params, loss_scale=ls, transfer="log",
+                                  caps={"z_log_H_atm": C_big})
+    dev = (params.z_log_H_atm.grad - gH0).norm() / (gH0.norm() + 1e-30)
+    check("log transfer, unsaturated: essentially full Bayes",
+          dev.item() < 6e-3, f"rel change = {dev.item():.2e}")
+    params.z_log_H_atm.grad.copy_(gH0)
+    sat = apply_influence_control(params, loss_scale=ls, transfer="log",
+                                  caps={"z_log_H_atm": C_small})
+    gd = params.z_log_H_atm.grad - gpH
+    import math as _m
+    want = ls * C_small * _m.log1p(sat["z_log_H_atm"])
+    check("log transfer, saturated: |g_data| = C~*log(1+x) (non-saturating)",
+          abs(float(gd.norm()) - want) < 1e-5 * want
+          and want > ls * C_small,   # exceeds the tanh ceiling: not bounded
+          f"|g_data| = {float(gd.norm()):.3e} vs C~*log1p(x) = {want:.3e} "
+          f"(x = {sat['z_log_H_atm']:.0f}, {_m.log1p(sat['z_log_H_atm']):.1f} e-folds)")
+    try:
+        apply_influence_control(params, loss_scale=ls, transfer="sigmoid",
+                                caps={"z_log_H_atm": 1.0})
+        check("unknown influence_transfer raises", False)
+    except ValueError:
+        check("unknown influence_transfer raises", True)
     try:
         apply_influence_control(params, eta=1.5, loss_scale=ls)
         check("eta outside [0, 1] raises", False)

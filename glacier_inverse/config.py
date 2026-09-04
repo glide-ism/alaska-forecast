@@ -459,6 +459,25 @@ class GlacierConfig:
     # saturation factor x is printed by inverse.py as the audit trail.
     # See loss.apply_influence_control.
     influence_cap: Optional[dict] = None
+    # Transfer function psi for the influence cap: the data score becomes
+    # loss_scale*C_z * psi(x), x = |g_data|/(loss_scale*C_z).
+    #   "tanh" — saturating: equilibrium ||z*|| <= C_z REGARDLESS of demand
+    #     (a hard information ceiling: magnitude beyond the cap carries
+    #     nothing; behaves as an emergent soft boundary at the C_z contour).
+    #     C_z is a bound — 2-3 is the natural range.
+    #   "log"  — non-saturating, psi = log(1+x): equilibrium
+    #     ||z*|| = C_z*log(1+x), i.e. C_z prior-stds PER E-FOLD of likelihood
+    #     demand — exponential information is required to carry the block
+    #     each additional C_z out of its prior regime, but it can happen
+    #     (the flawed-model hypothesis is defeasible). C_z is a RATE, not a
+    #     bound: at the measured melt-channel demand (x ~ 4e4, ~10.5
+    #     e-folds) C_z = 0.3 equilibrates near 3 sigma; C_z = 2 would allow
+    #     ~21 sigma. (For locally constant demand this rule is equilibrium-
+    #     equivalent to a doubly-exponential-tailed prior on the block —
+    #     every psi choice is dual to a tail assumption; this one states it
+    #     in e-folds of evidence per sigma.)
+    # Both are near-identity for x << 1 (a plausible demand passes through).
+    influence_transfer: str = "tanh"
 
     # Scalar prior mean of the log_beta field: the Matern prior (and its
     # whitened representation) applies to log_beta - mu_log_beta, so the
