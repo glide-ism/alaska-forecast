@@ -439,9 +439,19 @@ class GlacierConfig:
     # fumbled once) — prefer influence_cap below, which needs neither.
     smb_data_influence: float = 1.0
     # Bounded-influence (robust) cap on the whitened data score, per
-    # parameter: {z_attr_name: C_z} with C_z in PRIOR-STD units, e.g.
-    # {"z_log_H_atm": 2.0, "z_logit_cloud": 2.0}. The block's data gradient
-    # is radially saturated at loss_scale*C_z (tanh), i.e. ADAPTIVE
+    # parameter: {z_attr_name: C_z} with C_z the PER-MODE trust level in
+    # PRIOR-STD units, e.g. {"z_log_H_atm": 2.0, "z_tbias": 2.0}. The
+    # applied joint cap is sqrt(d_eff)*C_z — a calibrated likelihood's score
+    # across d informed modes scales as sqrt(d), so without this a many-dof
+    # field (tbias, d_eff ~ 2A/(pi l^2) ~ 1e2) would be rationed
+    # C_z/sqrt(d) per mode while a scalar got C_z. d_eff is resolved
+    # automatically from the parameter prior's correlation area
+    # (loss.resolve_influence_caps; pass (C_z, d) to override, e.g. for
+    # non-nu=1 priors), so C_z keeps ONE meaning across blocks and domains.
+    # Caveat: the joint cap bounds the total budget, not concentration —
+    # inspect the fitted field for a single smooth swell spending
+    # sqrt(d)*C_z on one mode. The block's data gradient
+    # is radially saturated at the cap (tanh), i.e. ADAPTIVE
     # tempering eta(w) = tanh(x)/x: inside the prior's C_z contour the
     # likelihood acts essentially unmodified; demands that would carry the
     # block outside its typical set are discounted as implausible requests

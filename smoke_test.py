@@ -830,6 +830,43 @@ def main() -> int:
         check("unknown influence_transfer raises", False)
     except ValueError:
         check("unknown influence_transfer raises", True)
+
+    # Effective-dof scaling: the joint cap is sqrt(d_eff)*C_z. Resolver:
+    # d_eff = max(1, 2A/(pi l^2)) from each parameter prior's correlation
+    # area; explicit (C, d) tuples pass through; float == (C, 1) exactly.
+    from glacier_inverse.loss import resolve_influence_caps
+    rc = resolve_influence_caps(
+        {"z_log_H_atm": 2.0, "z_tbias": 2.0, "z_log_mf": 1.0,
+         "z_logit_cloud": (3.0, 7.0)},
+        config, problem.ny, problem.nx, problem.dx)
+    import math as _m
+    A_dom = problem.ny * problem.nx * problem.dx ** 2
+    d_hatm = max(1.0, 2.0 * A_dom / (_m.pi * config.h_atm_prior.l ** 2))
+    d_tb = max(1.0, 2.0 * A_dom / (_m.pi * config.tbias_prior.l ** 2))
+    check("resolver: d_eff from prior correlation areas; override and "
+          "scalar fallback honored",
+          abs(rc["z_log_H_atm"][1] - d_hatm) < 1e-6 * d_hatm
+          and abs(rc["z_tbias"][1] - d_tb) < 1e-6 * d_tb
+          and rc["z_tbias"][1] > 20.0 * rc["z_log_H_atm"][1]
+          and rc["z_logit_cloud"] == (3.0, 7.0)
+          and rc["z_log_mf"][1] == 1.0,
+          f"d(h_atm)={rc['z_log_H_atm'][1]:.1f}, d(tbias)={rc['z_tbias'][1]:.0f}")
+    params.z_log_H_atm.grad.copy_(gH0)
+    apply_influence_control(params, loss_scale=ls,
+                            caps={"z_log_H_atm": (C_small, 4.0)})
+    n4 = float((params.z_log_H_atm.grad - gpH).norm())
+    check("sqrt(d) scaling: (C, d=4) doubles the saturated cap of (C, d=1)",
+          abs(n4 - 2.0 * ls * C_small) < 1e-5 * ls * C_small,
+          f"|g_data| = {n4:.3e} vs 2*C~ = {2*ls*C_small:.3e}")
+    params.z_log_H_atm.grad.copy_(gH0)
+    apply_influence_control(params, loss_scale=ls,
+                            caps={"z_log_H_atm": (C_small, 1.0)})
+    g_tuple = params.z_log_H_atm.grad.detach().clone()
+    params.z_log_H_atm.grad.copy_(gH0)
+    apply_influence_control(params, loss_scale=ls,
+                            caps={"z_log_H_atm": C_small})
+    check("float cap value is exactly (C, d=1)",
+          torch.equal(params.z_log_H_atm.grad, g_tuple))
     try:
         apply_influence_control(params, eta=1.5, loss_scale=ls)
         check("eta outside [0, 1] raises", False)

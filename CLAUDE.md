@@ -282,11 +282,24 @@ C_z = 2 would allow ~21σ. (For locally constant demand the log rule is
 equilibrium-equivalent to a doubly-exponential-tailed prior on the block — every ψ is
 dual to a tail assumption; this one is stated in e-folds per σ.) Both mechanisms live
 in `loss.apply_influence_control` (exact surgery; η first, then cap; returns saturation
-factors x = the implausibility audit, printed by `inverse.py` every 25 iters). Leave
-parameters *designed* to absorb local structural error (tbias, log_beta, pbias)
-uncapped. Enabled for denali (`influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud":
-2.0}`, tanh; switch to `influence_transfer="log"` with C_z ~ 0.3 for the defeasible
-variant; η retired).
+factors x = the implausibility audit, printed by `inverse.py` every 25 iters).
+**C_z is per-mode**: the applied joint cap is √d_eff·C_z, with d_eff resolved from the
+parameter prior's correlation area (`loss.resolve_influence_caps`, d = max(1, 2A/(πl²))
+for ν = 1; `(C_z, d)` tuple to override) — a calibrated score across d informed modes
+scales as √d, so without this a many-dof field (tbias, d_eff ~ 10²) would be rationed
+C_z/√d per mode. Caveat: the joint cap bounds the total budget, not concentration —
+inspect the fitted field for one smooth swell spending √d·C_z on a single mode. Pure
+structural absorbers (log_beta, pbias) stay uncapped; **tbias is capped on denali** —
+it is physically meaningful (field validation upcoming) and widening its prior σ made
+inferred temperatures implausible (the same unearned exchange rate), so it gets the
+bounded-absorber treatment rather than a dishonest σ. Enabled for denali
+(`influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud": 2.0, "z_tbias": 2.0}`, tanh;
+switch to `influence_transfer="log"` with C_z ~ 0.3 for the defeasible variant; η
+retired). Note the lr consequence: a saturated cap has ψ′ ≈ 0, so a capped block's
+local curvature is the PRIOR's alone (loss_scale) — its natural SGD unit becomes
+1/loss_scale and the settling time constant is (1−momentum)/(lr·loss_scale) iterations
+(lr ~ 10–50 equilibrates within a level; the pre-cap lr ~ 1 was hostage to the 10⁵ data
+stiffness and is ~20–50× too small after capping).
 
 **Profiled logit nuisance for the Brier terms (`LogitNuisance`).** `ExtentSpec` and
 `SnowlineSpec` accept `logit_error=MaternNoise(sigma, l, nu)` (nugget must be 0; σ in

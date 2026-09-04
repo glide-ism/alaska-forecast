@@ -23,7 +23,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="denali",
-    results_subdir="inverse_tempered",
+    results_subdir="inverse_tempered_gradient",
     smb_model = "enthalpy",
     q_lw0=-40.0,
     mu_H_atm=15.0,
@@ -42,9 +42,16 @@ CONFIG = GlacierConfig(
     # regardless of how hard the misspecified melt channels push (measured
     # pull/prior ratio ~1e4-1e5). Inside the C_z contour the likelihood
     # acts nearly unmodified; the saturation factor printed by inverse.py
-    # is the implausibility audit. tbias/log_beta/pbias stay uncapped —
-    # they are designed to absorb local structural error.
-    influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud": 2.0},
+    # is the implausibility audit. C_z is PER-MODE (joint cap scales by
+    # sqrt(d_eff) from the prior's correlation area — tbias d_eff ~ 1e2, the
+    # SMB fields ~ 2-4). tbias is capped too: it is physically meaningful
+    # (field validation upcoming), and widening its prior sigma made the
+    # inferred temperatures implausible — the same unearned-exchange-rate
+    # story, so it gets the bounded-absorber treatment rather than a
+    # dishonest sigma. log_beta/pbias (pure structural absorbers) stay
+    # uncapped.
+    influence_cap={"z_log_H_atm": 2.0, "z_logit_cloud": 2.0,
+                   "z_tbias": 2.0},
     # Shortwave: the inverted scalar f is the CLEAR-SKY fraction (1 - cloud
     # fraction); direct = f*S0*I (S0 = q_sw_clear = 1361, tau^airmass lives in
     # the direct potential I) and diffuse = (f*k_clr + (1-f)*k_cld)*S0*I_dif from
@@ -131,7 +138,7 @@ CONFIG = GlacierConfig(
     lr_z_tbias=Schedule(final=1.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1.0),
     # SGD-on-whitened-field lrs (the 0.05 finals were Adam-era scalar steps);
     # start conservative and retune on the level-2 trace.
-    lr_z_log_H_atm=Schedule(final=1e-1,ramp=lambda i,level:0.0 if (i<0 and level==2) else 1e-1),
-    lr_z_logit_cloud=Schedule(final=5e-0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 5e-0),
+    lr_z_log_H_atm=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
+    lr_z_logit_cloud=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
 )
 

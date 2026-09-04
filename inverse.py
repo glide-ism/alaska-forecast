@@ -12,7 +12,7 @@ import xarray as xr
 from glacier_inverse import GlacierProblem, load_config
 from glacier_inverse.config import resolve_weight
 from glacier_inverse.forward import differentiable_restriction
-from glacier_inverse.loss import apply_influence_control
+from glacier_inverse.loss import apply_influence_control, resolve_influence_caps
 from glacier_inverse.io import (
     load_whitened_params_into, make_diagnostic_fields, make_loss_vti_writer,
     make_time_vti_writer, save_whitened_params, update_diagnostic_fields,
@@ -82,6 +82,16 @@ if config.precip_lapse_enabled:
     ]
 
 optimizer_sgd = torch.optim.SGD(sgd_groups, momentum=0.5)
+
+# Influence caps resolved once: C_z is the per-mode trust level; the joint
+# cap is sqrt(d_eff)*C_z with d_eff from each parameter prior's correlation
+# area (see loss.resolve_influence_caps).
+influence_caps = (resolve_influence_caps(config.influence_cap, config,
+                                         problem.ny, problem.nx, problem.dx)
+                  if config.influence_cap else None)
+if influence_caps:
+    print("influence caps (C_z per mode, d_eff):",
+          {k[2:]: (v[0], round(v[1], 1)) for k, v in influence_caps.items()})
 
 def refresh_learning_rates(i, level):
     """Resolve every scheduled lr at (i, level) and push it into the matching
@@ -182,7 +192,7 @@ for level in range(config.max_level, config.min_level - 1, -1):
         if config.smb_data_influence != 1.0 or config.influence_cap:
             sat = apply_influence_control(
                 params, eta=config.smb_data_influence,
-                caps=config.influence_cap,
+                caps=influence_caps,
                 transfer=config.influence_transfer,
                 loss_scale=resolve_weight(config.loss_scale, i, level,
                                           schedule=True, what="loss_scale"))

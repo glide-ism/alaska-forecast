@@ -153,6 +153,48 @@ class LossTerms:
 _SMB_BLOCK = ("z_log_H_atm", "z_logit_cloud")
 
 
+# Whitened-parameter -> prior-hyperparameter field, for effective-dimension
+# resolution of the influence caps. Scalars (z_log_mf, ...) have d = 1.
+_PRIOR_OF = {
+    "z_bed": "bed_prior", "z_bed_mean": "mean_prior",
+    "z_log_beta": "log_beta_prior", "z_pbias": "pbias_prior",
+    "z_tbias": "tbias_prior", "z_log_H_atm": "h_atm_prior",
+    "z_logit_cloud": "cloud_prior",
+}
+
+
+def resolve_influence_caps(caps, config, ny: int, nx: int, dx: float) -> dict:
+    """Resolve {name: C_z | (C_z, d)} to {name: (C_z, d_eff)}.
+
+    C_z is the PER-MODE trust level (prior-stds per effective dof); the cap
+    applied to the block's joint score norm is sqrt(d_eff)*C_z — a correctly
+    specified likelihood's whitened score across d informed modes scales as
+    sqrt(d), so without this a high-d field (tbias) would be rationed
+    C_z/sqrt(d) per mode while a scalar got C_z. d_eff is the parameter
+    prior's effective dof on the domain, d = max(1, 2*A/(pi*l^2)) (the nu=1
+    Matern correlation area A_corr = pi*l^2/2) — computed automatically so a
+    larger domain legitimately supports proportionally more structure and
+    C_z keeps one meaning across blocks and ranges. Pass an explicit
+    (C_z, d) tuple to override (e.g. non-nu=1 priors). NOTE the joint cap
+    bounds the TOTAL budget, not concentration: the likelihood may spend
+    sqrt(d)*C_z on one mode — inspect the fitted field (t_bias in the VTIs)
+    for a single smooth swell vs structure at the prior's l.
+    """
+    out = {}
+    A = ny * nx * dx * dx
+    for name, spec in (caps or {}).items():
+        if isinstance(spec, (tuple, list)):
+            C, d = float(spec[0]), float(spec[1])
+        else:
+            C = float(spec)
+            hp_name = _PRIOR_OF.get(name)
+            hp = getattr(config, hp_name) if hp_name else None
+            d = max(1.0, 2.0 * A / (math.pi * hp.l ** 2)) if hp is not None \
+                else 1.0
+        out[name] = (C, d)
+    return out
+
+
 _INFLUENCE_TRANSFERS = {
     # psi(x): score gain at demand x = |g_data|/C~. Near-identity for x << 1;
     # the tail encodes how displacement scales with likelihood demand at
@@ -195,11 +237,17 @@ def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
           hypothesis is defeasible; C_z is a rate, ~0.2-0.5).
       Both are stated in prior geometry, need no pull-table calibration, and
       transfer across domains unchanged. Direction is preserved (the data
-      still says WHERE, just not how far). Lineage: bounded/redescending
-      influence functions (Huber), generalized Bayes under misspecification
-      (Jewson, Smith & Holmes 2018; beta/gamma-divergence posteriors). Leave
-      parameters DESIGNED to absorb structural error (tbias, log_beta,
-      pbias) uncapped.
+      still says WHERE, just not how far). Cap values may be C_z floats
+      (d = 1) or (C_z, d) tuples — pass caps through
+      `resolve_influence_caps` so many-dof GP blocks get the sqrt(d_eff)
+      budget (C_z stays the per-mode trust level). Lineage:
+      bounded/redescending influence functions (Huber), generalized Bayes
+      under misspecification (Jewson, Smith & Holmes 2018; beta/gamma-
+      divergence posteriors). Pure structural absorbers (log_beta, pbias)
+      may stay uncapped; capping a PHYSICALLY MEANINGFUL absorber (tbias —
+      to be validated against field observations) turns it into a bounded
+      absorber, the eps_max move: honest prior sigma first, cap as the
+      misspecification guard.
 
     In both cases the prior gradient is analytic (loss_scale * z, zero mean
     in the MAP solve) so the data component separates exactly from one
@@ -223,14 +271,20 @@ def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
         raise ValueError(
             f"influence_transfer must be one of "
             f"{tuple(_INFLUENCE_TRANSFERS)}, got {transfer!r}")
-    for name, C in caps.items():
+    norm_caps = {}
+    for name, spec in caps.items():
         if not hasattr(params, name):
             raise ValueError(
                 f"influence_cap key {name!r} is not a whitened parameter "
                 f"(expected a WhitenedParameters attribute name like "
                 f"'z_log_H_atm')")
-        if not (C > 0.0):
-            raise ValueError(f"influence_cap[{name!r}] must be > 0, got {C!r}")
+        C, d = spec if isinstance(spec, (tuple, list)) else (spec, 1.0)
+        if not (C > 0.0) or not (d >= 1.0):
+            raise ValueError(
+                f"influence_cap[{name!r}] needs C > 0 and d >= 1, "
+                f"got C={C!r}, d={d!r}")
+        norm_caps[name] = (float(C), float(d))
+    caps = norm_caps
     sat = {}
     with torch.no_grad():
         for name in dict.fromkeys(list(_SMB_BLOCK) + list(caps)):
@@ -246,7 +300,8 @@ def apply_influence_control(params, *, loss_scale: float, eta: float = 1.0,
             if temper:
                 g_data = eta * g_data
             if C is not None:
-                C_t = loss_scale * C
+                C_z, d = C
+                C_t = loss_scale * C_z * math.sqrt(d)
                 n = float(g_data.norm())
                 x = n / C_t
                 sat[name] = x
