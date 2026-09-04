@@ -20,7 +20,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="denali",
-    results_subdir="inverse_extent_try_v2",
+    results_subdir="inverse_discrepency",
     smb_model = "enthalpy",
     # Constant (non-albedo-scaled) surface-flux offset: a-priori interior sky
     # longwave deficit + evaporative cooling. With the offset explicit, H_atm is
@@ -83,7 +83,16 @@ CONFIG = GlacierConfig(
                      s_smb=0.5, sigma_p=0.3,
                      logit_error=MaternNoise(sigma=0.3, l=1000.0),
                      nuisance_inner_steps=2, eps_max=1.0),
-        DhdtSpec(noise=MaternNoise(sigma=0.5, l=3000.0, nu=0.5, nugget=0.5),
+        # dhdt discrepancy: sigma_D is in units of sigma_pix (= 0.5 x the
+        # reported per-pixel error — the member is registered with unit
+        # sigma and whitens r/sigma_pix), so sigma_D=1.0 trusts the
+        # REGIONAL rate level to one sigma_pix (~0.15-0.25 m/yr physical)
+        # per 80-km patch: the regional geodetic-bias / forcing-bias budget.
+        # This is the domain-mean melt-rate channel through which the smooth
+        # SMB fields (H_atm, f) were pinned; the experiment tests whether
+        # that pinning was real.
+        DhdtSpec(noise=MaternNoise(sigma=0.5, l=3000.0, nu=0.5, nugget=0.5,
+                                   discrepancy=MaternNoise(sigma=1.0, l=80000.0, nu=1.0)),
                  weight=Schedule(final=1.0, ramp=lambda i, level: 0.0 if (i < 0 and level == 2) else 1.0)),
         BedSlopeSpec(weight=1e-5,s_scale=5.0),
     ),

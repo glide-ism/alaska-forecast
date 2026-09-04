@@ -190,7 +190,7 @@ surface term's information about a uniform model−DEM offset drops from ±0.11 
 temper η would be the wrong shape here (it would also destroy the fine-scale constraint
 on bed/β). σ_D/l_D cannot come from within-domain variograms — use a-priori product/
 forcing bias budgets or the cross-range scatter of fitted smooth fields (empirical Bayes
-across domains). Enabled for denali's surface term (σ_D 20 m, l_D 80 km, ν 1). Note
+across domains). Enabled for denali's surface (σ_D 20 m) and dh/dt (σ_D 1.0 σ_pix — level info ±0.03 → ±0.76 σ_pix, the stiffest level channel) terms, both l_D 80 km. Note
 the prior/data balance on the scalars is **not** restored by whitening alone — the
 finite-difference curvature of the data terms along `z_log_H_atm` etc. (conditional on the
 fields) stays 10⁴–10⁵× the prior's, because the scalar sensitivity fields carry their power
