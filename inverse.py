@@ -17,7 +17,7 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/delta"
+DOMAIN = "domains/denali"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir
@@ -139,8 +139,17 @@ for level in range(config.max_level, config.min_level - 1, -1):
                                        config.vti_base_name, diag)
 
     for i in range(config.max_iters[level]):
+        # Rank-few fingerprint nuisance: re-measure the smooth SMB
+        # parameters' sensitivity fingerprints from the CURRENT state at
+        # every level start, and every `refresh` iterations when > 0
+        # (config.FingerprintNuisance; costs 1 + n_params*n_modes forwards).
+        fpn = config.fingerprint_nuisance
+        if fpn is not None and (i == 0 or (fpn.refresh or 0) > 0
+                                and i % fpn.refresh == 0):
+            problem.refresh_fingerprints(params=params, level=level)
+
         optimizer_sgd.zero_grad()
-        optimizer_adam.zero_grad()
+        #optimizer_adam.zero_grad()
         # Scheduled learning rates share the loss-weight continuation contract:
         # ramps are honored here (schedule=True) and nowhere else.
         lrs = refresh_learning_rates(i, level)
@@ -164,7 +173,7 @@ for level in range(config.max_level, config.min_level - 1, -1):
         
         loss_terms.J.backward()
         optimizer_sgd.step()
-        optimizer_adam.step()
+        #optimizer_adam.step()
 
         # Drop this iteration's snapshots/graph now: `sim` pins fine-grid
         # tensors per observation epoch, and letting them survive into the

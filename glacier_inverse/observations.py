@@ -156,6 +156,37 @@ class ObservationBuildContext:
     priors: object = None                # GlacierPriors (noise-model registry)
 
 
+def profile_fingerprints(z, fps, nu, iters: int = 2):
+    """Profile the rank-few fingerprint nuisance out of a whitened residual.
+
+    `fps` is a list of (w_j, s_j): whitened fingerprint fields (detached) and
+    their prior stds. Solves min_c Σ huber(z − Σ c_j w_j, nu) + ½ Σ c_j²/s_j²
+    by damped Gauss–Newton in the k-dim c (IRLS weights from the pseudo-Huber;
+    k is tiny so each step is a k×k solve). Returns (z_down, prior, c):
+    `z_down = z − Σ ĉ_j w_j` with ĉ DETACHED (envelope theorem — the caller's
+    gradient flows through z only), `prior = ½ Σ ĉ²/s²` (added to the loss so
+    absorption stays visible), and ĉ as a k-vector (prior-std units — the
+    audit trail of how much of each parameter's pattern the term attributes
+    to model error). See config.FingerprintNuisance for the model.
+    """
+    k = len(fps)
+    W = torch.stack([w for w, _ in fps])            # (k, ny, nx), detached
+    s2 = torch.tensor([s ** 2 for _, s in fps], device=z.device)
+    with torch.no_grad():
+        zd = z.detach()
+        c = torch.zeros(k, device=z.device)
+        for _ in range(iters):
+            t = zd - torch.einsum("k,kij->ij", c, W)
+            rho = 1.0 / torch.sqrt(1.0 + (t / nu) ** 2)   # huber'(t)/t
+            grad = -torch.einsum("kij,ij->k", W, rho * t) + c / s2
+            H = torch.einsum("kij,lij->kl", W, W * rho.unsqueeze(0)) \
+                + torch.diag(1.0 / s2)
+            c = c - torch.linalg.solve(H, grad)
+    z_down = z - torch.einsum("k,kij->ij", c, W)
+    prior = 0.5 * (c ** 2 / s2).sum()
+    return z_down, prior, c
+
+
 def _pcg(A, b, M_inv, x0, rtol: float = 1e-3, maxiter: int = 100):
     """Preconditioned conjugate gradients for SPD A (torch, no autograd)."""
     x = x0.clone()
@@ -391,6 +422,32 @@ class Observation:
     def __init__(self, *, weight: LossWeight):
         self.weight = weight
 
+    # Rank-few fingerprint nuisance (see config.FingerprintNuisance).
+    # `GlacierProblem.refresh_fingerprints` measures whitened fingerprints on
+    # the current level and installs them here; a whitened loss branch that
+    # supports the downdate profiles them out via `profile_fingerprints`.
+    # None (the default) is the unmodified likelihood, bit-identical.
+    _fingerprints = None
+    fingerprint_c = None    # last fitted ĉ (prior-std units), diagnostic
+
+    def set_fingerprints(self, fps, level: int) -> None:
+        """Install whitened fingerprints [(w, s), ...] measured at `level`
+        (or clear with fps=None). The downdate applies only while the term is
+        evaluated on the same level — the driver refreshes at every level
+        start, so a mismatch simply disables it."""
+        self._fingerprints = None if fps is None else \
+            {"level": level, "fps": [(w.detach(), float(s)) for w, s in fps]}
+        self.fingerprint_c = None
+
+    def _apply_fingerprints(self, z, level: int, nu):
+        """Downdate the whitened residual: returns (z_eff, prior_cost)."""
+        fp = self._fingerprints
+        if fp is None or fp["level"] != level:
+            return z, None
+        z_down, prior, c = profile_fingerprints(z, fp["fps"], nu)
+        self.fingerprint_c = c
+        return z_down, prior
+
     @property
     def required_times(self) -> tuple:
         return ()
@@ -482,7 +539,11 @@ class SurfaceObservation(Observation):
         raw, level = self._raw(sim)
         if self.noise is not None:
             z = _whiten(self.noise_model_at(level), raw)
-            return config.loss_scale * weight * _huber(z, self.nu).sum()
+            z, fp_prior = self._apply_fingerprints(z, level, self.nu)
+            J = config.loss_scale * weight * _huber(z, self.nu).sum()
+            if fp_prior is not None:
+                J = J + config.loss_scale * weight * fp_prior
+            return J
         scale = config.loss_scale * (dx * 2 ** level) ** 2
         r_s = raw / self.sigma
         return scale * weight * _huber(r_s, self.nu).sum()
@@ -1035,7 +1096,11 @@ class DhdtObservation(Observation):
             dhdt_model = self.model_rate(sim, "fine")
             r = (dhdt_model - self.dhdt) / self._sigma_pixel() * self.dhdt_mask
             z = _whiten(self.noise_model, r)
-            return config.loss_scale * weight * _huber(z, self.nu).sum()
+            z, fp_prior = self._apply_fingerprints(z, sim.final.level, self.nu)
+            J = config.loss_scale * weight * _huber(z, self.nu).sum()
+            if fp_prior is not None:
+                J = J + config.loss_scale * weight * fp_prior
+            return J
         scale = config.loss_scale * dx ** 2
         dhdt_model = self.model_rate(sim, "fine")
         sigma = torch.clamp(self.dhdt_err, min=self.sigma_floor)

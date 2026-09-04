@@ -197,6 +197,37 @@ fields) stays 10⁴–10⁵× the prior's, because the scalar sensitivity fields
 at glacier scales; what limits the scalars in the joint problem is their degeneracy with
 the fields, i.e. the field priors, not the error model.
 
+**Fingerprint nuisance (`FingerprintNuisance`) — rank-few model-error marginalization.**
+The field likelihoods' Gauss–Newton information about the smooth SMB parameter fields is
+10⁴–10⁶× their priors' (denali, measured 2026-09: H_atm 1.3e6× summed over terms, dh/dt
+dominant), riding on glacier-scale sensitivity structure — which is why the l_D = 80 km
+level discrepancies discounted 0–9% of it (fingerprints are not smooth at 80 km). The fix
+admits a nuisance `Σ c_j·g_j`, `c_j ~ N(0, s²)`, with `g_j` the MEASURED fingerprints
+(∂residual/∂mode) of the parameter's leading prior modes: model error that mimics the
+parameter. Profiled inside the whitened surface/dh/dt losses (`profile_fingerprints`:
+k-dim damped GN with Huber IRLS weights, envelope gradient, ĉ detached — the LogitNuisance
+pattern with k ≈ 8 instead of a field), returning the downdated Huber plus ½Σĉ²/s² so
+absorption stays visible. Perturbations are whitened-coordinate DCT modes (λ ascending ≈
+the prior's KL basis, unit prior std each), so **s is in units of the parameter's own
+prior, mode for mode, and the data-side information floor is 1/s² against unit prior
+curvature** — s = 1 means "the data may at most double the prior precision on these
+modes". `GlacierProblem.refresh_fingerprints(params=, level=)` measures them from the
+CURRENT state (1 + n_params·n_modes forwards, no MAP required); `inverse.py` calls it at
+every level start and every `refresh` iterations when > 0. Fingerprints are level-native;
+a level mismatch silently disables the downdate; a stale fingerprint under-forgives
+(conservative — in the saturated regime leftover pinning ~ sin²(angle)·‖w‖², so the
+per-level refresh is what drives the floor to 1/s² at the converged MAP, whose
+fingerprints are the error model of record for RTO/posterior). ĉ (printed at each
+refresh, exposed as `obs.fingerprint_c`) is the audit trail: how much of each parameter's
+pattern the term attributes to model error, in prior-std units — cross-domain consistency
+of ĉ in sign/size is the eventual evidence for a real missing term in the enthalpy
+balance. Velocity is deliberately excluded (its surge marginal's per-glacier η already
+absorbs glacier speed levels; needs its own treatment). Not a KOH method per se:
+confounding phenomenology per Brynjarsdóttir & O'Hagan (2014), span geometry the mirror
+of Plumlee (2017)'s orthogonal discrepancy, downdate algebra = astrophysics template
+marginalization (Rybicki & Press 1992; van Haasteren & Levin 2013). Enabled for denali
+(both params, s = 1, n_modes = 4, refresh at level starts).
+
 **Profiled logit nuisance for the Brier terms (`LogitNuisance`).** `ExtentSpec` and
 `SnowlineSpec` accept `logit_error=MaternNoise(sigma, l, nu)` (nugget must be 0; σ in
 logit units): the class probability becomes `p(η_model + ε)` with a coherent logit-error

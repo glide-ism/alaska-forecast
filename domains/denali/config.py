@@ -9,7 +9,10 @@ stay in the driver scripts.
 
 from pathlib import Path
 
-from glacier_inverse.config import BedConditioningConfig, GlacierConfig, MaternNoise, PriorHyperparams, Schedule
+from glacier_inverse.config import (
+    BedConditioningConfig, FingerprintNuisance, GlacierConfig, MaternNoise,
+    PriorHyperparams, Schedule,
+)
 from glacier_inverse.observations import (
     BedSpec, BedSlopeSpec, DhdtSpec, ExtentSpec, SnowlineSpec, SurfaceSpec, VelocitySpec,
 )
@@ -36,6 +39,17 @@ CONFIG = GlacierConfig(
     # l = the synoptic/orographic decorrelation scale.
     h_atm_prior=PriorHyperparams(sigma=0.2, l=80000.0, nu=1),
     cloud_prior=PriorHyperparams(sigma=0.25, l=80000.0, nu=1),
+    # Rank-few model-error marginalization along the measured H_atm/f
+    # sensitivity fingerprints (leading prior modes, whitened units): the
+    # srf/dhdt data may at most double the prior precision on these modes
+    # (s = 1 -> info floor 1/s^2 = one prior's worth), instead of the
+    # measured 10^4-10^6x pinning. The fitted c-hat (printed at each
+    # refresh) is the amount of each parameter's pattern attributed to
+    # model error, in prior-std units. refresh=0: re-measure fingerprints
+    # at each level start only.
+    fingerprint_nuisance=FingerprintNuisance(
+        params=("log_H_atm", "logit_cloud"), s=(1.0, 1.0),
+        n_modes=4, refresh=0),
     # Shortwave: the inverted scalar f is the CLEAR-SKY fraction (1 - cloud
     # fraction); direct = f*S0*I (S0 = q_sw_clear = 1361, tau^airmass lives in
     # the direct potential I) and diffuse = (f*k_clr + (1-f)*k_cld)*S0*I_dif from
@@ -65,7 +79,9 @@ CONFIG = GlacierConfig(
         SurfaceSpec(noise=MaternNoise(sigma=12.0, l=1000.0, nu=0.5, nugget=10.0,
                                       discrepancy=MaternNoise(sigma=20.0, l=80000.0, nu=1.0)),
                     weight=1.0, nu=3),
-        VelocitySpec(noise=MaternNoise(sigma=12.0, l=3000.0, nugget=10.0), weight=1.0,
+        VelocitySpec(noise=MaternNoise(sigma=12.0, l=3000.0, nugget=10.0,
+        discrepancy=MaternNoise(sigma=20.0, l=80000.0, nu=1.0)
+), weight=1.0,
                      surge_biased=True, nu=3, alpha_nonsurge=20),
         # eps_max bounds the coherent logit error (eps = eps_max*tanh(u/
         # eps_max)): below the bound the Gaussian model is unchanged, but a

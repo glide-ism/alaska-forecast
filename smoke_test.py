@@ -694,6 +694,67 @@ def main() -> int:
     except ValueError:
         check("MaternNoise rejects a negative nugget", True)
 
+    header("7e. Fingerprint nuisance (rank-few model-error marginalization)")
+    from glacier_inverse.config import FingerprintNuisance
+    from glacier_inverse.observations import profile_fingerprints
+
+    # Unit check: with a residual exactly along one fingerprint and a huge
+    # Huber threshold (quadratic regime), the profile matches the closed
+    # form c* = a|w|^2/(|w|^2 + 1/s^2) and the downdated objective the
+    # Sherman-Morrison value.
+    wf = torch.randn(64, 64, device="cuda")
+    wf = wf / wf.norm() * 30.0            # |w|^2 = 900
+    a = 0.7
+    z_syn = a * wf
+    zd, fprior, c = profile_fingerprints(z_syn, [(wf, 1.0)], nu=1e3)
+    c_star = a * 900.0 / 901.0
+    F_star = 0.5 * a ** 2 * 900.0 / 901.0
+    F_got = float(0.5 * (zd ** 2).sum() + fprior)
+    check("fingerprint profile matches the quadratic closed form",
+          abs(float(c[0]) - c_star) < 1e-3
+          and abs(F_got - F_star) < 1e-3 * (1 + F_star),
+          f"c={float(c[0]):.5f} vs {c_star:.5f}; "
+          f"J={F_got:.4f} vs {F_star:.4f} (undowndated {0.5*a**2*900:.1f})")
+
+    # Integration: measure real fingerprints on the wrangell problem (an
+    # ad-hoc whitened surface term; 1 + 2*2 forwards at the coarse level),
+    # then check the downdate: J_fp <= J_plain (c = 0 feasible), c-hat
+    # finite, envelope gradient reaches z_bed.
+    # Same hyperparameters as 7b's registration — the noise-model registry is
+    # idempotent per product name and would reject a mismatch.
+    srf_fp = SurfaceSpec(noise=MaternNoise(10.0, 1000.0),
+                         weight=1.0).build(problem.build_ctx)
+    problem.observations.append(srf_fp)
+    try:
+        fpn = FingerprintNuisance(params=("log_H_atm", "logit_cloud"),
+                                  s=(1.0, 1.0), n_modes=2, fd_step=0.5)
+        problem.refresh_fingerprints(params=params, level=level, fp=fpn)
+        kw_fp = dict(sim=sim, physical=physical, config=cfg0, domain=domain,
+                     mask=mask, dx=problem.dx, weight=1.0)
+        J_fp = srf_fp.loss(**kw_fp)
+        c_hat = srf_fp.fingerprint_c
+        srf_fp.set_fingerprints(None, level)
+        J_plain_fp = srf_fp.loss(**kw_fp)
+        check("fingerprints installed and profile <= plain whitened loss",
+              c_hat is not None and c_hat.shape == (4,)
+              and torch.isfinite(c_hat).all().item()
+              and J_fp.item() <= J_plain_fp.item() * (1 + 1e-6),
+              f"J_fp={J_fp.item():.4f} <= J_plain={J_plain_fp.item():.4f}, "
+              f"c-hat={[f'{v:+.3f}' for v in c_hat.tolist()]}")
+        params.z_bed.grad = None
+        J_fp.backward(retain_graph=True)
+        check("fingerprint-downdated loss gives z_bed a finite gradient",
+              params.z_bed.grad is not None
+              and torch.isfinite(params.z_bed.grad).all().item())
+        params.z_bed.grad = None
+    finally:
+        problem.observations.remove(srf_fp)
+    try:
+        FingerprintNuisance(params=("log_H_atm",), s=(1.0, 2.0))
+        check("FingerprintNuisance rejects mismatched s/params", False)
+    except ValueError:
+        check("FingerprintNuisance rejects mismatched s/params", True)
+
     header("7d. Checkpoint save/load + scalar->field conversion")
     import tempfile
     from glacier_inverse.io import save_whitened_params, load_whitened_params_into

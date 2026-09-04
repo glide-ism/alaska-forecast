@@ -575,6 +575,90 @@ class GlacierProblem:
             vector_fields=vector_fields,
         )
 
+    def refresh_fingerprints(self, *, params, level: int, fp=None,
+                             verbose: bool = True) -> None:
+        """Measure the smooth SMB parameters' sensitivity fingerprints at the
+        CURRENT state and install them on the whitened surface / dh/dt
+        likelihoods (see config.FingerprintNuisance for the model and
+        references). Cost: 1 + len(params)·n_modes forwards at `level`, all
+        under no_grad.
+
+        Perturbations are taken in WHITENED coordinates along the leading
+        orthonormal DCT modes (λ ascending — the parameter prior's KL basis
+        to good approximation), so each direction is one prior std of that
+        mode and the installed fingerprints w_j = Δz/δ are in
+        prior-standardized units: the downdate then caps the data-side
+        information at 1/s² per mode against a unit prior curvature.
+        The driver calls this at every level start (and every
+        `fp.refresh` iterations when > 0); fingerprints are level-native and
+        a level mismatch silently disables the downdate, so a term is never
+        downdated with a stale grid."""
+        fp = self.config.fingerprint_nuisance if fp is None else fp
+        if fp is None:
+            return
+        znames = {"log_H_atm": "z_log_H_atm", "logit_cloud": "z_logit_cloud"}
+        members = {"log_H_atm": self.priors.h_atm_model,
+                   "logit_cloud": self.priors.cloud_model}
+        for p in fp.params:
+            if p not in znames:
+                raise ValueError(
+                    f"FingerprintNuisance param {p!r}: only "
+                    f"{tuple(znames)} carry fingerprint support")
+            if members[p] is None:
+                raise ValueError(
+                    f"FingerprintNuisance param {p!r} requires "
+                    f"smb_model='enthalpy' (no Matérn member built)")
+        targets = [obs for obs in self.observations
+                   if obs.name in ("srf", "dhdt")
+                   and getattr(obs, "noise", None) is not None]
+        if not targets:
+            return
+        from scipy.fft import idctn as _idctn
+        ny, nx = self.ny, self.nx
+        lam = ((2.0 - 2.0 * np.cos(np.pi * np.arange(ny) / ny))[:, None]
+               + (2.0 - 2.0 * np.cos(np.pi * np.arange(nx) / nx))[None, :])
+        flat = np.argsort(lam.ravel())[:fp.n_modes]
+        modes = []
+        for f in flat:
+            one = np.zeros((ny, nx), dtype=np.float64)
+            one[np.unravel_index(f, (ny, nx))] = 1.0
+            modes.append(torch.tensor(
+                _idctn(one, norm="ortho").astype(np.float32), device="cuda"))
+
+        cfg0 = self.config.at_iteration(0, 0, schedule=False)
+        mask = (self.domain.rgi_mask * self.domain.domain_mask).to(torch.float32)
+        kw = dict(config=cfg0, domain=self.domain, mask=mask, dx=self.dx)
+        if verbose:
+            for obs in targets:
+                if obs.fingerprint_c is not None:
+                    c = ", ".join(f"{v:+.2f}" for v in obs.fingerprint_c.tolist())
+                    print(f"[fingerprints] {obs.name}: last c-hat = [{c}]")
+        with torch.no_grad():
+            sim0, phys0 = self.simulate(level=level, params=params)
+            base = {obs.name: obs.residuals(sim=sim0, physical=phys0, **kw)["z"]
+                    .detach() for obs in targets}
+            del sim0, phys0
+            fps = {obs.name: [] for obs in targets}
+            for pname, s in zip(fp.params, fp.s):
+                for phi in modes:
+                    pert = params.detach_clone()
+                    getattr(pert, znames[pname]).add_(fp.fd_step * phi)
+                    sim, phys = self.simulate(level=level, params=pert)
+                    for obs in targets:
+                        z = obs.residuals(sim=sim, physical=phys, **kw)["z"]
+                        fps[obs.name].append(
+                            ((z.detach() - base[obs.name]) / fp.fd_step, s))
+                    del sim, phys, pert
+        for obs in targets:
+            obs.set_fingerprints(fps[obs.name], level)
+        if verbose:
+            for obs in targets:
+                norms = ", ".join(f"{float((w ** 2).sum()):.3g}"
+                                  for w, _ in fps[obs.name])
+                print(f"[fingerprints] {obs.name} @ level {level}: "
+                      f"|w|^2 per direction = [{norms}] "
+                      f"(data info per mode, prior-std units; floor 1/s^2)")
+
     def write_residuals(self, output_dir: str, sim, physical,
                         base: str = "residuals") -> None:
         """Dump every field likelihood's residual diagnostics (`obs.residuals()`:

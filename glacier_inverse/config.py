@@ -208,6 +208,63 @@ class MaternNoise:
 
 
 @dataclass(frozen=True)
+class FingerprintNuisance:
+    """Rank-few model-error marginalization along the smooth SMB parameters'
+    sensitivity fingerprints.
+
+    Motivation: the field likelihoods' Gauss–Newton information about the
+    smooth enthalpy parameter fields (log H_atm, logit clear-sky f) is
+    10⁴–10⁶× their priors' — but it rides on glacier-scale sensitivity
+    structure whose model error is exactly the thing we know exists, so the
+    counting is unearned (measured 2026-09: the l_D = 80 km level
+    discrepancies discounted 0–9% of it). Fix: admit a nuisance
+    `Σ_j c_j·g_j`, `c_j ~ N(0, s²)`, where `g_j = ∂(residual)/∂(mode_j)` are
+    the MEASURED fingerprints of the parameter's leading prior modes — "there
+    may be model error whose imprint mimics this parameter". Marginalizing
+    the Gaussian c (profiled with the pseudo-Huber, envelope gradient — the
+    LogitNuisance pattern, k-dimensional instead of field-valued) caps the
+    data-side information about mode j at 1/s² in prior-standardized units.
+
+    Since the mode perturbations are taken in WHITENED coordinates (unit
+    prior std per mode), `s` reads as "model error up to s× the parameter's
+    own prior, mode for mode": s = 1 means the data may at most double the
+    prior precision on these modes — the honest few-knobs/few-observations
+    regime. Attribution phenomenology per Brynjarsdóttir & O'Hagan (2014);
+    span geometry mirrors Plumlee (2017)'s orthogonal discrepancy (sign of
+    intent flipped); the downdate algebra is astrophysics template
+    marginalization (Rybicki & Press 1992; van Haasteren & Levin 2013).
+
+    Applied to the whitened surface and dh/dt likelihoods (velocity's surge
+    marginal needs its own treatment — its per-glacier η already absorbs
+    glacier speed levels). Fingerprints are measured by finite differences
+    (1 + len(params)·n_modes forwards) from the CURRENT state:
+    `refresh = 0`/None re-measures at the start of each multigrid level;
+    `refresh = N > 0` additionally every N iterations. A stale fingerprint
+    degrades conservatively (less forgiveness, never more). The fitted ĉ
+    (per term, in prior-std units) is the audit trail: it reads "this term
+    attributes ĉ× the prior's worth of this parameter's pattern to model
+    error rather than physics".
+    """
+    params: tuple = ("log_H_atm", "logit_cloud")
+    s: tuple = (1.0, 1.0)      # per-param, in units of the param's prior std
+    n_modes: int = 4           # leading prior modes per parameter
+    refresh: Optional[int] = 0  # 0/None: each level start; N>0: also every N iters
+    fd_step: float = 0.5       # FD step, prior-std units
+
+    def __post_init__(self):
+        if len(self.s) != len(self.params):
+            raise ValueError(
+                f"FingerprintNuisance: len(s)={len(self.s)} must match "
+                f"len(params)={len(self.params)}")
+        if any(not (v > 0.0) for v in self.s):
+            raise ValueError("FingerprintNuisance: every s must be > 0")
+        if self.n_modes < 1:
+            raise ValueError("FingerprintNuisance: n_modes must be >= 1")
+        if not (self.fd_step > 0.0):
+            raise ValueError("FingerprintNuisance: fd_step must be > 0")
+
+
+@dataclass(frozen=True)
 class SolverConfig:
     coarsest_steps: int = 200
     pre_steps: int = 10
@@ -353,6 +410,9 @@ class GlacierConfig:
     # smb_model="enthalpy" (the Matern members are not built otherwise).
     h_atm_prior:    PriorHyperparams = PriorHyperparams(sigma=0.2,     l=80000.0, nu=1)
     cloud_prior:    PriorHyperparams = PriorHyperparams(sigma=0.25,    l=80000.0, nu=1)
+    # Opt-in rank-few model-error marginalization along the smooth SMB
+    # parameters' measured sensitivity fingerprints (see FingerprintNuisance).
+    fingerprint_nuisance: Optional["FingerprintNuisance"] = None
 
     # Scalar prior mean of the log_beta field: the Matern prior (and its
     # whitened representation) applies to log_beta - mu_log_beta, so the
