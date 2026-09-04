@@ -62,14 +62,25 @@ class SpectralMaternNoise:
         import cupyx.scipy.fft as cfft
         self._fft = cfft
         self.hp, self.ny, self.nx, self.dx = hp, ny, nx, dx
-        nu, alpha = float(hp.nu), float(hp.nu) + 1.0
-        kappa = math.sqrt(8.0 * nu) / hp.l
-        tau = math.sqrt(hp.sigma ** 2 * (4.0 * math.pi) * kappa ** (2 * nu)
-                        * _gamma_fn(alpha) / _gamma_fn(nu))
         li = (2.0 - 2.0 * np.cos(np.pi * np.arange(ny) / ny)) / dx ** 2
         lj = (2.0 - 2.0 * np.cos(np.pi * np.arange(nx) / nx)) / dx ** 2
         lam = li[:, None] + lj[None, :]
-        var = (tau / dx) ** 2 * (kappa ** 2 + lam) ** (-alpha) + hp.nugget ** 2
+
+        def matern_var(sigma, l, nu):
+            nu, alpha = float(nu), float(nu) + 1.0
+            kappa = math.sqrt(8.0 * nu) / l
+            tau = math.sqrt(sigma ** 2 * (4.0 * math.pi) * kappa ** (2 * nu)
+                            * _gamma_fn(alpha) / _gamma_fn(nu))
+            return (tau / dx) ** 2 * (kappa ** 2 + lam) ** (-alpha)
+
+        # Covariances add: base Matérn + white nugget + the optional smooth
+        # discrepancy component (the marginalized Kennedy–O'Hagan field) —
+        # all diagonal in the shared DCT basis, so the sum is still an exact
+        # spectral filter.
+        var = matern_var(hp.sigma, hp.l, hp.nu) + hp.nugget ** 2
+        if hp.discrepancy is not None:
+            d = hp.discrepancy
+            var = var + matern_var(d.sigma, d.l, d.nu)
         self._w = cp.asarray(var ** -0.5, dtype=cp.float32)   # C^{-1/2}
         self._m = cp.asarray(var ** 0.5, dtype=cp.float32)    # C^{+1/2}
 

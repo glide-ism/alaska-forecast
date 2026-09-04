@@ -150,12 +150,30 @@ class MaternNoise:
       the fitted c0 (in the product's units); the post-hoc check is
       `tools/residual_variograms.py` (std(z) → 1, γ_z(dx)/var → 1).
 
+    * `discrepancy`: an optional SECOND Matérn component at the domain/
+      synoptic scale — C = C_Matérn(σ, l, ν) + nugget²·I +
+      C_Matérn(σ_D, l_D, ν_D) — the exact (conjugate) marginalization of a
+      Kennedy–O'Hagan model-discrepancy field δ ~ GP(0, σ_D, l_D): a
+      coherent offset between prediction and product, trusted only to σ_D
+      per l_D-sized patch. Whitening by the sum is spectrally-shaped
+      tempering η(k) = C(k)/(C(k)+C_D(k)): fine scales (which constrain
+      bed/β) keep full weight, and only the near-constant modes — where a
+      variogram from ONE domain realization carries no information, so the
+      base model's k→0 confidence is extrapolation, not inference — are
+      discounted. The data's information about the product/prediction LEVEL
+      is thereby capped at ~one observation of error σ_D per l_D patch
+      instead of N_eff, which is what keeps a domain's few smooth SMB knobs
+      from being pinned through the domain-mean channel. The discrepancy
+      component itself must have nugget = 0 and no nested discrepancy; its
+      presence forces the spectral path.
+
     Duck-compatible with `PriorHyperparams` (same first three attributes).
     """
     sigma: float
     l: float
     nu: float = 1
     nugget: float = 0.0
+    discrepancy: Optional["MaternNoise"] = None
 
     def __post_init__(self):
         if not (self.sigma > 0.0):
@@ -166,13 +184,26 @@ class MaternNoise:
             raise ValueError(f"MaternNoise.nugget must be >= 0, got {self.nugget}")
         if isinstance(self.nu, bool) or not (self.nu > 0.0):
             raise ValueError(f"MaternNoise.nu must be a positive real, got {self.nu!r}")
+        if self.discrepancy is not None:
+            d = self.discrepancy
+            if not isinstance(d, MaternNoise):
+                raise ValueError(
+                    f"MaternNoise.discrepancy must be a MaternNoise, got "
+                    f"{type(d).__name__}")
+            if d.nugget != 0.0 or d.discrepancy is not None:
+                raise ValueError(
+                    "MaternNoise.discrepancy is a single smooth Matérn "
+                    "component: it carries no nugget (the base model's "
+                    "nugget prices pixel noise) and no nested discrepancy.")
 
     @property
     def stencil_compatible(self) -> bool:
-        """True when ggapp's stencil whitening applies exactly: no nugget
-        and ν a positive odd integer. Otherwise the spectral path is used."""
+        """True when ggapp's stencil whitening applies exactly: no nugget,
+        no discrepancy component, and ν a positive odd integer. Otherwise
+        the spectral path is used."""
         nu = self.nu
-        return (self.nugget == 0.0 and float(nu).is_integer()
+        return (self.nugget == 0.0 and self.discrepancy is None
+                and float(nu).is_integer()
                 and int(nu) >= 1 and int(nu) % 2 == 1)
 
 

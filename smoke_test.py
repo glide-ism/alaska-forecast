@@ -503,6 +503,58 @@ def main() -> int:
             check("re-registering srf with a different nugget raises", True)
         del srf_n
 
+        import cupy as cp
+        import dataclasses
+        # Discrepancy component (marginalized Kennedy–O'Hagan model error):
+        # C = C_Matern + nugget^2 I + C_disc. Whitening by the sum caps the
+        # information about a spatially CONSTANT residual (the product/
+        # prediction level) at ~one observation of error sigma_D, while the
+        # fine scales keep their weight; the spectral pair stays exactly
+        # inverse; sampling from the summed model whitens to unit variance.
+        hp_base = MaternNoise(10.0, 1000.0, nu=0.5, nugget=5.0)
+        hp_disc = MaternNoise(10.0, 1000.0, nu=0.5, nugget=5.0,
+                              discrepancy=MaternNoise(20.0, 60000.0, nu=1.0))
+        m_base = problem.priors.noise_model("srf_disc_base", hp_base)
+        m_disc = problem.priors.noise_model("srf_disc_test", hp_disc)
+        check("MaternNoise with discrepancy is not stencil-compatible",
+              not hp_disc.stencil_compatible)
+        const = cp.ones((problem.ny, problem.nx), dtype=cp.float32)
+        info_base = float((cp.asarray(m_base.whiten(const)) ** 2).sum())
+        info_disc = float((cp.asarray(m_disc.whiten(const)) ** 2).sum())
+        # One observation of a unit offset at sigma_D = 20 -> (1/20)^2.
+        check("discrepancy caps the constant-mode information near "
+              "(c/sigma_D)^2",
+              info_disc < 20.0 * (1.0 / 20.0) ** 2
+              and info_base / info_disc > 50.0,
+              f"info(const): base={info_base:.4g} disc={info_disc:.4g} "
+              f"(1/sigma_D^2 = {(1.0/20.0)**2:.4g}, "
+              f"ratio {info_base/info_disc:.3g}x)")
+        eps_w = cp.random.standard_normal(
+            (problem.ny, problem.nx), dtype=cp.float32)
+        rt = float(cp.linalg.norm(m_disc.whiten(m_disc.forward(eps_w)) - eps_w)
+                   / cp.linalg.norm(eps_w))
+        zsq = float((cp.asarray(m_disc.whiten(m_disc.forward(eps_w))) ** 2).mean())
+        check("discrepancy model: exact spectral pair and unit whitened draw",
+              rt < 1e-4 and abs(zsq - 1.0) < 0.05,
+              f"round-trip rel err = {rt:.3e}, mean(z^2) = {zsq:.3f}")
+        same = problem.priors.noise_model("srf_disc_test", hp_disc)
+        check("discrepancy model registry is idempotent (nested equality)",
+              same is m_disc)
+        try:
+            problem.priors.noise_model(
+                "srf_disc_test", dataclasses.replace(
+                    hp_disc, discrepancy=MaternNoise(30.0, 60000.0, nu=1.0)))
+            check("re-registering with a different discrepancy raises", False)
+        except ValueError:
+            check("re-registering with a different discrepancy raises", True)
+        try:
+            MaternNoise(10.0, 1000.0,
+                        discrepancy=MaternNoise(20.0, 60000.0, nugget=1.0))
+            check("discrepancy with a nugget raises", False)
+        except ValueError:
+            check("discrepancy with a nugget raises", True)
+        del m_base, m_disc, const, eps_w
+
         # Contracts.
         try:
             validate_noise_weights([SurfaceSpec(noise=noise, weight=2e-6)

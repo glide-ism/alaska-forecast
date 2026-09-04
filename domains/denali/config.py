@@ -54,7 +54,17 @@ CONFIG = GlacierConfig(
     grad_start_time=1712,
     #t_start=1712,
     observations=(
-        SurfaceSpec(noise=MaternNoise(sigma=12.0, l=1000.0, nu=0.5, nugget=10.0), weight=1.0, nu=3),
+        # discrepancy: marginalized Kennedy-O'Hagan model-error component at
+        # the synoptic scale — the surface term's information about the
+        # domain/patch-scale LEVEL of the model-vs-DEM misfit is capped at
+        # ~one observation of error sigma_D per l_D patch (the k->0 tail of
+        # the 1-km Matern was extrapolation: a single-domain variogram has
+        # n~1 samples at 80 km). Fine-scale weight (what constrains bed/beta)
+        # is untouched. This is what stops the smooth SMB fields being pinned
+        # through the domain-mean surface channel.
+        SurfaceSpec(noise=MaternNoise(sigma=12.0, l=1000.0, nu=0.5, nugget=10.0,
+                                      discrepancy=MaternNoise(sigma=20.0, l=80000.0, nu=1.0)),
+                    weight=1.0, nu=3),
         VelocitySpec(noise=MaternNoise(sigma=12.0, l=3000.0, nugget=10.0), weight=1.0,
                      surge_biased=True, nu=3, alpha_nonsurge=20),
         # eps_max bounds the coherent logit error (eps = eps_max*tanh(u/

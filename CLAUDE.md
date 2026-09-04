@@ -175,7 +175,22 @@ makes every pixel's fine-scale pattern count against it (curvature ~ nugget⁻²
 values: surface σ 12 m, l = bed-prior l (the user's rule: surface and bed measure the same
 quantity, so l_srf ≥ l_bed), ν ½, nugget 10 m; velocity σ 12 m yr⁻¹ per component, l 3 km,
 ν 1, nugget 10 (ITS_LIVE's typical error — the inputs carry no error field); dh/dt σ 0.5 ×
-reported error, l 7.7/7.2 km (= 2× the fitted exponential range), ν ½, nugget 1.0. Note
+reported error, l 7.7/7.2 km (= 2× the fitted exponential range), ν ½, nugget 1.0.
+**`discrepancy=MaternNoise(σ_D, l_D, ν_D)`** adds an optional second smooth component at
+the synoptic scale — the exact (conjugate) marginalization of a Kennedy–O'Hagan
+model-discrepancy field, i.e. "the product/prediction LEVEL is trusted only to σ_D per
+l_D patch". Whitening by the sum is spectrally-shaped tempering η(k) = C(k)/(C(k)+C_D(k)):
+fine scales keep full weight, the near-constant modes — where a single-domain variogram
+has n ≈ 1 samples and the base model's k→0 confidence is extrapolation, not inference —
+are capped at ~one observation per patch. This is what stops the few smooth SMB knobs
+(the H_atm/cloud fields) being pinned through the domain-mean channel: on denali the
+surface term's information about a uniform model−DEM offset drops from ±0.11 m (!) to
+±15 m at σ_D 20 m / l_D 80 km. Forces the spectral path; components sum in the DCT basis
+(exact); the discrepancy itself carries no nugget and no nesting; a flat SafeBayes-style
+temper η would be the wrong shape here (it would also destroy the fine-scale constraint
+on bed/β). σ_D/l_D cannot come from within-domain variograms — use a-priori product/
+forcing bias budgets or the cross-range scatter of fitted smooth fields (empirical Bayes
+across domains). Enabled for denali's surface term (σ_D 20 m, l_D 80 km, ν 1). Note
 the prior/data balance on the scalars is **not** restored by whitening alone — the
 finite-difference curvature of the data terms along `z_log_H_atm` etc. (conditional on the
 fields) stays 10⁴–10⁵× the prior's, because the scalar sensitivity fields carry their power
