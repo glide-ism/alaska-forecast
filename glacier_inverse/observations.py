@@ -1270,7 +1270,13 @@ class BedSlopeObservation(Observation):
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
         state = sim.at(self.time)
         dot = self.flow_aligned_slope(state, physical.bed, dx)
-        r = torch.sqrt(torch.relu(dot) ** 2) / self.s_scale
+        # One-sided: only ice forced UP bed steps (u.grad(B) > 0) is penalized.
+        # Do not write this as sqrt(relu(dot)**2): for 0 < dot < ~3e-23 m/yr
+        # (numerically-zero velocities on ice-free cells) the square underflows
+        # to exactly 0 in float32 and sqrt's backward divides by zero, seeding
+        # NaNs in the bed cotangent (juneau: 1240 cells -> the conditioning
+        # PCG rejects the NaN rhs and the bed silently stops updating).
+        r = torch.relu(dot) / self.s_scale
         #mag = torch.sqrt(dot ** 2 + self.eps ** 2)
         #r = torch.relu(mag - self.s0) / self.s_scale
         return config.loss_scale * weight * dx ** 2 * (mask * r ** self.p).sum()

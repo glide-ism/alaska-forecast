@@ -9,6 +9,7 @@ share the same physical model by construction.
 import inspect
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional, Union
+import numpy as np
 
 # The GlacierConfig fields that may be given as a schedule instead of a constant.
 # Per-observation weights are also schedulable, but live on the observation
@@ -364,7 +365,7 @@ class GlacierConfig:
     # same objective approximation.
     grad_start_time: Optional[float] = None
     base_anomaly_year: int = 2012
-    alpha_t2m: float = 2.2
+    alpha_t2m: float = 2.5
     
     base_precip_year: int = 2012
     alpha_precip: float = 0.0
@@ -390,9 +391,9 @@ class GlacierConfig:
     anomaly_integration: str = "mean_anomaly"
 
     # Field priors (Matern)
-    bed_prior:      PriorHyperparams = PriorHyperparams(sigma=250.0,    l=1000.0,  nu=1)
+    bed_prior:      PriorHyperparams = PriorHyperparams(sigma=500.0,    l=2000.0,  nu=1)
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0,   l=10000.0, nu=1)
-    log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=3.0,      l=1000.0,  nu=1)
+    log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=1./3.,      l=1000.0,  nu=1)
     pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
     tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
     # Priors for the enthalpy SMB parameters, which are (ny, nx) GP FIELDS
@@ -433,68 +434,19 @@ class GlacierConfig:
     # equilibrium is a fixed point of a non-conservative field (same formal
     # status as the warm-started profiled nuisances); the pull-table
     # stationarity test still applies blockwise. RTO must apply the same eta
-    # when it is migrated (noted in rto_sample.py). CAUTION: the balancing
-    # eta scales with the state-dependent misspecified pull AND with
-    # loss_scale-vs-whitened units (a 1e-3 factor that has already been
-    # fumbled once) — prefer influence_cap below, which needs neither.
+    # when it is migrated (noted in rto_sample.py).
     smb_data_influence: float = 1.0
-    # Bounded-influence (robust) cap on the whitened data score, per
-    # parameter: {z_attr_name: C_z} with C_z the PER-MODE trust level in
-    # PRIOR-STD units, e.g. {"z_log_H_atm": 2.0, "z_tbias": 2.0}. The
-    # applied joint cap is sqrt(d_eff)*C_z — a calibrated likelihood's score
-    # across d informed modes scales as sqrt(d), so without this a many-dof
-    # field (tbias, d_eff ~ 2A/(pi l^2) ~ 1e2) would be rationed
-    # C_z/sqrt(d) per mode while a scalar got C_z. d_eff is resolved
-    # automatically from the parameter prior's correlation area
-    # (loss.resolve_influence_caps; pass (C_z, d) to override, e.g. for
-    # non-nu=1 priors), so C_z keeps ONE meaning across blocks and domains.
-    # Caveat: the joint cap bounds the total budget, not concentration —
-    # inspect the fitted field for a single smooth swell spending
-    # sqrt(d)*C_z on one mode. The block's data gradient
-    # is radially saturated at the cap (tanh), i.e. ADAPTIVE
-    # tempering eta(w) = tanh(x)/x: inside the prior's C_z contour the
-    # likelihood acts essentially unmodified; demands that would carry the
-    # block outside its typical set are discounted as implausible requests
-    # of the misspecified model. Equilibrium theorem: at stationarity
-    # ||z*|| <= C_z regardless of the misspecification magnitude — the
-    # bound is stated in prior geometry, needs no pull-table calibration,
-    # and transfers across domains unchanged. Direction preserved. Lineage:
-    # bounded influence functions (Huber's psi), generalized Bayes under
-    # misspecification (Jewson, Smith & Holmes 2018; beta/gamma-divergence
-    # posteriors). Behaviorally, a saturated cap pins the block near the
-    # C_z contour — an emergent soft boundary, justified likelihood-side
-    # (the prior itself is untouched, and a well-specified likelihood with
-    # modest demands never feels it). Leave parameters DESIGNED to absorb
-    # local structural error (tbias, log_beta, pbias) uncapped. The
-    # saturation factor x is printed by inverse.py as the audit trail.
-    # See loss.apply_influence_control.
-    influence_cap: Optional[dict] = None
-    # Transfer function psi for the influence cap: the data score becomes
-    # loss_scale*C_z * psi(x), x = |g_data|/(loss_scale*C_z).
-    #   "tanh" — saturating: equilibrium ||z*|| <= C_z REGARDLESS of demand
-    #     (a hard information ceiling: magnitude beyond the cap carries
-    #     nothing; behaves as an emergent soft boundary at the C_z contour).
-    #     C_z is a bound — 2-3 is the natural range.
-    #   "log"  — non-saturating, psi = log(1+x): equilibrium
-    #     ||z*|| = C_z*log(1+x), i.e. C_z prior-stds PER E-FOLD of likelihood
-    #     demand — exponential information is required to carry the block
-    #     each additional C_z out of its prior regime, but it can happen
-    #     (the flawed-model hypothesis is defeasible). C_z is a RATE, not a
-    #     bound: at the measured melt-channel demand (x ~ 4e4, ~10.5
-    #     e-folds) C_z = 0.3 equilibrates near 3 sigma; C_z = 2 would allow
-    #     ~21 sigma. (For locally constant demand this rule is equilibrium-
-    #     equivalent to a doubly-exponential-tailed prior on the block —
-    #     every psi choice is dual to a tail assumption; this one states it
-    #     in e-folds of evidence per sigma.)
-    # Both are near-identity for x << 1 (a plausible demand passes through).
-    influence_transfer: str = "tanh"
+
+
+    influence_cap: dict = None,
+    influence_transfer: str = 'log',
 
     # Scalar prior mean of the log_beta field: the Matern prior (and its
     # whitened representation) applies to log_beta - mu_log_beta, so the
     # zero-loss state is beta = exp(mu_log_beta) rather than beta = 1.
     # Checkpointed z_log_beta is relative to this mean — changing it shifts
     # the physical field a warm start maps to.
-    mu_log_beta: float = 0.0
+    mu_log_beta: float = np.log(5.0)
 
     # Optional additive temperature bias field (units: K). A Matern GP field
     # added to the monthly t2m before the anomaly shift — the spatial,
@@ -516,7 +468,7 @@ class GlacierConfig:
     #   * under the enthalpy backend, tbias shifts t2m ONLY: t_base (the
     #     static substrate proxy) deliberately stays at the unbiased
     #     climatology, matching how the temperature anomaly is treated.
-    tbias_enabled: bool = False
+    tbias_enabled: bool = True
 
     # SMB backend: "temperature_index" (glare's ImprovedTemperatureIndex, the
     # default) or "enthalpy" (glare's EnthalpyModel — an enthalpy formulation of
@@ -544,7 +496,7 @@ class GlacierConfig:
     # q_sw_dif = (f * k_diffuse_clear + (1 - f) * k_diffuse_cloud) * q_sw_clear,
     # both from the same f. Physical values passed to the model are converted
     # to J m-2 yr-1 (K-1) via SECONDS_PER_YEAR.
-    mu_H_atm:          float = 10.0   # W m-2 K-1, prior median (of the FIELD)
+    mu_H_atm:          float = 15.0   # W m-2 K-1, prior median (of the FIELD)
     # LEGACY scalar sigma: the pointwise prior std now lives in
     # h_atm_prior.sigma. This value is used only (a) to convert pre-field
     # checkpoints (their 0-d z is de-whitened with THIS sigma before being
@@ -583,7 +535,7 @@ class GlacierConfig:
     # read mu_H_atm as the dT slope *given* this offset. A-priori interior
     # Alaska summer value ~ -40, maritime ~ -20; a monthly field from CARRA
     # downward longwave is the intended replacement.
-    q_lw0:       float = 0.0     # W m-2, constant non-albedo-scaled surface flux
+    q_lw0:       float = -40.0     # W m-2, constant non-albedo-scaled surface flux
     H_base0:     float = 0.6     # W m-2 K-1, basal conductance at zero snow mass
     albedo_snow: float = 0.9
     albedo_ice:  float = 0.4
@@ -654,7 +606,7 @@ class GlacierConfig:
     stress_scheme: str = "ssa"
 
     # Sliding
-    beta_init:   float = 2.0
+    beta_init:   float = 5.0
     sliding_m:   float = 1.0 / 3.0
     u_reg:       float = 1.0
     water_drag:  float = 0.01
@@ -760,9 +712,9 @@ class GlacierConfig:
     # still accumulates, so the first live step is well-conditioned). RTO
     # reads the steady-state `final` — as with the loss weights, `final` is
     # the contract.
-    lr_z_bed:      LearningRate = 0.5
+    lr_z_bed:      LearningRate = 0.0125
     lr_z_bed_mean: LearningRate = 0.5
-    lr_z_log_beta: LearningRate = 0.05
+    lr_z_log_beta: LearningRate = 4.05
 
     lr_z_pbias:    LearningRate = 0.001
     lr_z_tbias:    LearningRate = 0.001
