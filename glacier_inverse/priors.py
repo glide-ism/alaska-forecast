@@ -15,6 +15,7 @@ import warnings
 from pathlib import Path
 
 import cupy as cp
+import torch
 import numpy as np
 import xarray as xr
 from scipy.special import gamma as _gamma_fn
@@ -30,7 +31,15 @@ try:
 except ImportError:
     PriorCollection = None
 
-from .config import GlacierConfig, MaternNoise, PriorHyperparams
+from .config import GlacierConfig, MaternNoise, PriorHyperparams, SpectralPriorHyperparams
+
+
+def _field_prior(p, n_levels: int, ny: int, nx: int, dx: float):
+    """A field prior model from its hyperparameters: the spectral (DCT)
+    prior for SpectralPriorHyperparams, ggapp's multigrid MaternPrior else."""
+    if isinstance(p, SpectralPriorHyperparams):
+        return SpectralFieldPrior(p, ny, nx, dx)
+    return _build_matern_prior(p, n_levels, ny, nx, dx)
 
 
 def _build_matern_prior(p: PriorHyperparams, n_levels: int, ny: int, nx: int, dx: float) -> MaternPrior:
@@ -40,6 +49,83 @@ def _build_matern_prior(p: PriorHyperparams, n_levels: int, ny: int, nx: int, dx
     m.mg.parameters.nu.set(p.nu)
     m.forward_solver.fas_options.report_norms.set(False)
     return m
+
+
+def _matern_like_var(sigma, l, nu, mass, lam, dx):
+    """Per-mode variance (tau/dx)^2 (mass kappa^2 + lam)^-(nu+1) of the
+    Matern-like SPDE on the DCT eigenvalues `lam` (1/m^2): tau from (sigma,
+    l, nu) as for the Matern of marginal std sigma, so mass = 1 is that
+    Matern and mass = 0 its intrinsic counterpart (inf at lam = 0)."""
+    nu, alpha = float(nu), float(nu) + 1.0
+    kappa = math.sqrt(8.0 * nu) / l
+    tau = math.sqrt(sigma ** 2 * (4.0 * math.pi) * kappa ** (2 * nu)
+                    * _gamma_fn(alpha) / _gamma_fn(nu))
+    with np.errstate(divide="ignore"):
+        return (tau / dx) ** 2 * (mass * kappa ** 2 + lam) ** (-alpha)
+
+
+def _neumann_eigenvalues(ny, nx, dx):
+    li = (2.0 - 2.0 * np.cos(np.pi * np.arange(ny) / ny)) / dx ** 2
+    lj = (2.0 - 2.0 * np.cos(np.pi * np.arange(nx) / nx)) / dx ** 2
+    return li[:, None] + lj[None, :]
+
+
+class SpectralFieldPrior:
+    """Field prior x = M z with M = C^{1/2} diagonal in the orthonormal DCT-II
+    basis (mirror boundaries, which diagonalize ggapp's 5-point Neumann
+    Laplacian exactly): the variance of each mode is the sum of the
+    `SpectralPriorHyperparams` components' spectra, and the constant mode's
+    variance is replaced by sigma_mean^2 * N when `sigma_mean` is set (N
+    cells: the orthonormal constant coefficient is sqrt(N) times the mean).
+    `forward` applies C^{1/2}, `whiten` C^{-1/2}; both self-adjoint, exact,
+    O(N log N) -- duck-compatible with a ggapp prior member for GGaPPMap /
+    GGaPPWhiten, and `sample` draws exactly from the prior. A single mass-1
+    component reproduces ggapp's MaternPrior (its SPDE with the same
+    stencil and boundaries) to float32 rounding."""
+
+    def __init__(self, hp: SpectralPriorHyperparams, ny: int, nx: int, dx: float):
+        import cupyx.scipy.fft as cfft
+        self._fft = cfft
+        self.hp, self.ny, self.nx, self.dx = hp, ny, nx, dx
+        lam = _neumann_eigenvalues(ny, nx, dx)
+        var = np.zeros((ny, nx))
+        for c in hp.components:
+            if c.mass < 0:
+                raise ValueError(f"PriorComponent.mass must be >= 0, got {c.mass}")
+            v = _matern_like_var(c.sigma, c.l, c.nu, c.mass, lam, dx)
+            var = var + np.where(np.isfinite(v), v, 0.0)
+        intrinsic = any(c.mass == 0 for c in hp.components)
+        if hp.sigma_mean is not None:
+            var[0, 0] = hp.sigma_mean ** 2 * ny * nx
+        elif intrinsic:
+            raise ValueError("SpectralPriorHyperparams: an intrinsic component (mass = 0) "
+                             "leaves the domain mean unconstrained; set sigma_mean")
+        if not (var > 0).all():
+            raise ValueError("SpectralPriorHyperparams: a mode has zero prior variance")
+        self.var = var
+        self._w = cp.asarray(var ** -0.5, dtype=cp.float32)   # C^{-1/2}
+        self._m = cp.asarray(var ** 0.5, dtype=cp.float32)    # C^{+1/2}
+
+    def _apply(self, x, f):
+        x = cp.asarray(x, dtype=cp.float32)
+        X = self._fft.dctn(x, type=2, norm="ortho")
+        return self._fft.idctn(X * f, type=2, norm="ortho").astype(cp.float32)
+
+    def whiten(self, x):
+        return self._apply(x, self._w)
+
+    def forward(self, z, zero_init=True):
+        return self._apply(z, self._m)
+
+    def sample(self, rng=None):
+        z = (cp.random.standard_normal((self.ny, self.nx), dtype=cp.float32) if rng is None
+             else cp.asarray(rng.standard_normal((self.ny, self.nx)), dtype=cp.float32))
+        return self.forward(z)
+
+    def marginal_std(self):
+        """Pointwise prior std (spatially uniform away from the boundaries;
+        infinite-free: uses the regularized constant mode)."""
+        return float(np.sqrt(self.var.mean()))
 
 
 class SpectralMaternNoise:
@@ -135,6 +221,14 @@ def domain_shape(config: GlacierConfig) -> tuple:
     return ny, nx, dx
 
 
+def _available_variables(config: GlacierConfig) -> set:
+    """Names of the data variables in the gridded input file (opened and
+    closed eagerly — see _cropped_inputs on why no handle may linger)."""
+    path = Path(config.base_dir) / "model_inputs" / config.gridded_filename
+    with xr.open_dataset(path) as gd:
+        return set(gd.data_vars)
+
+
 def build_bed_conditioning_data(config: GlacierConfig) -> tuple:
     """Assemble the bed-conditioning data (b, D) on the cropped grid, from the
     config alone. Returns two (ny, nx) float32 numpy arrays: the precision
@@ -148,18 +242,61 @@ def build_bed_conditioning_data(config: GlacierConfig) -> tuple:
     non-diagonal) and scatter-added at 1/sigma_picks^2; coincident data merge
     by precision weighting. Out-of-crop and NaN picks are dropped; a missing
     or empty flightline file just contributes nothing.
+
+    Gridded bed observations (`bed_obs` / `bed_obs_err` in the input file —
+    BedMachine bed + errbed for Greenland) contribute every finite on-ice cell
+    at precision 1/(scale * max(err, floor))^2 when
+    `bed_conditioning.use_gridded_bed` (see BedConditioningConfig); off-ice
+    cells are left to the DEM anchor so the two never double count.
     """
     bc = config.bed_conditioning
-    gd = _cropped_inputs(config,
-                         variables=["elevation", "rgi_mask", "domain_mask"])
+    variables = ["elevation", "rgi_mask", "domain_mask"]
+    available = _available_variables(config)
+    use_gridded = (getattr(bc, "use_gridded_bed", False)
+                   and {"bed_obs", "bed_obs_err"} <= available)
+    mode = getattr(bc, "gridded_bed_data", "all")
+    if mode not in ("all", "radar"):
+        raise ValueError(f"bed_conditioning.gridded_bed_data must be 'all' or "
+                         f"'radar', got {mode!r}")
+    radar_vars = {"bed_obs_radar", "bed_obs_radar_err", "bed_radar_fraction"}
+    if use_gridded and mode == "radar":
+        if not radar_vars <= available:
+            raise ValueError(
+                "bed_conditioning.gridded_bed_data='radar' needs bed_obs_radar / "
+                "bed_obs_radar_err / bed_radar_fraction in the gridded inputs — "
+                "rebuild with preprocessing/make_dem.py (BedMachine dataid)")
+        variables += sorted(radar_vars)
+    elif use_gridded:
+        variables += ["bed_obs", "bed_obs_err"]
+    gd = _cropped_inputs(config, variables=variables)
     ny, nx = gd.sizes["y"], gd.sizes["x"]
     dem = gd.elevation.values.astype(np.float64)
 
     D = np.zeros((ny, nx), dtype=np.float64)
     num = np.zeros((ny, nx), dtype=np.float64)   # sum of value/sigma^2
 
+    off = (gd.rgi_mask.values == 0) | (gd.domain_mask.values == 0)
+    if use_gridded:
+        if mode == "radar":
+            b_obs = gd.bed_obs_radar.values.astype(np.float64)
+            e_obs = gd.bed_obs_radar_err.values.astype(np.float64) * bc.gridded_bed_err_scale
+            frac = gd.bed_radar_fraction.values.astype(np.float64)
+            ok = (frac > bc.radar_fraction_min)
+        else:
+            b_obs = gd.bed_obs.values.astype(np.float64)
+            e_obs = gd.bed_obs_err.values.astype(np.float64) * bc.gridded_bed_err_scale
+            ok = np.ones(b_obs.shape, dtype=bool)
+        ok &= np.isfinite(b_obs) & np.isfinite(e_obs) & (e_obs > 0) & ~off
+        if bc.gridded_bed_max_err is not None:
+            ok &= e_obs <= bc.gridded_bed_max_err
+        e_obs = np.maximum(e_obs, bc.gridded_bed_err_floor)
+        w = 1.0 / e_obs ** 2
+        D[ok] += w[ok]
+        num[ok] += w[ok] * b_obs[ok]
+        print(f"[bed conditioning] gridded bed ({mode}): {int(ok.sum())} on-ice cells, "
+              f"median error {np.median(e_obs[ok]) if ok.any() else float('nan'):.0f} m")
+
     if bc.include_off_ice:
-        off = (gd.rgi_mask.values == 0) | (gd.domain_mask.values == 0)
         if getattr(bc, "exclude_zero_dem", True):
             zero_fill = dem == 0.0
             n_zero = int((off & zero_fill).sum())
@@ -227,10 +364,14 @@ class GlacierPriors:
                 .fas_options.report_norms.set(False)
 
             def _add(name, p):
+                if isinstance(p, SpectralPriorHyperparams):
+                    return SpectralFieldPrior(p, ny, nx, dx)
                 return self.prior_collection.add(name, p.sigma, p.l, p.nu)
             self.bed_model      = _add("bed",      config.bed_prior)
             self.mean_model     = _add("mean",     config.mean_prior)
             self.log_beta_model = _add("log_beta", config.log_beta_prior)
+            lbm = getattr(config, "log_beta_mean_prior", None)
+            self.log_beta_mean_model = _add("log_beta_mean", lbm) if lbm is not None else None
             self.pbias_model    = _add("pbias",    config.pbias_prior)
             # Optional additive temperature bias (K). Registering a member is
             # ~free (scalars only), but keep the enabled gate so the disabled
@@ -247,20 +388,23 @@ class GlacierPriors:
                                 if enthalpy else None)
         else:
             self.prior_collection = None
-            self.bed_model      = _build_matern_prior(config.bed_prior,      config.n_levels, ny, nx, dx)
-            self.mean_model     = _build_matern_prior(config.mean_prior,     config.n_levels, ny, nx, dx)
-            self.log_beta_model = _build_matern_prior(config.log_beta_prior, config.n_levels, ny, nx, dx)
-            self.pbias_model    = _build_matern_prior(config.pbias_prior,    config.n_levels, ny, nx, dx)
+            self.bed_model      = _field_prior(config.bed_prior,      config.n_levels, ny, nx, dx)
+            self.mean_model     = _field_prior(config.mean_prior,     config.n_levels, ny, nx, dx)
+            self.log_beta_model = _field_prior(config.log_beta_prior, config.n_levels, ny, nx, dx)
+            lbm = getattr(config, "log_beta_mean_prior", None)
+            self.log_beta_mean_model = (_field_prior(lbm, config.n_levels, ny, nx, dx)
+                                        if lbm is not None else None)
+            self.pbias_model    = _field_prior(config.pbias_prior,    config.n_levels, ny, nx, dx)
             # Optional additive temperature bias (K). No hierarchy is built
             # when the term is disabled — z_tbias sits inert at 0.
             self.tbias_model = (
-                _build_matern_prior(config.tbias_prior, config.n_levels, ny, nx, dx)
+                _field_prior(config.tbias_prior, config.n_levels, ny, nx, dx)
                 if tbias_enabled else None)
             self.h_atm_model = (
-                _build_matern_prior(config.h_atm_prior, config.n_levels, ny, nx, dx)
+                _field_prior(config.h_atm_prior, config.n_levels, ny, nx, dx)
                 if enthalpy else None)
             self.cloud_model = (
-                _build_matern_prior(config.cloud_prior, config.n_levels, ny, nx, dx)
+                _field_prior(config.cloud_prior, config.n_levels, ny, nx, dx)
                 if enthalpy else None)
 
         # Correlated observation-error models (MaternNoise on a spec), keyed
@@ -354,10 +498,27 @@ class GlacierPriors:
         self.noise_models[key] = (hp, member)
         return member
 
-    def log_beta_from_whitened(self, z_log_beta):
-        """THE whitened -> log_beta map (mu_log_beta + Map(z)), shared by
-        problem.physical_from, posterior.py, and sensitivity.py."""
-        return self.mu_log_beta + GGaPPMap.apply(self.log_beta_model, z_log_beta)
+    @property
+    def log_beta_mean_additive(self) -> bool:
+        return (self.log_beta_mean_model is not None
+                and getattr(self.config, "log_beta_mean_mode", "centered") == "additive")
+
+    def log_beta_from_whitened(self, z_log_beta, z_log_beta_mean=None):
+        """THE whitened -> log_beta map, shared by problem.physical_from,
+        posterior.py, and sensitivity.py: mu_log_beta + Map(z), plus
+        Map_mean(z_mean) only in the ADDITIVE two-field mode (in the centered
+        mode the mean acts through the prior term alone, loss.compute_prior)."""
+        log_beta = self.mu_log_beta + GGaPPMap.apply(self.log_beta_model, z_log_beta)
+        if self.log_beta_mean_additive and z_log_beta_mean is not None:
+            log_beta = log_beta + GGaPPMap.apply(self.log_beta_mean_model, z_log_beta_mean)
+        return log_beta
+
+    def log_beta_mean_from_whitened(self, z_log_beta_mean):
+        """The long-wavelength log-beta field m = Map_mean(z_mean) (zeros when
+        config.log_beta_mean_prior is off)."""
+        if self.log_beta_mean_model is None:
+            return torch.zeros_like(z_log_beta_mean)
+        return GGaPPMap.apply(self.log_beta_mean_model, z_log_beta_mean)
 
     @property
     def bed_parametrization(self) -> str:

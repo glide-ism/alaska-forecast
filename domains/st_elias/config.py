@@ -9,7 +9,7 @@ stay in the driver scripts.
 from pathlib import Path
 
 from glacier_inverse.config import (BedConditioningConfig, GlacierConfig,
-                                    PriorHyperparams, Schedule)
+                                    OceanForcingConfig, PriorHyperparams, Schedule)
 from glacier_inverse.observations import (
     BedSpec, DhdtSpec, DivideFluxSpec, ExtentSpec, SnowlineSpec, SurfaceSpec,
     VelocitySpec,
@@ -47,7 +47,6 @@ CONFIG = GlacierConfig(
                          sigma_dem=25,
                          pcg_rtol=1e-3,
                          pcg_rtol_adjoint=1e-2),
-    ssa_damping=1.0,
     sliding_m=1.0,
     beta_init=0.05,
     u_reg=10.0,
@@ -64,6 +63,15 @@ CONFIG = GlacierConfig(
     dt=20.0,
     mu_H_atm=10.0,
     tbias_enabled=True,
-    calving_rate=250,
-    water_drag=0.0001,
+    water_drag=1e-3,          # 1e-4 leaves ice-free ocean cells without drag and stalls the adjoint
+    # Tidewater: glide's height-above-buoyancy calving with the front held at
+    # the RGI outline (OceanForcingConfig.pin_front: h0 = -1000 m inside the
+    # mask, +250 m outside), so beta is answerable for the observed speeds
+    # over the observed geometry. Inert on land (depth = -bed < 0 never
+    # reaches flotation). Values from greenland-forecast's stage-1 inversion.
+    calving_timescale=1.0,
+    calving_q=0.0,
+    calving_h0=0.0,
+    calving_H_c=100.0,
+    ocean_forcing=OceanForcingConfig(enabled=True, pin_front="rgi_mask"),
 )

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from glacier_inverse.config import (
     BedConditioningConfig, FingerprintNuisance, GlacierConfig, MaternNoise,
-    PriorHyperparams, Schedule,
+    OceanForcingConfig, PriorHyperparams, Schedule,
 )
 from glacier_inverse.observations import (
     BedSpec, BedSlopeSpec, DhdtSpec, ExtentSpec, SnowlineSpec, SurfaceSpec, VelocitySpec,
@@ -77,6 +77,16 @@ CONFIG = GlacierConfig(
     lr_z_tbias=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
     lr_z_log_H_atm=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
     lr_z_logit_cloud=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
+    # Tidewater: glide's height-above-buoyancy calving with the front held at
+    # the RGI outline (OceanForcingConfig.pin_front: h0 = -1000 m inside the
+    # mask, +250 m outside), so beta is answerable for the observed speeds
+    # over the observed geometry. Inert on land (depth = -bed < 0 never
+    # reaches flotation). Values from greenland-forecast's stage-1 inversion.
+    calving_timescale=1.0,
+    calving_q=0.0,
+    calving_h0=0.0,
+    calving_H_c=100.0,
+    ocean_forcing=OceanForcingConfig(enabled=True, pin_front="rgi_mask"),
 )
 
 

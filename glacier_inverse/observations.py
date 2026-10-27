@@ -24,7 +24,7 @@ working unchanged).
 import dataclasses
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import cupy as cp
 import torch
@@ -96,6 +96,18 @@ def _restrict_weighted(field, weight, level):
     num = _restrict(field * weight, level)
     den = _restrict(weight, level)
     return torch.where(den > 0, num / den.clamp(min=1e-12), torch.zeros_like(num))
+
+
+def _local_max(field: torch.Tensor, radius_cells: int) -> torch.Tensor:
+    """Maximum of |field| over a (2r+1)^2 window: the local scale a
+    relative structural-error term should refer to, so that a feature the
+    model places a cell or two off (an outlet channel on a coarse grid, a
+    thinning trough) is scored against the feature's own magnitude rather
+    than its quiet neighbour's."""
+    if radius_cells <= 0:
+        return field.abs()
+    k = 2 * int(radius_cells) + 1
+    return torch.nn.functional.max_pool2d(field.abs()[None, None], k, stride=1, padding=int(radius_cells))[0, 0]
 
 
 def _whiten(member, r: torch.Tensor) -> torch.Tensor:
@@ -601,8 +613,15 @@ class VelocityObservation(Observation):
                  nu: float, surge_biased: bool, weight: LossWeight,
                  outlier_threshold: float, alpha_surge: float = 2.0,
                  alpha_nonsurge: float = 6.0, mask_unobserved: bool = False,
-                 noise: Optional[MaternNoise] = None, noise_model=None):
+                 noise: Optional[MaternNoise] = None, noise_model=None,
+                 sigma_pixel=None):
         super().__init__(weight=weight)
+        # Optional per-pixel error stds (sigma_u, sigma_v), m/yr, from the
+        # mosaic's own error rasters (VelocitySpec.per_pixel_error): the
+        # residual is normalized by them before whitening (the member then
+        # carries unit sigma) and `sigma` is a multiplier on them — the
+        # DhdtObservation convention. None: the historical scalar sigma.
+        self.sigma_pixel = sigma_pixel
         self.alpha_surge = alpha_surge
         self.alpha_nonsurge = alpha_nonsurge
         self.mask_unobserved = mask_unobserved
@@ -639,15 +658,33 @@ class VelocityObservation(Observation):
             m = m * (U_obs2 <= self.outlier_threshold ** 2).to(m.dtype)
         return m
 
+    def _sigma_uv(self):
+        """(sigma_u, sigma_v): the per-pixel stds times the multiplier, or
+        the scalar sigma twice."""
+        if self.sigma_pixel is None:
+            return self.sigma, self.sigma
+        return self.sigma_pixel[0] * self.sigma, self.sigma_pixel[1] * self.sigma
+
+    def _normalized(self, u_pred, v_pred, m):
+        """Masked residuals in the units the whitening member expects: raw
+        m/yr for the scalar model, per-pixel-normalized (unit member) with
+        `sigma_pixel`."""
+        raw_u = (u_pred - self.u_obs) * m
+        raw_v = (v_pred - self.v_obs) * m
+        if self.sigma_pixel is None:
+            return raw_u, raw_v
+        su, sv = self._sigma_uv()
+        return raw_u / su, raw_v / sv
+
     def residuals(self, *, sim, physical, config, domain, mask, dx):
         u_pred, v_pred = self._predicted(sim.at(self.time))
         m = self._valid_mask()
-        raw_u = (u_pred - self.u_obs) * m
-        raw_v = (v_pred - self.v_obs) * m
-        out = {"r_u": raw_u / self.sigma, "r_v": raw_v / self.sigma}
+        su, sv = self._sigma_uv()
+        out = {"r_u": (u_pred - self.u_obs) * m / su, "r_v": (v_pred - self.v_obs) * m / sv}
         if self.noise is not None:
-            out["z_u"] = _whiten(self.noise_model, raw_u)
-            out["z_v"] = _whiten(self.noise_model, raw_v)
+            nu_, nv_ = self._normalized(u_pred, v_pred, m)
+            out["z_u"] = _whiten(self.noise_model, nu_)
+            out["z_v"] = _whiten(self.noise_model, nv_)
         else:
             out["z_u"], out["z_v"] = out["r_u"], out["r_v"]
         return out
@@ -659,11 +696,13 @@ class VelocityObservation(Observation):
         u_pred, v_pred = self._predicted(sim.at(self.time))
         m = self._valid_mask()
         W = self.noise_model
+        su, sv = self._sigma_uv() if self.sigma_pixel is not None else (1.0, 1.0)
         if self.surge_biased:
-            Z_obs = torch.stack((_whiten(W, m * self.u_obs).ravel(),
-                                 _whiten(W, m * self.v_obs).ravel()), dim=1)
-            Z_mod = torch.stack((_whiten(W, m * u_pred).ravel(),
-                                 _whiten(W, m * v_pred).ravel()), dim=1)
+            # per-pixel normalization commutes with the surge scaling eta
+            Z_obs = torch.stack((_whiten(W, m * self.u_obs / su).ravel(),
+                                 _whiten(W, m * self.v_obs / sv).ravel()), dim=1)
+            Z_mod = torch.stack((_whiten(W, m * u_pred / su).ravel(),
+                                 _whiten(W, m * v_pred / sv).ravel()), dim=1)
             labels = domain.rgi_label.ravel()
             sigma = torch.ones(Z_obs.shape[0], device='cuda',
                                dtype=torch.float32)
@@ -683,8 +722,9 @@ class VelocityObservation(Observation):
                 Z_obs, Z_mod, sigma, labels, eta_nodes, log_w_eff,
                 self.nu, weight, scale,
             )
-        z_u = _whiten(W, (u_pred - self.u_obs) * m)
-        z_v = _whiten(W, (v_pred - self.v_obs) * m)
+        nu_, nv_ = self._normalized(u_pred, v_pred, m)
+        z_u = _whiten(W, nu_)
+        z_v = _whiten(W, nv_)
         z2 = z_u ** 2 + z_v ** 2
         return scale * weight * self.nu ** 2 * (
             torch.sqrt(1 + z2 / self.nu ** 2) - 1).sum()
@@ -712,8 +752,16 @@ class VelocityObservation(Observation):
             if self.mask_unobserved:
                 keep = self.v_mask.ravel() > 0.0
                 U_obs, U_mod, labels = U_obs[keep], U_mod[keep], labels[keep]
-            sigma = self.sigma * torch.ones(U_obs.shape[0], device='cuda',
-                                            dtype=torch.float32)
+            if self.sigma_pixel is not None:
+                # the marginal takes one sigma per pixel: the mean of the two
+                # components' stds (they are nearly equal in the mosaics)
+                su, sv = self._sigma_uv()
+                sigma = (0.5 * (su + sv)).ravel()
+                if self.mask_unobserved:
+                    sigma = sigma[keep]
+            else:
+                sigma = self.sigma * torch.ones(U_obs.shape[0], device='cuda',
+                                                dtype=torch.float32)
             nodes, weights = leggauss(10)
             eta_nodes = torch.tensor((nodes + 1) / 2, device='cuda',
                                      dtype=torch.float32)
@@ -731,8 +779,8 @@ class VelocityObservation(Observation):
                 self.nu, weight, scale,
             )
         else:
-            r_u2 = (((u_pred - self.u_obs) ** 2 + (v_pred - self.v_obs) ** 2)
-                    / self.sigma ** 2)
+            su, sv = self._sigma_uv()
+            r_u2 = ((u_pred - self.u_obs) / su) ** 2 + ((v_pred - self.v_obs) / sv) ** 2
             if self.mask_unobserved:
                 r_u2 = r_u2 * self.v_mask
             if self.outlier_threshold is not None:
@@ -744,11 +792,14 @@ class VelocityObservation(Observation):
     def randomized(self, *, eps_u=None, eps_v=None):
         eps_u = torch.randn_like(self.u_obs) if eps_u is None else eps_u
         eps_v = torch.randn_like(self.v_obs) if eps_v is None else eps_v
+        su, sv = self._sigma_uv()
         if self.noise is not None:
             du = GGaPPMap.apply(self.noise_model, eps_u.contiguous())
             dv = GGaPPMap.apply(self.noise_model, eps_v.contiguous())
+            if self.sigma_pixel is not None:      # unit member scaled per pixel
+                du, dv = du * su, dv * sv
         else:
-            du, dv = eps_u * self.sigma, eps_v * self.sigma
+            du, dv = eps_u * su, eps_v * sv
         return VelocityObservation(
             u_obs=self.u_obs + du,
             v_obs=self.v_obs + dv,
@@ -757,7 +808,8 @@ class VelocityObservation(Observation):
             outlier_threshold=self.outlier_threshold,
             alpha_surge=self.alpha_surge, alpha_nonsurge=self.alpha_nonsurge,
             mask_unobserved=self.mask_unobserved,
-            noise=self.noise, noise_model=self.noise_model)
+            noise=self.noise, noise_model=self.noise_model,
+            sigma_pixel=self.sigma_pixel)
 
 
 class ExtentObservation(Observation):
@@ -893,15 +945,18 @@ class BedObservation(Observation):
         scale = config.loss_scale * dx ** 2
         bed_fine = physical.bed
 
-        bed_at_flightlines = grid_sample(
-            bed_fine[None, None, :, :],
-            self.bed_normed_coords[None, None, :, :],
-            mode="bilinear", align_corners=False,
-        ).squeeze()
-        r_bed_fl = (bed_at_flightlines - self.bed_obs) / self.sigma
         r_bed_grid = (bed_fine - self.dem_anchor) / self.sigma_dem * (1 - mask)
-        return scale * weight * (_huber(r_bed_fl, self.nu).sum()
-                                 + _huber(r_bed_grid, self.nu).sum())
+        J = _huber(r_bed_grid, self.nu).sum()
+        # No scattered picks (no flightline file): only the off-ice anchor.
+        if self.bed_obs.numel() > 0:
+            bed_at_flightlines = grid_sample(
+                bed_fine[None, None, :, :],
+                self.bed_normed_coords[None, None, :, :],
+                mode="bilinear", align_corners=False,
+            ).squeeze()
+            r_bed_fl = (bed_at_flightlines - self.bed_obs) / self.sigma
+            J = J + _huber(r_bed_fl, self.nu).sum()
+        return scale * weight * J
 
     def randomized(self, *, eps_bed=None, eps_S=None):
         eps_bed = torch.randn_like(self.bed_obs) if eps_bed is None else eps_bed
@@ -925,7 +980,8 @@ class BedObservation(Observation):
         row = (((rn + 1.0) * self.ny - 1.0) / 2.0).round().long().clamp_(0, self.ny - 1)
         raster = torch.full((self.ny, self.nx), float("nan"),
                             dtype=torch.float32, device="cuda")
-        raster[row, col] = self.bed_obs.to(torch.float32)
+        if self.bed_obs.numel() > 0:
+            raster[row, col] = self.bed_obs.to(torch.float32)
         return {"bed_obs": raster}
 
 
@@ -942,6 +998,52 @@ class SnowlineObservation(Observation):
     fraction, so only "snow observed, model bare" is penalized — the model may
     keep snow below the observed snowline for free. `two_sided=True` is the
     full Brier score against the fraction, penalizing both directions.
+
+    `times` (default: the single composite epoch) lists the emission times
+    whose step SMBs the model probability averages over: P = mean over the
+    times of sigmoid(SMB_t / s_smb). For a label that is the fraction of
+    SEASONS with snow (Greenland: 21 yearly snowlines) under year-by-year
+    forcing, the times are the step ends carrying those years, and the mean
+    of the per-year probabilities is the model's fraction of seasons —
+    averaging the SMBs first would compare the composite with one year's
+    weather (and the sigmoid of a mean is not the mean of sigmoids).
+
+    `loss="hinge"` replaces the Brier score on a probability by a squared
+    hinge on the SMB itself. A snowline label carries the SIGN of the
+    season's SMB and nothing about its magnitude, but a probability link
+    sigmoid(SMB / s) turns magnitude into misfit: where |SMB| is within a
+    few s of zero for physical reasons (Greenland's dry interior, 0.1-0.5
+    m/yr against label 1.00 in every year) the residual never closes and
+    ~1 M cells pull SMB - i.e. precipitation - up (inverse_v3, 2026-09).
+    Per cell i and season t, with label y in [0, 1] (the snow-covered
+    fraction of the glacierized subarea), SMB b, margin m >= 0:
+
+        v+ = relu(m - b)      violation of "snow"  (b should be >= +m)
+        v- = relu(m + b)      violation of "bare"  (b should be <= -m)
+        l  = y rho(v+) + (1 - y) rho(v-),   rho(v) = v^2 / 2
+        J  = loss_scale * weight * 4^level / s_smb^2 * sum_i omega_i mean_t l
+
+    (rho is the pseudo-Huber delta^2 (sqrt(1 + (v/delta)^2) - 1) when
+    `huber` = delta is set, quadratic below delta and linear above, for
+    misclassified product pixels; `two_sided=False` drops the v- term.) It is
+    the one-sided Gaussian: "b_true > 0 observed, model error N(0, s_smb^2)"
+    has the exact log-likelihood -log Phi(b / s), whose wrong-side asymptote
+    is b^2 / (2 s^2) and whose right side -> 0; the hinge keeps that
+    asymptote and makes the right side EXACTLY zero, so a cell that is right
+    by the margin contributes no loss and no gradient whatever its SMB, and a
+    cell that is wrong feels a gradient LINEAR in the violation (the Brier /
+    logistic gradient ~ p(1 - p) vanishes when the model is badly wrong). For
+    a fractional y the minimizer is b = m (2y - 1): the margin is the SMB
+    half-width of the snowline inside a cell. s_smb is the per-cell,
+    per-season SMB error std (m/yr). With per-season labels (`labels`, one
+    per entry of `times`) each season is scored against ITS OWN label, so the
+    term also sees which years the snowline was high; without them every
+    time is scored against the composite. `hinge_window` selects that
+    pairing: "mean_prob" instead averages the model's SNOW PROBABILITY over
+    the window and hinges on its residual against the composite fraction,
+    which is what the product observes -- see _hinge_loss. No logit
+    nuisance in this mode (that
+    machinery profiles an error on a probability's logit).
     """
 
     name = "snow"
@@ -949,20 +1051,61 @@ class SnowlineObservation(Observation):
     def __init__(self, *, snow_label, snow_mask, time: float, s_smb: float,
                  weight: LossWeight, two_sided: bool = False,
                  logit_nuisance: Optional[LogitNuisance] = None,
-                 sigma_p: Optional[float] = None):
+                 sigma_p: Optional[float] = None,
+                 times: Optional[Sequence[float]] = None,
+                 loss: str = "brier", margin: float = 0.0,
+                 huber: Optional[float] = None,
+                 labels: Optional[Sequence[torch.Tensor]] = None,
+                 hinge_window: str = "per_season",
+                 margin_prob: float = 0.05,
+                 prob_scale: Optional[float] = None):
         super().__init__(weight=weight)
+        if loss not in ("brier", "hinge"):
+            raise ValueError(f"SnowlineObservation loss={loss!r}: expected 'brier' or 'hinge'")
+        if loss == "hinge" and logit_nuisance is not None:
+            raise ValueError("SnowlineObservation: loss='hinge' has no logit nuisance; "
+                             "set logit_error=None (use `huber` for robustness)")
+        if hinge_window not in ("per_season", "mean_smb", "mean_prob"):
+            raise ValueError(f"SnowlineObservation hinge_window={hinge_window!r}: expected "
+                             "'per_season', 'mean_smb' or 'mean_prob'")
+        if hinge_window != "per_season" and loss != "hinge":
+            raise ValueError("SnowlineObservation: hinge_window applies to loss='hinge'")
+        if hinge_window == "mean_prob" and sigma_p is None:
+            raise ValueError("SnowlineObservation: hinge_window='mean_prob' scores a "
+                             "probability residual, so it needs sigma_p (the per-pixel "
+                             "snow-fraction noise std) as its scale")
+        self.hinge_window = hinge_window
+        self.margin_prob = float(margin_prob)
+        # Width of the smooth indicator in "mean_prob". It is a NUMERICAL
+        # smoothing of 1[b > 0], not an error std, and the two want opposite
+        # values: at s_smb = 0.35 the interior reports P(snow) = 0.69 against
+        # a label of 0.996 while the model's own hard indicator gives 0.990,
+        # so the residual is manufactured by the smoothing and the term
+        # chases it (61 % of the gradient above 2000 m, precipitation pulled
+        # up - the v3 Brier pathology). It must be small against the
+        # season-to-season SMB scatter: 0.02 gives P = 0.987 and 1.3 %.
+        self.prob_scale = float(s_smb if prob_scale is None else prob_scale)
         self.logit_nuisance = logit_nuisance
         self.sigma_p = sigma_p
         self.snow_label = snow_label
         self.snow_mask = snow_mask
         self.time = time
+        self.times = tuple(float(t) for t in times) if times else (float(time),)
         self.s_smb = s_smb
         self.two_sided = two_sided
+        self.loss_kind = loss
+        self.margin = float(margin)
+        self.huber = None if huber is None else float(huber)
+        # per-season labels, uint8 percent on the fine grid (one per time)
+        if labels is not None and len(labels) != len(self.times):
+            raise ValueError("SnowlineObservation: one label per time expected")
+        self.labels = labels
         self._targets = {0: (snow_mask, snow_label)}
+        self._season_targets = {}
 
     @property
     def required_times(self):
-        return (self.time,)
+        return self.times
 
     def _target_at(self, level: int):
         """(snow_mask, snow_label) box-restricted to `level`: the mask
@@ -973,12 +1116,117 @@ class SnowlineObservation(Observation):
             self._targets[level] = (m, lab)
         return self._targets[level]
 
+    def _season_label_at(self, k: int, level: int):
+        """Season k's label restricted to `level` (mask-weighted mean); the
+        composite when no per-season labels were given. Fine-grid labels stay
+        uint8 percent on the device and are decoded per use."""
+        if self.labels is None:
+            return self._target_at(level)[1]
+        if level == 0:
+            return self.labels[k].to(torch.float32) / 100.0
+        key = (k, level)
+        if key not in self._season_targets:
+            self._season_targets[key] = _restrict_weighted(
+                self.labels[k].to(torch.float32) / 100.0, self.snow_mask, level)
+        return self._season_targets[key]
+
+    def _rho(self, v):
+        if self.huber is None:
+            return 0.5 * v * v
+        d = self.huber
+        return d * d * (torch.sqrt(1.0 + (v / d) ** 2) - 1.0)
+
+    def _hinge_loss(self, *, sim, config, weight):
+        """How the window's seasons are paired with the label. `hinge_window`:
+
+          "per_season" (default)  mean_t rho(hinge(b_t)) vs each season's own
+                                  label, the historical behaviour.
+          "mean_smb"              rho(hinge(mean_t b_t)) vs the composite.
+          "mean_prob"             rho(relu(|mean_t sigmoid(b_t/s_smb) - y|
+                                  - margin_prob)) / sigma_p^2.
+
+        Which pairing is right depends on what the label observes. The model's
+        b_t is one season's SMB, whose zero contour is that year's ELA. The
+        product records the END-OF-SUMMER SNOWLINE, i.e. the ice-firn
+        interface, which survives several years of melt and so integrates
+        them: it is a low-pass filter on the model's quantity. Scoring season
+        against season therefore asks the model to reproduce a filtered
+        observable at full bandwidth, which it cannot do at any parameter
+        setting, and the term spends its gradient on the difference (at the
+        2019 state, ~280 k cells scored wrong-side). Averaging the model over
+        the window first compares like with like: mean_t b_t against the
+        fraction of seasons that ended with snow, which is a firn-presence
+        probability. Its minimizer is mean_t b_t = margin (2y - 1), so a cell
+        that held snow in 70 % of seasons wants a slightly positive mean SMB.
+
+        WARNING on "mean_smb": it is the literal reading of "average the ELA
+        over the window", but it is NOT satisfiable at the truth. With a
+        fractional y and `two_sided`, both branches are live, so a cell pays
+        y rho(relu(m - b)) + (1 - y) rho(relu(m + b)) and only |b| <= m gives
+        zero. Every cell in the transition band, where y is fractional over
+        several hundred metres of elevation while the true mean SMB runs from
+        clearly negative to clearly positive, therefore carries a standing
+        gradient pulling its mean SMB toward zero -- i.e. it FLATTENS the
+        SMB-elevation gradient exactly where the snowline's sensitivity is
+        set. Raising `margin` does not help: the floor at y = 0.5 is rho(m),
+        so the loss grows with it. On a synthetic band (sigma_y 0.5 m/yr,
+        21 seasons) the true state scores 0.0013 under "per_season" and
+        0.985 under "mean_smb". Kept because it is sometimes the right thing
+        for a nearly binary label, but not the default.
+
+        "mean_prob" is the pairing that the product actually justifies. The
+        model's ELA is averaged as a PROBABILITY, not as an SMB -- mean_t
+        sigmoid(b_t / s_smb) is the model's fraction of seasons ending with
+        snow, which is what `snow_fraction` measures -- and the hinge is
+        taken on the residual against the label, so the term saturates once
+        the model is within `margin_prob` of it. That keeps the property the
+        hinge was adopted for, which the Brier score lacks: in the interior
+        y = 1 and p ~ 0.95, and a Brier term keeps paying 0.05 and pulling
+        precipitation up, while this one is exactly zero. `sigma_p` is the
+        scale, since the residual is dimensionless.
+        """
+        states = [sim.at(t) for t in self.times]
+        level = states[0].level
+        omega, composite = self._target_at(level)
+        if self.hinge_window == "mean_prob":
+            p = torch.sigmoid(states[0].smb_coarse / self.prob_scale)
+            for st in states[1:]:
+                p = p + torch.sigmoid(st.smb_coarse / self.prob_scale)
+            p = p / float(len(states))
+            total = self._rho(torch.relu((p - composite).abs() - self.margin_prob))
+            c = weight * 4.0 ** level / self.sigma_p ** 2
+            return config.loss_scale * c * (omega * total).sum()
+        if self.hinge_window == "mean_smb":
+            b = states[0].smb_coarse
+            for st in states[1:]:
+                b = b + st.smb_coarse
+            b = b / float(len(states))
+            total = composite * self._rho(torch.relu(self.margin - b))
+            if self.two_sided:
+                total = total + (1.0 - composite) * self._rho(torch.relu(self.margin + b))
+            n_seasons = 1.0
+        else:
+            total = None
+            for k, st in enumerate(states):
+                b = st.smb_coarse
+                y = self._season_label_at(k, level)
+                l = y * self._rho(torch.relu(self.margin - b))
+                if self.two_sided:
+                    l = l + (1.0 - y) * self._rho(torch.relu(self.margin + b))
+                total = l if total is None else total + l
+            n_seasons = float(len(states))
+        c = weight * 4.0 ** level / self.s_smb ** 2
+        return config.loss_scale * c * (omega * total).sum() / n_seasons
+
     def loss(self, *, sim, physical, config, domain, mask, dx, weight):
+        if self.loss_kind == "hinge":
+            return self._hinge_loss(sim=sim, config=config, weight=weight)
         # Evaluated on the snapshot's own grid (see ExtentObservation.loss
         # for why the Brier on box-averaged targets is the right coarse form).
-        state = sim.at(self.time)
-        level = state.level
-        logits = state.smb_coarse / self.s_smb
+        states = [sim.at(t) for t in self.times]
+        level = states[0].level
+        logits = [st.smb_coarse / self.s_smb for st in states]
+        n_t = float(len(logits))
         snow_mask, snow_label = self._target_at(level)
         if self.two_sided:
             omega, target = snow_mask, snow_label
@@ -993,16 +1241,18 @@ class SnowlineObservation(Observation):
         prior = None
         if self.logit_nuisance is not None and weight > 0.0:
             with torch.no_grad():
-                ld = logits.detach()
+                ld = [lg.detach() for lg in logits]
 
                 def p_g(e):
-                    s = torch.sigmoid(ld + e)
-                    return s, s * (1 - s)
+                    # mean over the times of the per-time probability and slope
+                    s = sum(torch.sigmoid(l + e) for l in ld) / n_t
+                    g = sum((lambda q: q * (1 - q))(torch.sigmoid(l + e)) for l in ld) / n_t
+                    return s, g
                 eps, prior = self.logit_nuisance.solve(
                     level=level, dx_level=dx * 2 ** level,
                     p_g=p_g, omega=omega, target=target, c=c_data)
 
-        y = torch.sigmoid(logits + eps)
+        y = sum(torch.sigmoid(lg + eps) for lg in logits) / n_t
         J = config.loss_scale * c_data * (omega * (target - y) ** 2).sum()
         if prior is not None:
             J = J + config.loss_scale * prior
@@ -1011,7 +1261,7 @@ class SnowlineObservation(Observation):
     def residuals(self, *, sim, physical, config, domain, mask, dx):
         if self.logit_nuisance is None:
             return {}
-        eps = self.logit_nuisance.eps_at(sim.at(self.time).level)
+        eps = self.logit_nuisance.eps_at(sim.at(self.times[0]).level)
         return {} if eps is None else {"logit_eps": eps}
 
     def diagnostics(self):
@@ -1043,14 +1293,24 @@ class DhdtObservation(Observation):
     def __init__(self, *, dhdt, dhdt_err, dhdt_mask, t0: float, t1: float,
                  sigma_floor: float, nu: float, weight: LossWeight,
                  legacy_final_step: bool = False,
-                 noise: Optional[MaternNoise] = None, noise_model=None):
+                 noise: Optional[MaternNoise] = None, noise_model=None,
+                 name: Optional[str] = None, sigma_rel: float = 0.0,
+                 sigma_rel_radius: int = 0):
         super().__init__(weight=weight)
+        if name is not None:            # a second product (another window) needs its own key
+            self.name = name
         self.dhdt = dhdt
         self.dhdt_err = dhdt_err
         self.dhdt_mask = dhdt_mask
         self.t0 = t0
         self.t1 = t1
         self.sigma_floor = sigma_floor
+        # model structural error as a fraction of the observed rate (2026-09-21):
+        # a retreating outlet thinning 1 m/yr is not known to the product's
+        # 1 cm/yr formal error by the model, while the interior's cm/yr are.
+        self.sigma_rel = float(sigma_rel)
+        self.sigma_rel_radius = int(sigma_rel_radius)      # cells, on the fine grid
+        self._rel_ref = None
         self.nu = nu
         self.legacy_final_step = legacy_final_step
         self.noise = noise
@@ -1081,6 +1341,10 @@ class DhdtObservation(Observation):
         `sigma_floor`, times the noise model's multiplier when present (the
         Matérn member itself is registered with unit sigma)."""
         sigma = torch.clamp(self.dhdt_err, min=self.sigma_floor)
+        if self.sigma_rel > 0.0:
+            if self._rel_ref is None:
+                self._rel_ref = _local_max(self.dhdt.nan_to_num(), self.sigma_rel_radius)
+            sigma = torch.maximum(sigma, self.sigma_rel * self._rel_ref)
         if self.noise is not None:
             sigma = sigma * self.noise.sigma
         return sigma
@@ -1103,7 +1367,7 @@ class DhdtObservation(Observation):
             return J
         scale = config.loss_scale * dx ** 2
         dhdt_model = self.model_rate(sim, "fine")
-        sigma = torch.clamp(self.dhdt_err, min=self.sigma_floor)
+        sigma = self._sigma_pixel()
         r = (dhdt_model - self.dhdt) / sigma * self.dhdt_mask
         return scale * weight * _huber(r, self.nu).sum()
 
@@ -1118,7 +1382,9 @@ class DhdtObservation(Observation):
             dhdt_err=self.dhdt_err, dhdt_mask=self.dhdt_mask,
             t0=self.t0, t1=self.t1, sigma_floor=self.sigma_floor, nu=self.nu,
             weight=self.weight, legacy_final_step=self.legacy_final_step,
-            noise=self.noise, noise_model=self.noise_model)
+            noise=self.noise, noise_model=self.noise_model,
+            name=self.name if self.name != "dhdt" else None, sigma_rel=self.sigma_rel,
+            sigma_rel_radius=self.sigma_rel_radius)
 
     def diagnostics(self):
         return {"dhdt": self.dhdt, "dhdt_err": self.dhdt_err,
@@ -1337,14 +1603,45 @@ class VelocitySpec:
     mask_unobserved: bool = False
     # Correlated error model per component: whitened misfit, weight must be 1.
     noise: Optional[MaternNoise] = None
+    # Per-pixel error stds from the mosaic's `vx_err` / `vy_err` rasters
+    # (2026-09-21): sigma_c = max(sigma_floor, err_c, sigma_rel * |v_obs|)
+    # per component, times `sigma` / `noise.sigma` as a multiplier (the
+    # Matérn member is registered with unit sigma, its nugget is then in
+    # units of the per-pixel std — the DhdtSpec convention). The floor
+    # covers the mosaic's zero-error pixels (ITS_LIVE reports 0 on most of
+    # the ablation zone) and the model's own error on slow ice; `sigma_rel`
+    # is the model's structural error on fast ice (resolution, physics).
+    # Motivation: with a scalar sigma of 100 m/yr the interior (7-20 m/yr,
+    # product error 0-3) is unconstrained, so flux divergence can absorb any
+    # accumulation excess and the mass budget is free (inverse_v5).
+    per_pixel_error: bool = False
+    sigma_floor: float = 5.0
+    sigma_rel: float = 0.0
+    # radius (km) of the window over which |v_obs| is maximized before the
+    # relative term (the model puts a 1 km outlet channel a cell or two off,
+    # and on a coarse level smears it over the coarse cell: the quiet
+    # neighbours are then scored against the outlet's speed, not their own)
+    sigma_rel_km: float = 0.0
 
     def build(self, ctx: ObservationBuildContext) -> VelocityObservation:
         cfg = ctx.config
         gd = ctx.gridded_data
-        sigma, noise_model = self.sigma, None
+        sigma, noise_model, sigma_pixel = self.sigma, None, None
+        if self.per_pixel_error:
+            if "vx_err" not in gd or "vy_err" not in gd:
+                raise ValueError("VelocitySpec(per_pixel_error=True) needs vx_err / vy_err "
+                                 f"in {cfg.gridded_filename}")
+            speed = torch.tensor((gd.vx.values ** 2 + gd.vy.values ** 2) ** 0.5,
+                                 dtype=torch.float32, device="cuda").nan_to_num()
+            if self.sigma_rel_km:
+                speed = _local_max(speed, int(round(self.sigma_rel_km * 1e3 / float(ctx.gridded_data.x[1] - ctx.gridded_data.x[0]))))
+            sigma_pixel = tuple(
+                torch.maximum(torch.tensor(gd[e].values, dtype=torch.float32, device="cuda").nan_to_num(),
+                              torch.clamp(self.sigma_rel * speed, min=self.sigma_floor))
+                for e in ("vx_err", "vy_err"))
         if self.noise is not None:
-            noise_model = _require_priors(ctx, "VelocitySpec") \
-                .noise_model("vel", self.noise)
+            hp = dataclasses.replace(self.noise, sigma=1.0) if self.per_pixel_error else self.noise
+            noise_model = _require_priors(ctx, "VelocitySpec").noise_model("vel", hp)
             sigma = self.noise.sigma
         domain_mask = ctx.domain.domain_mask
         time = _resolve_time(self.time, gd.vx, fallback=cfg.t_end,
@@ -1361,7 +1658,7 @@ class VelocitySpec:
             weight=self.weight, outlier_threshold=self.outlier_threshold,
             alpha_surge=self.alpha_surge, alpha_nonsurge=self.alpha_nonsurge,
             mask_unobserved=self.mask_unobserved,
-            noise=self.noise, noise_model=noise_model)
+            noise=self.noise, noise_model=noise_model, sigma_pixel=sigma_pixel)
 
 
 @dataclass(frozen=True)
@@ -1416,9 +1713,14 @@ class BedSpec:
 
     def build(self, ctx: ObservationBuildContext) -> BedObservation:
         gd = ctx.gridded_data
-        flightlines = torch.tensor(
-            ctx.flightlines_df[["x", "y", "bed"]].values,
-            dtype=torch.float32, device="cuda")
+        fl = ctx.flightlines_df
+        if len(fl) == 0:
+            # No radar picks: an empty (0, 3) tensor keeps the off-ice DEM
+            # anchor alive and skips the pick term (BedObservation.loss).
+            flightlines = torch.zeros((0, 3), dtype=torch.float32, device="cuda")
+        else:
+            flightlines = torch.tensor(
+                fl[["x", "y", "bed"]].values, dtype=torch.float32, device="cuda")
         xmin, xmax = gd.x.min().item(), gd.x.max().item()
         ymin, ymax = gd.y.min().item(), gd.y.max().item()
         col_normed = 2.0 * ((flightlines[:, 0] - xmin) / (xmax - xmin)) - 1
@@ -1447,6 +1749,45 @@ class SnowlineSpec:
     # Per-pixel snow-fraction noise std; same contract as ExtentSpec.sigma_p
     # (legacy weight ↔ σ_p = 0.25/√(2·weight·dx²)).
     sigma_p: Optional[float] = None
+    # Composite over a window of seasons: (first year, last year) inclusive,
+    # or "file" for the product's time_start..time_end. The model probability
+    # is the mean over those years of sigmoid(SMB / s_smb), each year taken
+    # from the step ending at year + 1 (the step (y, y+1] carries year y's
+    # forcing; the schedule must resolve those years). None: the single
+    # nominal epoch (`time`), the historical behaviour.
+    window: Optional[object] = None
+    # "brier" (the historical probability score) or "hinge": a squared hinge
+    # on the SMB sign, zero loss and zero gradient once a cell is right by
+    # `margin` (m/yr), quadratic in the violation over s_smb^2 (s_smb is then
+    # the per-cell per-season SMB error std), pseudo-Huber beyond `huber`
+    # (m/yr of violation; None = pure quadratic). With a window and a file
+    # carrying per-year `snow_label` each season is scored against its own
+    # label. sigma_p and logit_error do not apply (logit_error raises). See
+    # SnowlineObservation.
+    loss: str = "brier"
+    margin: float = 0.0
+    huber: Optional[float] = None
+    # How the window's seasons pair with the label (loss="hinge" only).
+    # The product is the END-OF-SUMMER SNOWLINE, i.e. the ice-firn interface,
+    # which survives several melt seasons and so low-pass filters the model's
+    # per-season ELA. "per_season" scores each season against its own label,
+    # which asks the model to reproduce a filtered observable at full
+    # bandwidth. "mean_prob" averages the model as a PROBABILITY over the
+    # window and hinges on the residual against the composite
+    # `snow_fraction`, which is the pairing the product justifies and which
+    # keeps the saturation the hinge was adopted for (needs sigma_p as the
+    # scale; `margin_prob` is the dimensionless tolerance). "mean_smb"
+    # averages the SMB instead -- the literal "average the ELA" reading, but
+    # it is not satisfiable at the truth and flattens the SMB gradient across
+    # the transition band; see SnowlineObservation._hinge_loss. Per-year
+    # labels are loaded only for "per_season".
+    hinge_window: str = "per_season"
+    margin_prob: float = 0.05
+    # "mean_prob" only: width of the smooth indicator, a numerical smoothing
+    # of 1[b > 0] and NOT an error std. None = s_smb, which is far too wide
+    # and manufactures an interior residual the term then chases; ~0.02 m/yr
+    # reproduces the hard indicator. See SnowlineObservation.
+    prob_scale: Optional[float] = None
 
     def build(self, ctx: ObservationBuildContext) -> Optional[SnowlineObservation]:
         sd = ctx.snowline_data
@@ -1473,41 +1814,91 @@ class SnowlineSpec:
         ).nan_to_num()
         snow_mask = ((glacier_fraction > 0.0) & domain_mask).to(torch.float32)
         snow_label = snow_label.masked_fill(snow_mask == 0.0, 0.0)
+        times = None
+        if self.window is not None:
+            if self.window == "file":
+                _, t0, t1 = read_time_attrs(sd.snow_fraction, fallback=time,
+                                            what="snowline composite (snow_fraction)")
+            else:
+                t0, t1 = self.window
+            times = [float(y) + 1.0 for y in range(int(round(t0)), int(round(t1)) + 1)]
+        labels = None
+        if self.loss == "hinge" and self.hinge_window == "per_season" and times is not None \
+                and "snow_label" in sd and "year" in sd.snow_label.dims:
+            have = {int(y) for y in sd.year.values}
+            years = [int(round(t - 1.0)) for t in times]
+            missing = [y for y in years if y not in have]
+            if missing:
+                raise ValueError(f"snowline window years {missing} have no per-year "
+                                 f"snow_label in {ctx.config.snowline_filename}")
+            labels = [torch.tensor(sd.snow_label.sel(year=y).values, device="cuda")
+                      .clamp(0, 100).to(torch.uint8).masked_fill(snow_mask == 0.0, 0)
+                      for y in years]
         return SnowlineObservation(
-            snow_label=snow_label, snow_mask=snow_mask, time=time,
+            snow_label=snow_label, snow_mask=snow_mask, time=time, times=times,
             s_smb=self.s_smb, weight=self.weight, two_sided=self.two_sided,
             logit_nuisance=(LogitNuisance(self.logit_error,
                                           self.nuisance_inner_steps,
                                           eps_max=self.eps_max)
                             if self.logit_error is not None else None),
-            sigma_p=self.sigma_p)
+            sigma_p=self.sigma_p, loss=self.loss, margin=self.margin,
+            huber=self.huber, labels=labels, hinge_window=self.hinge_window,
+            margin_prob=self.margin_prob, prob_scale=self.prob_scale)
 
 
 @dataclass(frozen=True)
 class DhdtSpec:
     weight: LossWeight = 2e-5
     sigma_floor: float = 0.5
+    # per-pixel std = max(sigma_floor, product error, sigma_rel * |dh/dt obs|)
+    # (times noise.sigma): the relative part is the model's structural error
+    # where the signal is large (outlet retreat timing, 1 km resolution),
+    # so the floor can be lowered to the interior's firn-level uncertainty
+    # without declaring the outlets known to a few cm/yr. 0 = off.
+    sigma_rel: float = 0.0
+    # radius (km) of the window over which |dh/dt obs| is maximized before
+    # the relative term: the reference is the local feature's magnitude
+    sigma_rel_km: float = 0.0
     nu: float = 1.0                 # pseudo-Huber threshold (NOT noise.nu)
     t0: Optional[float] = None    # override; None -> file attrs -> legacy mode
     t1: Optional[float] = None
     # Correlated error model: noise.sigma multiplies the per-pixel product
     # error (the Matérn member has unit sigma); whitened misfit, weight must be 1.
     noise: Optional[MaternNoise] = None
+    # A second dh/dt product over another window (e.g. the MEaSUREs/ITS_LIVE
+    # 1992-2023 record next to ATL15 2019-2026): `filename` names another
+    # gridded_dhdt_*.nc under model_inputs (built by make_dhdt.py --name),
+    # loaded here on the same crop; `name` keys its loss term, noise model
+    # and residuals (must differ from "dhdt"). None -> config.dhdt_filename.
+    filename: Optional[str] = None
+    name: Optional[str] = None
 
     def build(self, ctx: ObservationBuildContext) -> Optional[DhdtObservation]:
-        dd = ctx.dhdt_data
+        name = self.name or "dhdt"
+        if self.filename is None:
+            dd = ctx.dhdt_data
+            filename = ctx.config.dhdt_filename
+        else:
+            from pathlib import Path
+            from .problem import _crop_to_factor, _open_eager   # lazy: problem imports us
+            filename = self.filename
+            path = Path(ctx.config.base_dir) / "model_inputs" / filename
+            if self.name is None:
+                raise ValueError(f"DhdtSpec(filename={filename!r}) needs a distinct `name`")
+            dd = (_crop_to_factor(_open_eager(path), 2 ** ctx.config.n_levels)
+                  if path.exists() else None)
         if dd is None:
             return None
         noise_model = None
         if self.noise is not None:
             noise_model = _require_priors(ctx, "DhdtSpec").noise_model(
-                "dhdt", dataclasses.replace(self.noise, sigma=1.0))
+                name, dataclasses.replace(self.noise, sigma=1.0))
 
         expected = (ctx.ny, ctx.nx)
         if dd.dhdt.shape != expected:
             raise ValueError(
                 f"dhdt grid {tuple(dd.dhdt.shape)} does not match the cropped "
-                f"model grid {expected}; rebuild {ctx.config.dhdt_filename} "
+                f"model grid {expected}; rebuild {filename} "
                 f"on the DEM grid."
             )
 
@@ -1522,7 +1913,7 @@ class DhdtSpec:
             # Legacy input file: no window recorded. Fall back to the
             # historical final-step rate so old model_inputs keep working.
             warnings.warn(
-                f"dhdt product ({cfg.dhdt_filename}): no time_start/time_end "
+                f"dhdt product ({filename}): no time_start/time_end "
                 f"attrs; falling back to the legacy final-step rate "
                 f"(H(t_end) - H_prev)/dt. Rebuild with preprocessing/"
                 f"make_dhdt.py to compare over the true observation window."
@@ -1545,7 +1936,9 @@ class DhdtSpec:
             dhdt=dhdt, dhdt_err=dhdt_err, dhdt_mask=dhdt_mask, t0=t0, t1=t1,
             sigma_floor=self.sigma_floor, nu=self.nu, weight=self.weight,
             legacy_final_step=legacy,
-            noise=self.noise, noise_model=noise_model)
+            noise=self.noise, noise_model=noise_model, name=name,
+            sigma_rel=self.sigma_rel,
+            sigma_rel_radius=int(round(self.sigma_rel_km * 1e3 / float(ctx.gridded_data.x[1] - ctx.gridded_data.x[0]))) if self.sigma_rel_km else 0)
 
 
 @dataclass(frozen=True)

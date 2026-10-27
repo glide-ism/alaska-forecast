@@ -72,10 +72,15 @@ class WhitenedParameters:
     z = 0 = prior median and never enters the forward graph)."""
 
     def __init__(self, z_bed, z_bed_mean, z_log_beta, z_pbias, z_tbias,
-                 z_log_mf, z_log_rf, z_tau, z_z0, z_log_H_atm, z_logit_cloud):
+                 z_log_mf, z_log_rf, z_tau, z_z0, z_log_H_atm, z_logit_cloud,
+                 z_log_beta_mean=None):
         self.z_bed = z_bed
         self.z_bed_mean = z_bed_mean
         self.z_log_beta = z_log_beta
+        # long-wavelength log-beta field (config.log_beta_mean_prior); always
+        # allocated, inert at 0 when the prior is off
+        self.z_log_beta_mean = (torch.zeros_like(z_log_beta) if z_log_beta_mean is None
+                                else z_log_beta_mean)
         self.z_pbias = z_pbias
         self.z_tbias = z_tbias
         self.z_log_mf = z_log_mf
@@ -86,7 +91,7 @@ class WhitenedParameters:
         self.z_logit_cloud = z_logit_cloud
 
     def requires_grad_(self) -> "WhitenedParameters":
-        for t in (self.z_bed, self.z_bed_mean, self.z_log_beta,
+        for t in (self.z_bed, self.z_bed_mean, self.z_log_beta, self.z_log_beta_mean,
                   self.z_pbias, self.z_tbias, self.z_log_mf, self.z_log_rf,
                   self.z_tau, self.z_z0, self.z_log_H_atm, self.z_logit_cloud):
             t.requires_grad_()
@@ -105,6 +110,7 @@ class WhitenedParameters:
             z_z0=self.z_z0.detach().clone(),
             z_log_H_atm=self.z_log_H_atm.detach().clone(),
             z_logit_cloud=self.z_logit_cloud.detach().clone(),
+            z_log_beta_mean=self.z_log_beta_mean.detach().clone(),
         )
 
     @torch.no_grad()
@@ -114,6 +120,7 @@ class WhitenedParameters:
         self.z_bed.copy_(other.z_bed)
         self.z_bed_mean.copy_(other.z_bed_mean)
         self.z_log_beta.copy_(other.z_log_beta)
+        self.z_log_beta_mean.copy_(other.z_log_beta_mean)
         self.z_pbias.copy_(other.z_pbias)
         self.z_tbias.copy_(other.z_tbias)
         self.z_log_mf.copy_(other.z_log_mf)
@@ -124,8 +131,10 @@ class WhitenedParameters:
         self.z_logit_cloud.copy_(other.z_logit_cloud)
 
 
-def _apply_solver_settings(target_fas, cfg: SolverConfig) -> None:
-    target_fas.set(
+def _apply_solver_settings(solver, cfg: SolverConfig) -> None:
+    """Push a SolverConfig onto one of glide's FAS solvers (forward or
+    adjoint): the V-cycle schedule and the Vanka/Newton smoother options."""
+    solver.fas_options.set(
         coarsest_steps=cfg.coarsest_steps,
         pre_steps=cfg.pre_steps,
         post_steps=cfg.post_steps,
@@ -134,6 +143,17 @@ def _apply_solver_settings(target_fas, cfg: SolverConfig) -> None:
         absolute_tolerance=cfg.absolute_tolerance,
         report_norms=cfg.report_norms,
     )
+    solver.vanka_options.omega.set(cp.float32(cfg.omega))
+    solver.vanka_options.newton_options.momentum_damping.set(cp.float32(cfg.momentum_damping))
+    solver.vanka_options.newton_options.step_tolerance.set(cp.float32(cfg.step_tolerance))
+    if "freeze_coarse_calving" in getattr(solver.fas_options, "options", ()):   # forward solver only
+        solver.fas_options.set(freeze_coarse_calving=cfg.freeze_coarse_calving,
+                               freeze_coarse_phi=cfg.freeze_coarse_phi,
+                               trace_file=cfg.trace_file, trace_every=cfg.trace_every,
+                               dump_dir=cfg.dump_dir, dump_max=cfg.dump_max,
+                               backtrack=cfg.backtrack, backtrack_scales=tuple(cfg.backtrack_scales),
+                               raise_on_nonfinite=cfg.raise_on_nonfinite,
+                               cold_start_dt=cfg.cold_start_dt)
 
 
 def _crop_to_factor(gridded_data: xr.Dataset, factor: int) -> xr.Dataset:
@@ -175,7 +195,16 @@ class GlacierProblem:
         inputs_dir = Path(cfg.base_dir) / "model_inputs"
         self.gridded_data = _open_eager(inputs_dir / cfg.gridded_filename)
         self.temperature_anomaly = _open_eager(inputs_dir / cfg.anomaly_filename)
-        flightlines_df = gpd.read_file(inputs_dir / cfg.flightline_filename)
+        # Radar bed picks are optional: Greenland domains condition the bed
+        # on the gridded BedMachine product instead (bed_obs / bed_obs_err in
+        # GLIDE_inputs.nc, see priors.build_bed_conditioning_data), so a
+        # missing flightline file just means "no scattered picks".
+        flightline_path = inputs_dir / cfg.flightline_filename
+        if flightline_path.exists():
+            flightlines_df = gpd.read_file(flightline_path)
+        else:
+            flightlines_df = gpd.GeoDataFrame(
+                {"x": [], "y": [], "bed": []}, geometry=[], crs=None)
 
         self.crs = pyproj.CRS(self.gridded_data.spatial_ref.crs_wkt)
         self.gridded_data = _crop_to_factor(self.gridded_data, 2 ** cfg.n_levels)
@@ -206,6 +235,66 @@ class GlacierProblem:
                 _open_eager(dhdt_path), 2 ** cfg.n_levels)
         else:
             self.dhdt_data = None
+
+        # Optional ocean thermal forcing of the calving margins (q, h0 per
+        # step; see ocean.py). Loaded on the same crop; only the annual
+        # statistic the config asks for is read.
+        self.ocean_forcing = None
+        if cfg.ocean_forcing.enabled and (cfg.ocean_forcing.pin_front or getattr(cfg.ocean_forcing, "pin_front_filename", None)):
+            # front held at an observed mask: no TF file involved (ocean.py);
+            # a yearly mask file (TermPicks) takes precedence over the static variable
+            from .ocean import PinnedFront
+            if getattr(cfg.ocean_forcing, "pin_front_filename", None):
+                self.ocean_forcing = PinnedFront.from_file(
+                    Path(cfg.base_dir) / "model_inputs" / cfg.ocean_forcing.pin_front_filename, 2 ** cfg.n_levels,
+                    cfg.ocean_forcing, q0=cfg.calving_q, h00=cfg.calving_h0)
+            else:
+                self.ocean_forcing = PinnedFront.from_gridded(
+                    self.gridded_data, cfg.ocean_forcing, q0=cfg.calving_q, h00=cfg.calving_h0)
+            rel = getattr(cfg.ocean_forcing, "pin_release_year", None)
+            tf_path = inputs_dir / cfg.ocean_forcing.filename
+            if rel is not None:
+                # pinned until the release year, the free TF-driven law after
+                from .ocean import OceanForcing, ReleasedPin
+                free = OceanForcing.from_file(tf_path, 2 ** cfg.n_levels, cfg.ocean_forcing,
+                                              q0=cfg.calving_q, h00=cfg.calving_h0,
+                                              freeze_anomaly=cfg.climatology_only)
+                self.ocean_forcing = ReleasedPin(self.ocean_forcing, free, rel)
+            print(self.ocean_forcing.describe())
+        elif cfg.ocean_forcing.enabled:
+            tf_path = inputs_dir / cfg.ocean_forcing.filename
+            if tf_path.exists():
+                from .ocean import OceanForcing
+                self.ocean_forcing = OceanForcing.from_file(
+                    tf_path, 2 ** cfg.n_levels, cfg.ocean_forcing,
+                    q0=cfg.calving_q, h00=cfg.calving_h0,
+                    freeze_anomaly=cfg.climatology_only)
+                print(self.ocean_forcing.describe())
+            else:
+                warnings.warn(f"ocean_forcing enabled but {tf_path} is missing: "
+                              f"calving margins stay at calving_q / calving_h0")
+
+        # Optional year-by-year forcing over a reanalysis record (see
+        # yearly_climate.py): per-year t2m anomalies / precip ratios on the
+        # model's climatology, the same crop, never on the tape.
+        self.yearly_climate = None
+        if cfg.yearly_climate_filename is not None and not cfg.climatology_only:
+            if cfg.base_anomaly_year is not None:
+                raise ValueError("yearly_climate_filename requires base_anomaly_year=None: "
+                                 "the yearly fields are departures from the climatology window")
+            yc_path = inputs_dir / cfg.yearly_climate_filename
+            if yc_path.exists():
+                from .yearly_climate import YearlyClimate
+                self.yearly_climate = YearlyClimate.from_file(
+                    yc_path, 2 ** cfg.n_levels, cache=cfg.yearly_climate_cache)
+                print(self.yearly_climate.describe())
+            else:
+                warnings.warn(f"yearly_climate_filename set but {yc_path} is missing: "
+                              f"every year uses the climatology + index anomaly")
+        if cfg.climatology_only:
+            print("climatology mode: the atmosphere is held at the reference climate "
+                  "(monthly climatology + tbias / pbias; no yearly fields, no anomaly index) "
+                  "and the ocean at its TF climatology (dTF = 0, time-invariant margins)")
 
         ny, nx = self.gridded_data.sizes["y"], self.gridded_data.sizes["x"]
         dx = (self.gridded_data.x[1] - self.gridded_data.x[0]).item()
@@ -262,8 +351,9 @@ class GlacierProblem:
 
         self.params = self._build_initial_parameters()
 
-        self.base_anomaly = self.temperature_anomaly.sel(
-            time=cfg.base_anomaly_year).temp_anomaly.item()
+        self.base_anomaly = (0.0 if cfg.base_anomaly_year is None else
+                             self.temperature_anomaly.sel(
+                                 time=cfg.base_anomaly_year).temp_anomaly.item())
         self.alpha_t2m = torch.tensor(cfg.alpha_t2m, device="cuda")
 
         # Optional ice-core precip anomaly: applied as a multiplicative
@@ -327,13 +417,25 @@ class GlacierProblem:
                             stress_scheme=cfg.stress_scheme)
         mg = model.mg
 
-        mg.state.H.set(0.1)
-        mg.state.H_prev.set(0.1)
+        mg.state.H.set(cfg.thklim)
+        mg.state.H_prev.set(cfg.thklim)
 
-        mg.geometry.bed.set(self.gridded_data.elevation)
-        mg.geometry.depth.set(np.maximum(-self.gridded_data.elevation, 0))
+        # Initial bed. Alaska: the DEM composite (the surface over ice — no
+        # bed is known a priori, the likelihood has to find it). Greenland:
+        # the gridded bed observation (BedMachine `bed_obs`) where it exists,
+        # the DEM elsewhere. With the bed prior conditioned on that same
+        # gridded data at every ice cell, the unconditional field Map(z_bed)
+        # is barely touched by the likelihood, so whatever it is initialized
+        # to is (up to the prior) what it stays: seeded from the surface it
+        # would sit ~thickness above the bed forever, and bed_mean would
+        # converge to a smoothed SURFACE (observed on greenland_coarse).
+        self.bed_init = self._initial_bed()
+        mg.geometry.thklim.set(cfg.thklim)
+        mg.geometry.bed.set(self.bed_init)
+        # signed head deficit (water level minus bed): negative on dry land,
+        # so thin terrestrial ice is far from flotation, not half-floating
+        mg.geometry.depth.set(-self.bed_init)
         mg.geometry.sigmoid_c.set(cfg.sigmoid_c)
-        mg.geometry.sigmoid_k.set(cfg.sigmoid_k)
 
         mg.rheology.B.set(cfg.B_rate)
         mg.rheology.eps_reg.set(cfg.eps_reg)
@@ -345,23 +447,60 @@ class GlacierProblem:
         mg.sliding.m.set(cfg.sliding_m)
         mg.sliding.u_reg.set(cfg.u_reg)
         mg.sliding.water_drag.set(cfg.water_drag)
+        mg.sliding.u0.set(float(cfg.sliding_u0))
+        if cfg.sliding_N_scale_H:
+            mg.sliding.N_scale_H.set(float(cfg.sliding_N_scale_H))
+            mg.sliding.N_floor_H.set(float(cfg.sliding_N_floor_H))
 
-        mg.calving.calving_rate.set(cfg.calving_rate)
+        mg.calving.timescale.set(cfg.calving_timescale)
+        mg.calving.q.set(cfg.calving_q)
+        mg.calving.h0.set(cfg.calving_h0)
+        mg.calving.H_c.set(cfg.calving_H_c)
 
-        _apply_solver_settings(model.forward_solver.fas_options, cfg.forward_solver)
-        _apply_solver_settings(model.adjoint_solver.fas_options, cfg.adjoint_solver)
-        #model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.01))
-        #model.adjoint_solver.vanka_options.newton_options.shear_damping.set(cp.float32(0.01))
-        
-        model.forward_solver.vanka_options.omega.set(cp.float32(0.5))
-        model.forward_solver.vanka_options.newton_options.step_tolerance.set(cp.float32(1e-4))
-        #model.adjoint_solver.vanka_options.omega.set(cp.float32(0.5))
-
-        #model.adjoint_solver._fas_config.maximum_vcycles=5
-        #model.adjoint_solver.fas_options.maximum_vcycle.set(3)
-        #model.forward_solver.vanka_options.newton_options.momentum_damping.set(
-        #    cp.float32(1.0))
+        _apply_solver_settings(model.forward_solver, cfg.forward_solver)
+        _apply_solver_settings(model.adjoint_solver, cfg.adjoint_solver)
         return model
+
+    def _smoothed(self, field: np.ndarray) -> np.ndarray:
+        """Gaussian smoothing at half the bed-mean prior's length scale —
+        the hierarchical mean's starting point."""
+        from cupyx.scipy.ndimage import gaussian_filter as _cp_gauss
+        sigma_px = float(self.config.mean_prior.l) / (2.0 * float(self.dx))
+        return cp.asnumpy(_cp_gauss(cp.asarray(field, dtype=cp.float32),
+                                    sigma_px, mode="nearest"))
+
+    def _initial_bed(self) -> np.ndarray:
+        """(ny, nx) float32 initial bed: `bed_obs` where finite (gridded bed
+        data, Greenland), the DEM composite elsewhere / when absent (Alaska
+        — bit-identical to the historical initialization).
+
+        Under bed_conditioning.gridded_bed_data == "radar" with
+        seed_off_track_from_mean, the ice cells WITHOUT a radar pick are
+        seeded from the smoothed bed instead of BedMachine's interpolated
+        value, so the between-track structure starts from the prior mean."""
+        gd = self.gridded_data
+        elevation = gd.elevation.values.astype(np.float32)
+        if "bed_obs" not in gd:
+            return elevation
+        bed_obs = gd.bed_obs.values.astype(np.float32)
+        use = np.isfinite(bed_obs)
+        bed = np.where(use, bed_obs, elevation).astype(np.float32)
+        bc = self.config.bed_conditioning
+        if (getattr(bc, "gridded_bed_data", "all") == "radar"
+                and getattr(bc, "seed_off_track_from_mean", False)
+                and "bed_obs_radar" in gd):
+            radar = (gd.bed_radar_fraction.values > bc.radar_fraction_min) \
+                & np.isfinite(gd.bed_obs_radar.values)
+            smooth = self._smoothed(bed)
+            bed = np.where(radar, gd.bed_obs_radar.values.astype(np.float32),
+                           np.where(use, smooth, bed)).astype(np.float32)
+            print(f"[init] bed seeded from radar picks on {int(radar.sum())} cells, "
+                  f"the smoothed bed on {int((use & ~radar).sum())} off-track ice "
+                  f"cells, DEM elsewhere")
+        else:
+            print(f"[init] bed seeded from bed_obs on {int(use.sum())} cells, "
+                  f"DEM elsewhere")
+        return bed
 
     def _build_smb_model(self, ny, nx, dx, x0, y0):
         cfg = self.config
@@ -609,7 +748,7 @@ class GlacierProblem:
                     f"FingerprintNuisance param {p!r} requires "
                     f"smb_model='enthalpy' (no Matérn member built)")
         targets = [obs for obs in self.observations
-                   if obs.name in ("srf", "dhdt")
+                   if (obs.name == "srf" or obs.name.startswith("dhdt"))
                    and getattr(obs, "noise", None) is not None]
         if not targets:
             return
@@ -697,8 +836,22 @@ class GlacierProblem:
                                        log_beta - priors.mu_log_beta)
 
         bed = torch.tensor(self.mg[0].geometry.bed.data, device="cuda")
-        bed_mean = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
-        z_bed = GGaPPWhiten.apply(priors.bed_model, bed - bed_mean)
+        if "bed_obs" in self.gridded_data:
+            # Gridded-bed domains: start the hierarchical mean on a smoothed
+            # copy of the initial bed (Gaussian at the mean prior's length
+            # scale) so the fluctuation field z_bed starts small and the
+            # initial bed-prior cost is O(1) instead of O((H/sigma_bed)^2).
+            bed_mean = torch.tensor(
+                self._smoothed(cp.asnumpy(self.mg[0].geometry.bed.data)), device="cuda")
+            print(f"[init] bed_mean seeded from the bed smoothed at "
+                  f"{self.config.mean_prior.l / 2000:.0f} km")
+        else:
+            bed_mean = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
+        # The physical bed is Map(z_bed) ALONE (bed_from_whitened); bed_mean
+        # enters only the prior term on (bed_uncond - bed_mean). So z_bed
+        # whitens the full initial bed, and a nonzero bed_mean just makes
+        # that prior residual small — it must not be subtracted here.
+        z_bed = GGaPPWhiten.apply(priors.bed_model, bed)
         z_bed_mean = GGaPPWhiten.apply(priors.mean_model, bed_mean)
 
         z_pbias = torch.zeros(ny, nx, dtype=torch.float32, device="cuda")
@@ -756,7 +909,7 @@ class GlacierProblem:
         bed, bed_mean, bed_uncond = priors.bed_from_whitened(
             params.z_bed, params.z_bed_mean,
             data_override=self._bed_data_override)
-        log_beta = priors.log_beta_from_whitened(params.z_log_beta)
+        log_beta = priors.log_beta_from_whitened(params.z_log_beta, params.z_log_beta_mean)
         pbias = GGaPPMap.apply(priors.pbias_model, params.z_pbias)
         # Additive temperature bias (K): mapped only when the term is enabled
         # (no Matern hierarchy exists otherwise); None keeps t2m untouched.
@@ -839,8 +992,8 @@ class GlacierProblem:
         mg.state.v.set(0.0, start_level=level)
         mg.state.ud.set(0.0, start_level=level)
         mg.state.vd.set(0.0, start_level=level)
-        mg.state.H.set(0.1, start_level=level)
-        mg.state.H_prev.set(0.1, start_level=level)
+        mg.state.H.set(self.config.thklim, start_level=level)
+        mg.state.H_prev.set(self.config.thklim, start_level=level)
         mg.state.mask.set(0.0, start_level=level)
         mg.adjoint.lambda_u.set(0.0, start_level=level)
         mg.adjoint.lambda_v.set(0.0, start_level=level)
@@ -849,8 +1002,10 @@ class GlacierProblem:
         mg.adjoint.lambda_H.set(0.0, start_level=level)
 
     def update_depth(self, bed: torch.Tensor) -> None:
-        """Blend new bed-derived depth into the existing depth field."""
-        depth_new = torch.maximum(-bed, torch.zeros_like(bed)).detach()
+        """Blend the new bed-derived (signed) depth into the existing depth
+        field. depth = -bed: the head deficit below sea level, negative on
+        dry land (glide's flotation excess uses the sign)."""
+        depth_new = (-bed).detach()
         w = self.config.depth_blend
         self.mg.geometry.depth.set(
             w * cp.asarray(depth_new) + (1 - w) * self.mg[0].geometry.depth.data
@@ -926,7 +1081,13 @@ class GlacierProblem:
         else:
             H_prev_full = self.H_prev
         H_prev_ = differentiable_restriction(H_prev_full, level)
-        log_beta_ = differentiable_restriction(physical.log_beta, level)
+        # config.beta_max caps the FINE-level field before restriction (the
+        # order forward_standalone.py uses, so both run the same beta on every
+        # level); no gradient passes above the cap, where only the prior acts
+        log_beta_full = physical.log_beta
+        if cfg.beta_max is not None:
+            log_beta_full = torch.clamp(log_beta_full, max=math.log(float(cfg.beta_max)))
+        log_beta_ = differentiable_restriction(log_beta_full, level)
         beta_ = torch.exp(log_beta_)
 
         return simulate(
@@ -957,11 +1118,16 @@ class GlacierProblem:
             anomaly_integration=cfg.anomaly_integration,
             domain_mask=self.domain.domain_mask,
             temperature_anomaly=self.temperature_anomaly,
-            base_anomaly=self.base_anomaly,
-            alpha_t2m=self.alpha_t2m,
-            precip_anomaly=self.precip_anomaly,
-            base_precip=self.base_precip,
-            alpha_precip=self.alpha_precip,
+            # config.climatology_only: reference climate for the whole run —
+            # the monthly climatology + tbias / pbias, no yearly fields and no
+            # anomaly index (the record is still passed so the step sequence
+            # and the year lookups are unchanged; alpha 0 makes every term the
+            # climatological one).
+            base_anomaly=0.0 if cfg.climatology_only else self.base_anomaly,
+            alpha_t2m=0.0 if cfg.climatology_only else self.alpha_t2m,
+            precip_anomaly=None if cfg.climatology_only else self.precip_anomaly,
+            base_precip=None if cfg.climatology_only else self.base_precip,
+            alpha_precip=None if cfg.climatology_only else self.alpha_precip,
             dx_fine=self.dx,
             n_glen=float(cfg.n_glen),
             grad_start_time=cfg.grad_start_time,
@@ -969,7 +1135,42 @@ class GlacierProblem:
             record_states_at=record_states_at,
             record_volumes_at=record_volumes_at,
             time_writer=time_writer,
+            ocean_forcing=self.ocean_forcing,
+            dt_schedule=cfg.dt_schedule,
+            yearly_climate=None if cfg.climatology_only else self.yearly_climate,
+            # NOT gated on climatology_only: the missing variance is a property
+            # of the climate, not of the anomaly. A drift diagnostic run
+            # without it would sit ~90 Gt/yr above the calibration and report
+            # that offset as drift.
+            interannual_sigma=cfg.interannual_sigma,
+            interannual_nodes=cfg.interannual_nodes,
+            thermal=self.thermal_driver(level),
+            thermal_T_surface=self.thermal_surface_temperature(tbias),
         )
+
+    # ------------------------------------------------------------ thermal
+    def thermal_driver(self, level: int):
+        """The level's ThermalDriver (built once per level), or None when
+        config.thermal is None (isothermal B from A_glen)."""
+        tcfg = getattr(self.config, "thermal", None)
+        if tcfg is None:
+            return None
+        if not hasattr(self, "_thermal_drivers"):
+            self._thermal_drivers = {}
+        if level not in self._thermal_drivers:
+            from .thermal import ThermalDriver
+            self._thermal_drivers[level] = ThermalDriver(
+                self.model, level, tcfg, rho_i=float(self.config.rho_ice),
+                thin_B=float(self.config.B_rate) if tcfg.thin_ice_isothermal else None)
+        return self._thermal_drivers[level]
+
+    def thermal_surface_temperature(self, tbias=None):
+        tcfg = getattr(self.config, "thermal", None)
+        if tcfg is None:
+            return None
+        from .thermal import surface_temperature_fine
+        return surface_temperature_fine(
+            self.t2m, tbias if tcfg.surface_T_tbias else None)
 
     def simulate(
         self,
@@ -1042,6 +1243,7 @@ class GlacierProblem:
             log_mf=physical.log_mf,
             prior_means=prior_means,
             physical_bed_uncond=getattr(physical, "bed_uncond", None),
+            physical_log_beta=physical.log_beta,
         )
         return LossTerms(
             data_terms=data_terms,
@@ -1053,6 +1255,7 @@ class GlacierProblem:
             J_prior_h_atm=J_prior_terms[5],
             J_prior_cloud=J_prior_terms[6],
             J_prior_smb=J_prior_terms[7],
+            J_prior_beta_mean=J_prior_terms[8],
         )
 
 

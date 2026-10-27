@@ -9,6 +9,7 @@ at the configured maximum). Times are plain Python floats throughout so
 snapshot dictionary keys match the requested times exactly — no float32
 clock-drift matching.
 """
+import math
 from typing import Iterable, Optional, Sequence
 
 
@@ -36,8 +37,17 @@ def build_step_sequence(
     dt_max: float,
     required_times: Sequence[float] = (),
     eps: float = 1e-6,
+    dt_schedule: Sequence = (),
 ) -> list:
     """Design the forward model's step sequence as [(t_next, dt), ...].
+
+    `dt_schedule` = ((t_from, dt), ...) refines the stepping from `t_from`
+    onward (later entries override earlier ones): each refined segment is
+    anchored at its start, at every required time inside it and at its end,
+    and every gap between anchors is split into ceil(gap / dt) EQUAL steps —
+    so steps never exceed dt, no slivers appear next to observation epochs,
+    and snapshots still land on the exact requested floats. The legacy
+    uniform grid applies before the first entry.
 
     The run covers (t_start, horizon] where horizon = max(t_end, max required
     time) — a required time beyond the nominal calibration end extends the run
@@ -68,20 +78,48 @@ def build_step_sequence(
 
     horizon = max([t_end] + list(required))
 
+    schedule = sorted((float(a), float(b)) for a, b in dt_schedule)
+    for _, d in schedule:
+        if d <= 0:
+            raise ValueError(f"dt_schedule steps must be positive, got {schedule}")
+    refine_from = schedule[0][0] if schedule and schedule[0][0] < horizon - eps else None
+
     # Uniform grid, skipping points that collide (within eps) with a required
-    # time — the required float wins so snapshot keys are exact.
+    # time — the required float wins so snapshot keys are exact. With a
+    # schedule the uniform grid stops at the first refinement start.
     breakpoints = list(required)
+    coarse_end = horizon if refine_from is None else refine_from
     k = 1
     while True:
         t = t_start + k * dt_max
-        if t > horizon - eps:
+        if t > coarse_end - eps:
             break
         if all(abs(t - r) > eps for r in required):
             breakpoints.append(t)
         k += 1
+    if refine_from is not None:
+        if refine_from > t_start + eps and all(abs(refine_from - b) > eps for b in breakpoints):
+            breakpoints.append(refine_from)
+        # Refined segments: anchors = segment bounds + required times inside;
+        # each gap split into ceil(gap/dt) equal steps.
+        bounds = [s for s, _ in schedule] + [horizon]
+        for (seg_start, seg_dt), seg_end in zip(schedule, bounds[1:]):
+            seg_start = max(seg_start, t_start)
+            if seg_end <= seg_start + eps:
+                continue
+            anchors = sorted({seg_start, seg_end}
+                             | {r for r in required if seg_start + eps < r < seg_end - eps})
+            for a, b in zip(anchors[:-1], anchors[1:]):
+                n = max(1, int(math.ceil((b - a) / seg_dt - eps)))
+                for j in range(1, n):
+                    t = a + (b - a) * j / n
+                    if all(abs(t - r) > eps for r in required):
+                        breakpoints.append(t)
+            if all(abs(seg_end - b) > eps for b in breakpoints):
+                breakpoints.append(seg_end)
     if all(abs(horizon - b) > eps for b in breakpoints):
         breakpoints.append(horizon)
-    breakpoints.sort()
+    breakpoints = sorted(b for b in breakpoints if t_start + eps < b <= horizon + eps)
 
     steps = []
     t_prev = t_start

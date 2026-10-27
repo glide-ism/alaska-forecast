@@ -24,7 +24,7 @@ SCHEDULABLE_WEIGHTS = ("loss_scale",)
 #   lr_z_log_mf=Schedule(final=0.01, ramp=lambda i: 0.0 if i < 100 else 0.01)
 # holds the melt factor for the first 100 iterations of every level.
 SCHEDULABLE_LRS = (
-    "lr_z_bed", "lr_z_bed_mean", "lr_z_log_beta",
+    "lr_z_bed", "lr_z_bed_mean", "lr_z_log_beta", "lr_z_log_beta_mean",
     "lr_z_pbias", "lr_z_tbias", "lr_z_log_mf", "lr_z_log_rf",
     "lr_z_log_H_atm", "lr_z_logit_cloud",
     "lr_z_tau", "lr_z_z0",
@@ -104,6 +104,55 @@ class PriorHyperparams:
     sigma: float
     l: float
     nu: int
+
+
+@dataclass(frozen=True)
+class PriorComponent:
+    """One term of a `SpectralPriorHyperparams` spectrum: the SPDE
+    (mass kappa^2 - Laplacian)^((nu+1)/2) x = tau W with kappa = sqrt(8 nu)/l
+    and tau set so that mass = 1 is the Matern field of marginal std `sigma`,
+    range `l`, smoothness `nu` (any real nu > 0). `mass` scales the mass term
+    only, leaving the derivative terms and so the small-scale spectrum as they
+    are: mass = 1 the Matern, mass = 0 its INTRINSIC counterpart (penalizes
+    derivatives only; a coherent offset over a region costs its edges, not its
+    area -- the prior then needs `SpectralPriorHyperparams.sigma_mean`), in
+    between an effective range l / sqrt(mass) with the same small-scale
+    amplitude."""
+    sigma: float
+    l: float
+    nu: float = 1.0
+    mass: float = 1.0
+
+
+@dataclass(frozen=True)
+class SpectralPriorHyperparams:
+    """Matern-like field prior as an explicit spectrum on the domain's DCT
+    basis (mirror boundaries, like ggapp's stencil): the variance of each
+    cosine mode is the SUM of the components' spectra, so e.g. a short-range
+    proper Matern plus a long-range or intrinsic component frees regional
+    levels and trends while keeping local roughness regularized. `sigma_mean`
+    (optional; required when any component has mass = 0) is the prior std of
+    the DOMAIN MEAN, replacing the constant mode's variance -- a vague prior
+    on the level instead of the hard pin a fixed mean with a short-range
+    Matern implies (a coherent shift Delta over an area A costs ~ Delta^2 A /
+    (pi l^2 sigma^2) there). Exact whitening, forward map and sampling
+    (glacier_inverse.priors.SpectralFieldPrior); a single mass-1 component
+    reproduces ggapp's MaternPrior. `sigma`, `l`, `nu` return the first
+    component's, for code that reads a single scale (influence caps)."""
+    components: tuple
+    sigma_mean: Optional[float] = None
+
+    @property
+    def sigma(self):
+        return self.components[0].sigma
+
+    @property
+    def l(self):
+        return self.components[0].l
+
+    @property
+    def nu(self):
+        return self.components[0].nu
 
 
 @dataclass(frozen=True)
@@ -267,13 +316,255 @@ class FingerprintNuisance:
 
 @dataclass(frozen=True)
 class SolverConfig:
+    """FAS V-cycle schedule plus the Vanka/Newton smoother options, applied
+    to one of glide's solvers (forward or adjoint). Defaults are glide's
+    examples/greenland settings (2026-09 refactor): a post-smoothing-heavy
+    cycle with no finest-level sweeps, omega 0.5, momentum damping 0.01."""
     coarsest_steps: int = 200
     pre_steps: int = 10
-    post_steps: int = 50
-    finest_steps: int = 50
+    post_steps: int = 150
+    finest_steps: int = 0
     relative_tolerance: float = 1e-2
     absolute_tolerance: float = 10.0
     report_norms: bool = False
+    # Vanka smoother: under-relaxation of the patch update and the Newton
+    # options inside each patch solve (vanka_options.omega,
+    # vanka_options.newton_options.{momentum_damping, step_tolerance}).
+    omega: float = 0.5
+    momentum_damping: float = 0.01
+    step_tolerance: float = 1e-6
+    # Coarse-level calving in the FORWARD FAS cycle (glide FASCDConfig; the
+    # adjoint cycle has no switch and always runs the sink on the restricted
+    # psi). True = the historical behaviour: calving rate 0 on every coarse
+    # level, the sink reaching them only through the tau correction as a fixed
+    # source, so the coarse H operator lacks the rate (1 - psi) diagonal
+    # (26x the 1/dt term at dt 25, tau 1). False = the coarse levels apply
+    # the sink with the RESTRICTED flag psi (kept frozen by
+    # freeze_coarse_phi, so no switching on the coarse grid).
+    freeze_coarse_calving: bool = True
+    freeze_coarse_phi: bool = True
+    # Forward cycle only: glide's V-cycle residual trace (FASCDSolver.trace):
+    # CSV path receiving the residual split into calving / front /
+    # constrained / interior cells at start, after pre-smoothing, after the
+    # coarse correction, after post-smoothing and every `trace_every` finest
+    # sweeps. None = off (costs one residual evaluation per row).
+    trace_file: Optional[str] = None
+    trace_every: int = 25
+    # Forward cycle only: directory receiving the starting state of every
+    # solve that ends unconverged or non-finite (glide/dump.py; replay with
+    # glide.dump.load_solve_state), at most dump_max files. None = off.
+    dump_dir: Optional[str] = None
+    dump_max: int = 5
+    # Forward cycle only: backtracking coarse correction (glide
+    # FASCDConfig.backtrack): a V-cycle is accepted only if it lowers the
+    # residual, else repeated with the coarse correction scaled by the next
+    # of backtrack_scales (0 = pure smoothing).
+    backtrack: bool = False
+    backtrack_scales: tuple = (1.0, 0.5, 0.25, 0.0)
+    # Forward cycle only: raise FloatingPointError when a solve ends with a
+    # non-finite residual (after its dump is written), stopping the run.
+    raise_on_nonfinite: bool = True
+    # Forward cycle only: a solve starting from zero velocities (the first
+    # step of every run: reset_state / the thermal spin-up zero them) with
+    # dt > cold_start_dt first solves at dt = cold_start_dt to initialize the
+    # velocities, then takes the real step from them (glide
+    # FASCDConfig.cold_start_dt). From u = 0 at dt 25 the Vanka patches on
+    # steep ice beside calving cells took runaway Newton steps. None = off.
+    cold_start_dt: Optional[float] = 1.0
+
+
+@dataclass(frozen=True)
+class OceanForcingConfig:
+    """Ocean thermal forcing -> calving margins (see glacier_inverse/ocean.py).
+    Per step, with TF_clim(x) the per-cell mean of the annual `statistic`
+    over `ref_years` and dTF(x, t) = TF_step(x, t) - TF_clim(x):
+
+        q  = calving_q  + clim_q * (TF_clim - tf_crit) + alpha_q * dTF   (1/K)
+        h0 = calving_h0 + clim_h * (TF_clim - tf_crit) + alpha_h * dTF   (m/K)
+
+    Under glide's monotone calving law only the SIGN of the margin at
+    flotation decides whether a floating tongue is admissible, so `tf_crit`
+    is the critical thermal forcing: fjords colder than it in the climatology
+    get negative margins (tongues), warmer ones positive margins (grounded
+    fronts calve within the margin of flotation). `clim_*` set how far above
+    / below flotation that baseline sits per kelvin, the alphas the response
+    to warming. Greenland EN4 front climatologies: Petermann 2.0, 79N 2.2,
+    Jakobshavn 3.8, Kangerlussuaq 4.3, Helheim 6.2 degC. Before the record
+    dTF = 0; both terms are zero farther than `max_dist_km` from the native
+    product. All are sweep parameters, not differentiated. Needs
+    model_inputs/<filename>
+    (preprocessing/make_thermal_forcing.py); when `enabled` and the file is
+    absent the run warns and keeps constant margins."""
+    enabled: bool = False
+    filename: str = "thermal_forcing.nc"
+    statistic: str = "max"          # "max" (annual max of monthly TF) | "mean"
+    ref_years: tuple = (1950, 1979)
+    max_dist_km: float = 5.0
+    tf_crit: float = 0.0            # degC; the climatology term is clim * (TF_clim - tf_crit)
+    clim_q: float = 0.0             # per K of climatological TF above tf_crit
+    clim_h: float = 0.0             # m per K of climatological TF above tf_crit
+    alpha_q: float = 0.0            # per K of TF anomaly
+    alpha_h: float = 0.0            # m per K of TF anomaly
+    q_bounds: tuple = (-1.0, 1.0)
+    h0_bounds: tuple = (-1000.0, 250.0)
+    # FRONT PIN (2026-09-24): hold the calving front at an observed ice mask
+    # instead of driving the margins with the thermal forcing. `pin_front`
+    # names a boolean variable of the gridded inputs (e.g. "rgi_mask", the
+    # BedMachine ice mask incl. its floating tongues, nominal 2015); the
+    # margins become h0 = pin_h0_inside on masked cells and pin_h0_outside
+    # elsewhere, q = calving_q, dTF = 0, all time-invariant, and the TF file
+    # is not read. Under the monotone law a very negative h0 never calves
+    # grounded ice and leaves floating ice to H_c alone (tongues thicker
+    # than calving_H_c persist, thinner fringes still go), while +250 m
+    # removes any ice within 250 m of flotation at the calving timescale --
+    # a soft pin, ice can exist outside the mask transiently. Why: the
+    # velocity term cannot pull traction at an outlet the model has already
+    # lost (d misfit / d beta ~ 0 with no ice there), so inverting with the
+    # front held at observed makes beta answerable for the observed speeds
+    # over the observed geometry; the calving parameters are then tuned
+    # afterwards, forward-only, to reproduce those fronts. The whole run,
+    # spin-up included, sits at the one epoch the mask carries. Both values
+    # must lie inside h0_bounds. forward_projection refuses a pin.
+    pin_front: Optional[str] = None
+    pin_h0_inside: float = -1000.0
+    pin_h0_outside: float = 250.0
+    # TIME-VARYING pin (2026-09-25): a file under model_inputs/ with
+    # `front_mask(time, y, x)` per calendar year (preprocessing/
+    # make_front_mask.py from TermPicks: the 2015 inventory plus the fjord
+    # cells landward of each year's observed terminus, minus those seaward);
+    # each step is pinned to the mask of its END year, the first mask held
+    # before the record and the last after. Takes precedence over
+    # `pin_front`; the margins are the same pin_h0_inside / _outside.
+    pin_front_filename: Optional[str] = None
+    # CRITICAL-ANOMALY FIELD (2026-09-24, library change 16): a per-cell
+    # rho(x) in kelvin from model_inputs/<rho_filename> (variable
+    # `calving_rho`, preprocessing/make_calving_rho.py) enters the margin as
+    #     h0 = calving_h0 + clim_h (TF_clim - tf_crit) + alpha_h (dTF - rho)
+    # so a front flips exactly when its anomaly exceeds rho: rho is the
+    # front's distance to threshold in the reference climate, alpha_h the
+    # metres of margin per kelvin of exceedance (the extent of a grounded
+    # retreat). Why a field: under the monotone law the whole TF response of
+    # a front is the one ratio -h0_base / alpha_h, and the observed onsets
+    # need ratios that are not a function of TF_clim (Petermann and
+    # Zachariae share TF_clim 2.27 and need 0.3 and 1.2 K), so no
+    # (tf_crit, clim_h, alpha_h) times them -- analysis/calving_screen.py.
+    # With the field, set clim_h = 0 and calving_h0 = 0 (the builder derives
+    # rho assuming the static margin is -alpha_h rho alone). NaN / missing
+    # cells contribute 0; None = no field. The pin ignores it.
+    rho_filename: Optional[str] = None
+    # PRE-RECORD HELD TF (2026-09-29): before the record's first year the
+    # thermal forcing is held at an AFFINE transform of the climatology,
+    #     TF_pre(x) = max(pre_record_scale * TF_clim(x) + pre_record_offset, 0)
+    # i.e. dTF_pre = (scale - 1) TF_clim + offset (K), ramped linearly to 0
+    # over the `pre_record_ramp` years before the record starts (0 = a step
+    # at the record start). scale 1 / offset 0 is the historical dTF = 0
+    # hold. Purpose: EN4 starts in 1950, so the spin-up (and the LIA
+    # extension of the fronts) sees whatever the pre-1950 ocean is assumed
+    # to be; the two coefficients are calibrated so the free spin-up reaches
+    # the LIA extent (sweep_pre_tf.py), instead of holding the fronts at it.
+    # scale < 1 cools warm fjords more than cold ones (the climatology's
+    # geography scaled), offset shifts all alike. climatology_only still
+    # forces dTF = 0.
+    # RELEASED PIN (2026-09-29): with a pin (pin_front / pin_front_filename)
+    # and pin_release_year set, every step ending at or before that year is
+    # pinned as usual and every later step takes the TF-driven margins above
+    # (the free calving law, incl. rho_filename / pre-record hold): the
+    # observed extent of the pin at the release year is an INITIAL CONDITION
+    # for the free law, not a constraint during the record. None = a pin
+    # holds for the whole run.
+    pin_release_year: Optional[float] = None
+    pre_record_scale: float = 1.0
+    pre_record_offset: float = 0.0
+    pre_record_ramp: float = 0.0
+    # PRE-RECORD INDEX TF (2026-09-29): in addition to the hold, before the
+    # record dTF_pre(t) += pre_record_index_k * (I_s(t) - I_ref), I the
+    # annual `temp_anomaly` of model_inputs/<pre_record_index> (the Vinther /
+    # GISP2 index the atmosphere uses), I_s its centred running mean over
+    # `pre_record_index_smooth` years, I_ref the mean of I_s over ref_years
+    # (so it is referenced like EN4's dTF). k (K of TF per K of index) from
+    # EN4 front TF on the 11-yr smoothed index over 1950-2025: 0.19 all
+    # fronts, 0.28 NW, 0.31 SE (r 0.85-0.94, ~7 dof). It carries the
+    # 1920s-40s warm phase (+0.5 K of index vs 1950-79) and the 19th-century
+    # cold (-0.7 K), so pre-1950 front changes come from forcing rather than
+    # from an initial condition. None = off.
+    pre_record_index: Optional[str] = None
+    pre_record_index_k: float = 0.25
+    pre_record_index_smooth: int = 11
+    # first year the index term applies (None = the whole index); earlier
+    # years get no index term (the hold alone). The deep GISP2 part of the
+    # index has +2..+4 K 11-yr excursions that ratchet the free-law fronts
+    # back irreversibly (2026-09-29), so 1850 isolates the instrumental era.
+    pre_record_index_start: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class ThermalConfig:
+    """Thermomechanical coupling (see glacier_inverse/thermal.py; glide's
+    enthalpy model, ThermalModel). None on GlacierConfig.thermal = the
+    isothermal rheology B from A_glen (the Alaska behaviour).
+
+    Every forward run starts with a THERMAL SPIN-UP on the initial geometry:
+    a momentum solve for the velocities, then implicit enthalpy steps of
+    `spinup_dt` years with geometry and velocity frozen until the mean basal
+    temperature change over ice thicker than 100 m, extrapolated from the decay of successive changes, falls below `spinup_tol_K`
+    (at most `spinup_max_steps`, at least `spinup_min_steps`), then B is set from the equilibrium and the
+    cycle is repeated `spinup_outer` times so the velocities see the thermal
+    rheology. Afterwards one enthalpy step follows every dynamics step and B
+    is updated per step (restricted to every coarser level; glide's GlideStep
+    checkpoints it). The thermal state carries NO gradient: B is a frozen
+    input to the adjoint, like the calving margins.
+
+    Rheology: Paterson-Budd on the pressure-adjusted temperature with the
+    Lliboutry-Duval water softening (capped at 1 %), collapsed to one B per
+    column with `weighting` ('shear': A weighted by (1 - sigma)^n, the
+    shallow-ice deformation weighting; 'mean': plain depth mean), times the
+    `enhancement` factor. Surface temperature: the annual mean of the monthly
+    climatology t2m (+ tbias when `surface_T_tbias`), capped at 0 degC, held
+    fixed through the run (no anomaly: the ice-temperature response to the
+    interannual record is second order for A; a known simplification).
+    `Q_geo` is a uniform geothermal flux (W/m^2) until a product is added.
+    `thin_ice_isothermal` gives columns thinner than `h_thin` (and the
+    ice-free cells) the isothermal B of A_glen instead of their cold
+    surface-clamped value (up to 2x the interior's B); opt-in, the evidence
+    that it helps the 1 km solve was mixed (2026-09-27).
+
+    `couple_rheology=False` (2026-09-30) is ONE-WAY coupling: the enthalpy
+    model is spun up and stepped with the run's velocities, strain and
+    frictional heating, but B is never written -- the dynamics keep the
+    isothermal B of A_glen and are those of the uncoupled model (one spin-up
+    cycle suffices, the velocities do not change). The temperature field is
+    then a diagnostic of the uncoupled flow (the ISMIP litemp* output).
+    `surface_T="forcing"` (2026-09-30; "climatology" = the fixed field
+    above) takes the Dirichlet surface temperature per step from the SAME
+    air temperature the step's SMB saw (the drivers' compute_smb records its
+    annual mean on ctx.forcing_T_annual: the reanalysis year / the index
+    anomaly / the ISMIP7 field, + tbias, + the elevation feedback), capped
+    at 0 degC; the spin-up uses the first step's forcing. Implemented in
+    forward_standalone and forward_projection, not in the inverse's
+    forward.simulate (which keeps the climatology)."""
+    nz: int = 9
+    n_smooth: int = 60                 # max enthalpy sweeps per step
+    Q_geo: float = 0.05                # W/m^2
+    weighting: str = "shear"
+    enhancement: float = 1.0           # multiplies the collapsed A
+    frictional_heating: bool = True
+    strain_heating: bool = True
+    surface_T_tbias: bool = True
+    spinup_dt: float = 1000.0          # yr, thermal-only steps
+    spinup_max_steps: int = 300
+    spinup_tol_K: float = 1e-2         # K, estimated REMAINING change of the mean basal temperature
+    spinup_min_steps: int = 3          # per spin-up cycle
+    spinup_outer: int = 2
+    spinup_momentum_dt: float = 1.0    # yr, the momentum solve giving the spin-up velocities
+    h_thin: float = 25.0               # m, thinner columns are clamped to the surface
+    lf_c: float = 1e-4                 # Lax-Friedrichs coefficient of the enthalpy advection
+    n_newton: int = 5
+    absolute_tolerance: float = 1e-6   # max |r|, scaled units; 1e-3 left the spin-up smoother-limited (0.2 K, 2 % in B)
+    warm_start: bool = True            # start each spin-up from the previous run's E (same level)
+    thin_ice_isothermal: bool = False  # B of A_glen where H < h_thin (see above)
+    couple_rheology: bool = True       # False: one-way, B stays isothermal (see above)
+    surface_T: str = "climatology"     # "climatology" | "forcing" (the step's SMB air temperature)
+    report: bool = True
 
 
 @dataclass(frozen=True)
@@ -302,6 +593,42 @@ class BedConditioningConfig:
     sigma_picks: float = 10.0    # m, per-pick noise (BedSpec.sigma semantics)
     sigma_dem: float = 10.0      # m, off-ice bed=DEM noise (BedSpec.sigma_dem)
     include_off_ice: bool = True
+    # Gridded bed observations (Greenland: BedMachine `bed` + `errbed`,
+    # carried into GLIDE_inputs.nc as `bed_obs` / `bed_obs_err` by
+    # preprocessing/make_dem.py). Every finite on-ice cell contributes
+    # bed = bed_obs at precision 1/(scale * max(errbed, floor))^2 — the
+    # per-cell error field replaces the single sigma_picks of the flightline
+    # route. Cells with errbed > max_err (None = keep all) are dropped, so a
+    # domain can condition only on radar-constrained bed (BedMachine's
+    # mass-conservation cells carry errbed ~ 30-100 m, interpolated interior
+    # cells several hundred m). Silently inactive when the variables are
+    # absent (Alaska-style flightline-only domains).
+    use_gridded_bed: bool = True
+    gridded_bed_err_floor: float = 10.0   # m
+    gridded_bed_err_scale: float = 1.0    # multiplier on errbed
+    gridded_bed_max_err: Optional[float] = None   # m; None keeps every cell
+    # Which gridded cells count as bed DATA:
+    #   "all"   — every BedMachine cell at its errbed (v6: 64% kriging, 22%
+    #             mass conservation, 9% IceBoost, 5% interpolation, 4% radar;
+    #             errbed is NOT a distance-to-data proxy — the kriged
+    #             interior sits at a 30 m floor 100 km from any track, so
+    #             gridded_bed_max_err cannot isolate the observed cells).
+    #   "radar" — only cells whose BedMachine subcells hold a radar pick
+    #             (dataid == 2; `bed_radar_fraction` > radar_fraction_min),
+    #             at the pick-averaged bed / errbed (`bed_obs_radar`,
+    #             `bed_obs_radar_err`). Everywhere else D = 0: the bed is
+    #             the Matern fluctuation about bed_mean, informed only by
+    #             the flow likelihood — mass conservation as inference, and
+    #             no double counting of the velocity / thinning data that
+    #             BedMachine's MC bed was itself built from.
+    gridded_bed_data: str = "all"
+    radar_fraction_min: float = 0.0       # keep cells with fraction > this
+    # "radar" mode only: seed the unconditional bed Map(z_bed) OFF the radar
+    # tracks from the smoothed bed (the bed_mean start) instead of from
+    # BedMachine's interpolated bed, so between-track structure comes purely
+    # from the prior and the flow likelihood rather than from BedMachine's
+    # warm start. Radar cells keep their picks either way.
+    seed_off_track_from_mean: bool = False
     # Cells where the DEM is exactly 0.0 are void fill at the land-DEM /
     # bathymetry seam (nearshore, fjord heads), not real bed — anchoring them
     # pins fjord bottoms at sea level. Excluded by default: the conditional
@@ -335,8 +662,13 @@ class GlacierConfig:
     # Grid / multigrid
     n_levels: int = 6
 
-    # Time stepping
+    # Time stepping. `dt` is the maximum step of the uniform spin-up grid;
+    # `dt_schedule` = ((t_from, dt), ...) refines it from t_from onward
+    # (equal sub-steps <= dt between consecutive observation epochs; see
+    # scheduling.build_step_sequence), e.g. ((1990.0, 3.0),) for the
+    # observational period.
     dt: float = 20.0
+    dt_schedule: tuple = ()
     t_start: float = 1012.0
     t_end: float = 2012.0
 
@@ -364,7 +696,10 @@ class GlacierConfig:
     # gradient-computing tasks (MAP, RTO, sensitivity) so they optimize the
     # same objective approximation.
     grad_start_time: Optional[float] = None
-    base_anomaly_year: int = 2012
+    # Year whose anomaly is subtracted from the series (the climatology's
+    # epoch). None: the anomaly file is already referenced to the
+    # climatology window (mean zero over it) and no year is subtracted.
+    base_anomaly_year: Optional[int] = 2012
     alpha_t2m: float = 2.5
     
     base_precip_year: int = 2012
@@ -390,10 +725,87 @@ class GlacierConfig:
     # legacy endpoint trapezoid) and is held at its step mean in every mode.
     anomaly_integration: str = "mean_anomaly"
 
+    # The Jensen bias "mean_anomaly" retains above, removed by quadrature
+    # instead of by more evaluations (2026-09-22; None = the previous
+    # behaviour). smb is concave in temperature, so a step evaluated at its
+    # MEAN anomaly is not its mean smb: the gap is ~ curvature sigma^2 / 2,
+    # and for Greenland (~ -160 Gt/yr/K^2 integrated, interannual sigma
+    # ~1.05 K) that is ~90 Gt/yr of spurious accumulation. It applies to
+    # INDEX years only -- reanalysis years are already one evaluation each,
+    # with their own fields -- so the affected span is precisely the
+    # pre-record spin-up, and the bias grows with its length while the
+    # calibration window carries none: the two halves of one run disagree.
+    # `interannual_sigma` is the TOTAL interannual std of the forcing
+    # temperature AFTER alpha_t2m (so, of the ice-sheet field, not of the
+    # index). Each scalar term is replaced by a Gauss-Hermite fan carrying
+    # the variance the terms do not already supply, which makes one setting
+    # correct for every epoch: a smoothed pre-instrumental index gets the
+    # full sigma, an annual index gets the remainder. This is the same device
+    # as `temp_dev` one level up -- a fixed deterministic quadrature, not a
+    # random draw, so the checkpointed backward reproduces the forward.
+    # Cost is `interannual_nodes` SMB evaluations per index term (3 is exact
+    # through 5th order); the dynamics solves are untouched.
+    interannual_sigma: Optional[float] = None
+    interannual_nodes: int = 3
+
+    # Year-by-year forcing for the years a reanalysis record covers (see
+    # yearly_climate.py; the file comes from preprocessing/make_climate_yearly.py
+    # and holds per-(year, month) t2m anomalies and precip ratios relative to
+    # the model's own climatology). None keeps the climatology + scalar index
+    # anomaly for every year. When set, a step's overlap with a record year
+    # is one SMB evaluation on that year's fields (plus the biases; the
+    # index anomaly is not applied to those years) and the rest of the step
+    # keeps the `anomaly_integration` treatment. Requires
+    # base_anomaly_year=None: the fields are departures from the climatology
+    # window, so a base year has no meaning. `yearly_climate_cache`: "ram"
+    # holds the record's int16 codes in pinned host memory (~230 MB per year
+    # at 1 km), "none" reads them from the file at every SMB evaluation.
+    yearly_climate_filename: Optional[str] = None
+    yearly_climate_cache: str = "ram"
+
+    # Hold the atmosphere at the REFERENCE CLIMATE for the whole run: the
+    # monthly climatology in the gridded inputs plus the calibrated tbias /
+    # pbias, with no yearly fields (`yearly_climate_filename` ignored), no
+    # temperature-anomaly index (alpha_t2m and base_anomaly forced to 0) and
+    # no precipitation anomaly. The OCEAN is held at its reference climate
+    # too (`OceanForcing(freeze_anomaly=True)`: dTF == 0 every step, so the
+    # calving margins are the time-invariant q0 + clim_q (TF_clim - tf_crit)
+    # and h00 + clim_h (TF_clim - tf_crit)) — the thermal forcing drives
+    # mass change through the margins on the same order as the atmosphere
+    # does through SMB, so a drift diagnostic has to hold both. The TF
+    # climatology is still read and still shapes the margins' geography;
+    # only its interannual departure is removed. Everything else — dynamics,
+    # calving, the observation terms — is unchanged, so a run with this set
+    # measures the model's own relaxation from the initial geometry: the
+    # transient a spin-up has to absorb, and the part of any dh/dt misfit
+    # that no climate forcing can explain.
+    climatology_only: bool = False
+
     # Field priors (Matern)
     bed_prior:      PriorHyperparams = PriorHyperparams(sigma=500.0,    l=2000.0,  nu=1)
     mean_prior:     PriorHyperparams = PriorHyperparams(sigma=1000.0,   l=10000.0, nu=1)
     log_beta_prior: PriorHyperparams = PriorHyperparams(sigma=1./3.,      l=1000.0,  nu=1)
+    # Two-field log beta (2026-09-29): log beta = mu_log_beta + Map(z_log_beta)
+    # + Map_mean(z_log_beta_mean), the second a long-wavelength field with its
+    # own prior, prior term (J_prior_beta_mean) and learning rate
+    # (lr_z_log_beta_mean). A short-range log_beta_prior with a fixed mean pins
+    # the REGIONAL level of log beta (its mass term costs a coherent shift in
+    # proportion to area); this field carries regional levels instead. None =
+    # off (z_log_beta_mean stays 0 and out of the forward graph).
+    log_beta_mean_prior: Optional[PriorHyperparams] = None
+    # How the two fields combine (only with log_beta_mean_prior):
+    #   "centered"  (default; the bed_mean pattern) log beta = mu + Map(z_log_beta)
+    #               ALONE, prior 0.5 |Whiten(log beta - mu - m)|^2 + 0.5 |z_mean|^2
+    #               with m = Map_mean(z_log_beta_mean): the data act on
+    #               z_log_beta only (short-prior step scale), the mean follows
+    #               the smooth part of log beta through the prior coupling.
+    #   "additive"  log beta = mu + Map(z_log_beta) + Map_mean(z_log_beta_mean),
+    #               prior 0.5 |z|^2 + 0.5 |z_mean|^2: the data gradient reaches
+    #               z_log_beta_mean amplified by the long prior's low-mode
+    #               variance, which caps the SGD step (poorly conditioned).
+    # Both are the same Gaussian model (a linear change of variables): same
+    # objective, same MAP; only the optimizer's geometry differs.
+    log_beta_mean_mode: str = "centered"
     pbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
     tbias_prior:    PriorHyperparams = PriorHyperparams(sigma=0.1,     l=10000.0, nu=1)
     # Priors for the enthalpy SMB parameters, which are (ny, nx) GP FIELDS
@@ -437,9 +849,12 @@ class GlacierConfig:
     # when it is migrated (noted in rto_sample.py).
     smb_data_influence: float = 1.0
 
-
-    influence_cap: dict = None,
-    influence_transfer: str = 'log',
+    # Bounded-influence cap on the whitened data score, {z_attr_name: C_z}
+    # per-mode in PRIOR-STD units, and its transfer function "tanh"
+    # (saturating bound) | "log" (C_z prior-stds per e-fold of demand).
+    # See CLAUDE.md and loss.apply_influence_control.
+    influence_cap: Optional[dict] = None
+    influence_transfer: str = "log"
 
     # Scalar prior mean of the log_beta field: the Matern prior (and its
     # whitened representation) applies to log_beta - mu_log_beta, so the
@@ -590,7 +1005,9 @@ class GlacierConfig:
 
     # Ice rheology
     rho_ice:  float = 917.0
-    rho_water: float = 1000.0   # kg/m^3, freshwater (proglacial-lake termini)
+    # kg/m^3. Freshwater (1000) for Alaska's proglacial-lake termini; the
+    # Greenland domains set seawater (1028) for tidewater/floating termini.
+    rho_water: float = 1000.0
     gravity:  float = 9.81
     n_glen:   int   = 3
     A_glen:   float = 1e-16    # Pa^-n s^-1
@@ -607,20 +1024,78 @@ class GlacierConfig:
 
     # Sliding
     beta_init:   float = 5.0
+    # Upper bound on the basal traction coefficient handed to glide (None =
+    # unbounded, the library default). Applied to the FINE-level log beta
+    # before restriction, exactly as forward_standalone.py's BETA_MAX, so the
+    # inverse and the forward drivers run the same field. Above ~20 the bed is
+    # effectively no-slip and the misfit is flat in beta, but where the
+    # flotation fraction xi -> 0 the product beta * xi is degenerate and the
+    # optimizer inflates beta without bound (95 at Humboldt, 2026-09-17),
+    # which makes the drag Jacobian's effective-pressure term stiff. The clamp
+    # passes no gradient above the cap, so only the prior acts there and
+    # pulls the field back under it.
+    beta_max:    Optional[float] = None
     sliding_m:   float = 1.0 / 3.0
     u_reg:       float = 1.0
     water_drag:  float = 0.01
+    # Regularized Coulomb (2026-09-28, glide `sliding.u0`): the drag is
+    # beta xi^p |u|^m (u0 / (|u| + u0))^m, i.e. Weertman well below u0 (m/yr)
+    # and capped at beta xi^p u0^m above it. 0 = Weertman (the Alaska
+    # behaviour).
+    sliding_u0:  float = 0.0
+    # Dimensional effective pressure with a thickness floor (2026-09-28, glide
+    # `sliding.N_scale_H` / `N_floor_H`): the drag's effective-pressure factor
+    # is N* / (rho_i g N_scale_H) with N* = xi_f rho_i g (H + N_floor_H), xi_f
+    # the flotation fraction -- N itself on thick grounded ice, 0 at
+    # flotation, bounded below by rho_i g N_floor_H on thin grounded ice.
+    # Thinning then lowers the drag of land-based ice too (the normalized
+    # N / (rho_i g H) is thickness-insensitive on land). N_scale_H is a pure
+    # unit scale, degenerate with beta: choose it near the typical thickness
+    # so beta_init / the log-beta prior mean / beta_max keep their magnitude.
+    # None = the normalized law (the Alaska behaviour).
+    sliding_N_scale_H: Optional[float] = None
+    sliding_N_floor_H: float = 100.0
 
-    # Calving / geometry
-    calving_rate: float = 250.0
-    sigmoid_c:    float = 0.1
-    sigmoid_k:    float = 4.0
-    depth_blend:  float = 0.1    # weight on new bed-derived depth vs prior depth
+    # Calving / geometry (glide's signed-flotation model, 2026-09). Every
+    # grounded/floating quantity derives from the flotation excess
+    # z = rho_i/rho_w H - depth with depth = -bed (signed: negative on dry
+    # land), so the grounded flag phi = sigmoid(sigmoid_c z) is exactly 1/2
+    # at flotation and sigmoid_c is in 1/m. Ice calves where H < (1 + q) H_f
+    # (calving flag psi = 0), losing thickness at H / timescale per year
+    # until the active set pins it at thklim; timescale inf disables it.
+    # calving_q < 0 keeps floating ice that is thicker than (1+q) H_f (ice
+    # shelves / tongues), > 0 removes a margin above flotation.
+    thklim:           float = 1.0     # minimum thickness (m), ice-free cells sit here
+    sigmoid_c:        float = 1.0
+    calving_timescale: float = 0.5    # years
+    # Hybrid threshold: ice calves where H - H_f < calving_q * H + calving_h0
+    # (a fraction of the thickness plus an absolute margin in metres); these
+    # are the baselines that OceanForcingConfig perturbs with the TF anomaly.
+    calving_q:        float = -0.5
+    calving_h0:       float = 0.0     # m
+    # Shelf minimum thickness (m) of glide's gap-blended MONOTONE calving
+    # criterion psi = sigmoid(c r (H - H_calve)), H_calve = H_s + w (H_g -
+    # H_s) with H_g = (depth/r + h0)/(1 - q), H_s = min(H_c, H_g) and w a
+    # linear ramp in the gap between ice base and bed (w = 1 at flotation, 0
+    # once the gap exceeds r (H_g - H_s)): grounded ice calves below H_g,
+    # floating ice down to H_s - h0 calves iff the margin q H + h0 is
+    # positive, thinner floating ice calves below H_s. The cap makes H_c act
+    # only on tongues in water deeper than H_c / r; without it shallow
+    # margins lost every floating cell at once and their grounded ice
+    # ungrounded behind them. Thinning never reduces calving, which is what
+    # makes the implicit solve converge with a sharp flag. inf = the
+    # grounded law everywhere (old behaviour).
+    calving_H_c:      float = float("inf")
+    # Weight on the bed-derived depth (-bed) vs the previous depth field when
+    # the flotation fields are refreshed before a forward run. 1.0 = depth is
+    # exactly -bed (the signed-flotation model's definition); the historical
+    # 0.1 relaxation left phi/xi/psi on a stale bed during the inversion.
+    depth_blend:  float = 1.0
     # Seed the integration from the thickness implied by the observed surface
     # (S_obs - bed, with the hydrostatic value for floating ice) instead of the
     # ice-free state. Matters for tidewater hysteresis. Not differentiated.
     init_from_observed_geometry: bool = False
-    init_H_floor: float = 0.1    # minimum/ice-free thickness used when seeding
+    init_H_floor: float = 1.0    # minimum/ice-free thickness used when seeding (= thklim)
     use_avalanche_model: bool = False
 
     # Avalanche-operator hyperparameters (only read when use_avalanche_model).
@@ -657,19 +1132,28 @@ class GlacierConfig:
     #      this flag whenever the precip pipeline changes.
     avalanche_hoisted: bool = False
 
-    # Solver settings
+    # Solver settings (glide examples/greenland: identical cycles for both
+    # solvers; the adjoint variable is small in magnitude, hence its absolute
+    # tolerance)
     forward_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
-        relative_tolerance=1e-2, absolute_tolerance=10.0, report_norms=False,finest_steps=50))
+        relative_tolerance=1e-2, absolute_tolerance=10.0, report_norms=False))
     adjoint_solver: SolverConfig = field(default_factory=lambda: SolverConfig(
-        relative_tolerance=1e-2, absolute_tolerance=1e-5, report_norms=False,post_steps=50,finest_steps=50))
+        relative_tolerance=1e-2, absolute_tolerance=1e-5, report_norms=False))
 
     # Bed GP conditioning (posterior-as-prior). See BedConditioningConfig.
     bed_conditioning: BedConditioningConfig = field(
         default_factory=BedConditioningConfig)
 
+    # Ocean thermal forcing of the calving margins. See OceanForcingConfig.
+    ocean_forcing: OceanForcingConfig = field(default_factory=OceanForcingConfig)
+
+    # Thermomechanical coupling (library change 18). None = isothermal B from
+    # A_glen. See ThermalConfig.
+    thermal: Optional[ThermalConfig] = None
+
     # Input filenames (relative to base_dir/model_inputs/)
     gridded_filename:    str = "GLIDE_inputs.nc"
-    flightline_filename: str = "flightlines.gpkg"
+    flightline_filename: str = "flightlines.gpkg"  # optional; radar bed picks
     anomaly_filename:    str = "temperature_anomaly.nc"
     precip_anomaly_filename: str = "precip_anomaly.nc"  # optional; multiplicative
     snowline_filename:   str = "gridded_snowline.nc"  # optional; ELA proxy
@@ -715,6 +1199,11 @@ class GlacierConfig:
     lr_z_bed:      LearningRate = 0.0125
     lr_z_bed_mean: LearningRate = 0.5
     lr_z_log_beta: LearningRate = 4.05
+    # The long-wavelength log-beta field (log_beta_mean_prior): its whitened
+    # gradient is amplified by the long prior's large low-mode variance, so it
+    # needs a much smaller step than lr_z_log_beta -- the reason it is a
+    # separate field.
+    lr_z_log_beta_mean: LearningRate = 0.01
 
     lr_z_pbias:    LearningRate = 0.001
     lr_z_tbias:    LearningRate = 0.001

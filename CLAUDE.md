@@ -42,11 +42,27 @@ python inverse.py        # deterministic MAP solve
 python rto_sample.py     # randomize-then-optimize posterior sampling
 python sensitivity.py    # information gain of ΔV predictions
 python posterior.py      # empirical covariance from RTO samples
+python forward_standalone.py   # MAP replay + projection to 2100 (no autograd);
+                               # per-RGI-glacier volumes -> forward_standalone/glacier_volumes.nc
+python tools/compare_pygem.py  # one glacier vs PyGEM (Rounce) RCP2.6 (default Kahiltna/denali)
+python tools/replay_snapshots.py       # MAP replay -> model fields at observation epochs
+python tools/presentation_figures.py   # denali/Kahiltna talk figures -> inverse/figures/
+                                       # (tools/read_vti.py reads glide VTIs without vtk)
 ```
 
 There is no test runner, linter, or build step — `smoke_test.py` is the closest thing to a
-test. (`run_rto.sh` is stale: it calls a script that no longer exists; use `rto_sample.py`,
-which loops internally.)
+test, plus `tests/test_spectral_prior.py` (runs its checks at import: `python
+tests/test_spectral_prior.py`, prints ALL PASS). (`run_rto.sh` is stale: it calls a script
+that no longer exists; use `rto_sample.py`, which loops internally.)
+
+**Shared library.** `glacier_inverse/` is kept byte-identical with
+`../greenland-forecast/glacier_inverse/` (synced 2026-10-20, tag `pre-greenland-sync` is
+the last Alaska-only state). Change it in one repo and copy to the other — `diff -r
+-x __pycache__` should stay empty; region-specific behaviour belongs in domain configs, and
+every Greenland-only mechanism (ocean thermal forcing, thermal coupling, yearly reanalysis
+forcing, gridded BedMachine bed) is off by default. `../greenland-forecast/CLAUDE.md` holds
+the detailed findings behind the features summarized under "Synced from greenland-forecast"
+below.
 
 ## Architecture
 
@@ -580,6 +596,78 @@ per-step SMB evaluation — exactly equivalent while per-step precip varies only
 scalar multiplier, and worth ~20 s/iteration on St. Elias; `GlacierProblem` raises if it
 is combined with ETIM, whose t2m-dependent partition sits upstream of the operator.
 
+### Ice dynamics: geometry, sliding, calving, solver (glide ≥ 2026-09)
+
+- **Signed flotation geometry.** `depth = -bed` (signed — negative on dry land; never
+  clip it at 0: with glide's offset-free flag that makes thin land ice read as
+  half-floating). The grounded flag is `phi = sigmoid(sigmoid_c·(ρ_i/ρ_w·H − depth))`,
+  `sigmoid_c` in 1/m (default 1). `thklim` (1 m) is the ice-free floor; `init_H_floor`
+  follows it. glide hard-codes ρ_i/ρ_w = 0.917, i.e. `rho_water = 1000` — keep it
+  (greenland's 1028 is a known unreconciled mismatch). Water level is fixed at 0, so
+  proglacial lakes above sea level are **not** represented (would need depth = lake − bed).
+- **Sliding.** Weertman `β ξ^p |u|^m` by default. `sliding_u0` (m/yr, default 0) switches
+  to glide's regularized Coulomb `β ξ^p |u|^m (u0/(|u|+u0))^m` (Weertman below u0, capped
+  at `β ξ^p u0^m` above; greenland's ISMIP7 runs use 300). A yield-stress `tau0` form was
+  tried on glide branch `sliding-tau0-coulomb` and dropped. `sliding_N_scale_H`/`sliding_N_floor_H` give a
+  dimensional, floored effective pressure `N* = ξ_f ρ_i g (H + N_floor_H)` — glide's
+  normalized N is thickness-insensitive on land, so without it thinning never speeds up
+  land-based ice. `beta_max` clamps fine-level log β (no gradient above it): where ξ → 0
+  the product βξ is degenerate and β runs away (marine/lake fronts). Changing the law
+  changes what a checkpoint's β means (greenland `tools/convert_beta_warmstart.py`).
+- **Calving.** Height-above-buoyancy with a monotone gap-blended criterion (replaced the
+  old `calving_rate` facet flux): a cell loses `1 − exp(−dt/calving_timescale)` of its
+  thickness where `psi` says it should not exist; margins `calving_q` (fraction of
+  flotation thickness), `calving_h0` (m above/below flotation; its sign at flotation decides
+  whether floating ice is admissible), `calving_H_c` (thinnest floating ice that survives,
+  ~100 m — a real tuning knob: thin fringes buttress). The exact dψ/dH Jacobian is
+  deliberately absent (ψ is a ~1 m switch; with it the adjoint would not converge).
+  **Front pin**: `ocean_forcing=OceanForcingConfig(enabled=True, pin_front="rgi_mask")`
+  sets h0 = −1000 m inside the mask (never calves grounded ice) and +250 m outside (removes
+  any marine re-advance) — without it the model can lose an outlet, where d misfit/dβ ≈ 0
+  and β stops answering for the observed speeds. Enabled on the tidewater domains
+  (juneau, st_elias, chugach; calving_timescale 1, q 0, h0 0, H_c 100, water_drag 1e-3 —
+  1e-4 left ice-free ocean without drag and stalled greenland's adjoint). Inert on land.
+- **Solver** (`SolverConfig`, now applied to both forward and adjoint): `omega`,
+  `momentum_damping`, `step_tolerance`, `post_steps` 150 / `finest_steps` 0 defaults, and
+  forward-only `cold_start_dt` (pre-solve the first step at dt = 1), `backtrack`,
+  `freeze_coarse_calving/phi`, `trace_file`, `dump_dir`. `raise_on_nonfinite=True` makes a
+  NaN forward solve raise `FloatingPointError` instead of limping on. glide also clips the
+  driving stress where rock stands above the neighbouring ice surface ("rock cannot push
+  ice", always on) — it changes valley-wall facets relative to pre-2026-09 runs, so old
+  MAPs will not reproduce exactly. Test solver changes on warm-started solves through
+  `inverse.py`, not a single-level harness.
+
+### Synced from greenland-forecast (opt-in, off by default)
+
+- **Priors**: `SpectralPriorHyperparams(components=(PriorComponent(sigma, l, nu, mass),
+  ...), sigma_mean=)` — exact DCT-II field prior, any sum of Matérn-like spectra (`mass=0`
+  intrinsic); a short-l Matérn with a fixed mean pins the regional mean of log β (a +0.1
+  shift cost 776 prior units vs 0.6 of data on greenland) — add a proper long component.
+  The bed conditioner still needs a ggapp bed prior. Two-field log β
+  (`log_beta_mean_prior`, `log_beta_mean_mode="centered"`, `lr_z_log_beta_mean` ~
+  lr_z_log_beta/100): a separate long-wavelength field so the long component does not set
+  the SGD step. A checkpoint's z is only meaningful under its own prior — re-whiten when
+  a prior changes.
+- **Likelihoods**: `SnowlineSpec(loss="hinge", hinge_window="mean_prob", margin_prob=,
+  window=)` — a squared hinge on each season's SMB sign that is exactly zero on the right
+  side (no spurious pull on precipitation from a saturated interior; incompatible with
+  `logit_error`; `"mean_smb"` is broken). With a fractional snowline label, one-sided
+  Brier lets snow below the snowline go free (greenland pbias +8%) — prefer two-sided.
+  `VelocitySpec(per_pixel_error=True, sigma_floor, sigma_rel, sigma_rel_km)` needs
+  `vx_err`/`vy_err` in the inputs (Alaska's `make_velocity.py` does not write them yet).
+  `DhdtSpec(sigma_rel=, filename=, name=)` — relative error floor and a second dh/dt
+  product under its own name (fingerprints target every `dhdt*`). Known gap: dh/dt is
+  compared as dH/dt everywhere, ~9× wrong on floating ice (dS = (1−ρ_i/ρ_w)dH).
+- **Time stepping / forcing**: `dt_schedule` (piecewise dt refinement, equal-split steps);
+  `interannual_sigma`/`interannual_nodes` (Gauss–Hermite correction of SMB's concavity
+  under the step-mean anomaly); `yearly_climate_filename` with `base_anomaly_year=None`;
+  `climatology_only`.
+- **Init/checkpoints**: `load_whitened_params_into` accepts partial checkpoints (missing
+  keys keep the problem's own initialization); `bed_obs` in the inputs seeds bed/bed_mean
+  and gridded bed conditioning (inert without it).
+- **Thermal**: `thermal=ThermalConfig(...)` (glide's enthalpy model, no gradient through
+  it; `couple_rheology=False` keeps dynamics bit-identical).
+
 ### Multigrid level schedule
 
 Inversions run coarse-to-fine: from `config.max_level` (coarsest) down to `config.min_level`
@@ -641,8 +729,8 @@ Each builder is also importable/runnable on its own.
 
 ## Conventions
 
-- Domains live under `domains/{chugach,delta,denali,juneau,st_elias,wrangell}`; `denali` has
-  no `model_inputs/` yet. The active domain is selected by editing the `DOMAIN` constant at
+- Domains live under `domains/{chugach,delta,denali,juneau,st_elias,wrangell}`; `chugach`
+  and `st_elias` have no `model_inputs/` yet. The active domain is selected by editing the `DOMAIN` constant at
   the top of each driver script (not a CLI arg).
 - `model_inputs/`, `common_data/`, and all raster/VTI/NetCDF outputs (`*.nc *.tif *.vti
   *.pvd ...`) are gitignored. Only configs, library code, and outlines are tracked.

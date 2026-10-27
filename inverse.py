@@ -19,12 +19,16 @@ from glacier_inverse.io import (
 )
 
 # Available domains: domains/{chugach,delta,denali,juneau,st_elias,wrangell}
-DOMAIN = "domains/juneau"
+DOMAIN = "domains/delta"
 config = load_config(DOMAIN)
 
 OUTPUT_PATH = config.output_dir
+# 2026-09-21: start the tightened-likelihood runs (inverse_v6_*) from the v5
+# state. From the prior state the per-pixel velocity term is dominated by
+# the 435 k slow-ice cells the prior has 1.8x too fast, and its "more
+# friction" update leaks onto the outlets through the beta prior (fast ice
+# 0.35 -> 0.22 of observed in one step); from v5 the descent is monotone.
 WARM_START_PATH = None  # e.g. f"{OUTPUT_PATH}/level_0/torch_vars.p"
-#WARM_START_PATH = f"{DOMAIN}/inverse_geosmooth_nonlin/level_0/torch_vars.p"
 
 problem = GlacierProblem(config)
 params = problem.params
@@ -53,6 +57,9 @@ sgd_groups += [{"params": params.z_bed,      "lr": lr0["lr_z_bed"],      "name":
     {"params": params.z_bed_mean, "lr": lr0["lr_z_bed_mean"], "name": "lr_z_bed_mean"},
     {"params": params.z_log_beta, "lr": lr0["lr_z_log_beta"], "name": "lr_z_log_beta"},
 ]
+if config.log_beta_mean_prior is not None:     # long-wavelength log-beta field, its own step
+    sgd_groups += [{"params": params.z_log_beta_mean, "lr": lr0["lr_z_log_beta_mean"],
+                    "name": "lr_z_log_beta_mean"}]
 
 sgd_groups += [{"params": params.z_pbias,  "lr": lr0["lr_z_pbias"], "name": "lr_z_pbias"},]
 
@@ -134,10 +141,16 @@ def write_loss_vti(diag, vti_writer, sim, physical, level, i):
         dhdt_coarse = dhdt_obs.model_rate(sim, "coarse")
     else:
         dhdt_coarse = (sim.H - sim.H_prev) / sim.final.dt_step
+    # the long-wavelength log-beta field m (log_beta_mean_prior; zeros when off):
+    # in centered mode it enters the prior residual only, so compare it with log(beta)
+    log_beta_mean_coarse = (differentiable_restriction(
+        problem.priors.log_beta_mean_from_whitened(params.z_log_beta_mean), level)
+        if problem.priors.log_beta_mean_model is not None else None)
     update_diagnostic_fields(diag, sim.S_coarse, S_obs_coarse, bed_mean_coarse,
                              pbias_coarse, pbias_total_coarse, dhdt_coarse,
                              tbias_=tbias_coarse,
-                             H_atm_=H_atm_coarse, f_clear_=f_clear_coarse)
+                             H_atm_=H_atm_coarse, f_clear_=f_clear_coarse,
+                             log_beta_mean_=log_beta_mean_coarse)
     vti_writer.append(problem.mg[level], time=i)
     vti_writer.write_pvd()
 
@@ -147,8 +160,9 @@ for level in range(config.max_level, config.min_level - 1, -1):
     diag = make_diagnostic_fields(problem.mg[level])
     level_dir = f"{OUTPUT_PATH}/level_{level}/vti"
     problem.write_observations(level_dir, level=level)
+    thermal = problem.thermal_driver(level)     # None unless config.thermal
     vti_writer = make_loss_vti_writer(problem.mg[level], level_dir,
-                                       config.vti_base_name, diag)
+                                       config.vti_base_name, diag, thermal=thermal)
 
     for i in range(config.max_iters[level]):
         # Rank-few fingerprint nuisance: re-measure the smooth SMB
@@ -171,7 +185,7 @@ for level in range(config.max_level, config.min_level - 1, -1):
         prev_lrs = lrs
 
         # Periodically emit a per-time-step VTI series.
-        time_writer = (make_time_vti_writer(problem.mg[level], level_dir)
+        time_writer = (make_time_vti_writer(problem.mg[level], level_dir, thermal=thermal)
                        if i % 10 == 0 else None)
 
         sim, physical = problem.simulate(
@@ -213,6 +227,7 @@ for level in range(config.max_level, config.min_level - 1, -1):
         # memory. Costs milliseconds per iteration against a full solve.
         cp.get_default_memory_pool().free_all_blocks()
         torch.cuda.empty_cache()
+        save_whitened_params(params, f"{OUTPUT_PATH}/level_{level}/torch_vars.p", bed_parametrization=problem.priors.bed_parametrization)
 
     # Final evaluation (no backward) so the multigrid state matches the
     # converged parameters before we save it out. Its residual fields (raw
@@ -235,6 +250,13 @@ for level in range(config.max_level, config.min_level - 1, -1):
         mg_lvl.sliding.beta.to_dataarray(),
         mg_lvl.forcing.smb.to_dataarray(),
     ])
+    if thermal is not None:
+        # end-of-run basal and depth-averaged temperature (K), on the H grid
+        H_da = mg_lvl.state.H.to_dataarray()
+        for name, arr in thermal.temperature_fields().items():
+            ds[name] = H_da.copy(data=cp.asnumpy(arr)).rename(name).assign_attrs(
+                units="K", long_name={"T_bed": "basal ice temperature",
+                                      "T_mean": "depth-averaged ice temperature"}[name])
     ds.to_netcdf(f"{OUTPUT_PATH}/level_{level}/inverse_soln.nc")
     save_whitened_params(params, f"{OUTPUT_PATH}/level_{level}/torch_vars.p",
                          bed_parametrization=problem.priors.bed_parametrization)

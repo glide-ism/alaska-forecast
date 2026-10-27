@@ -96,6 +96,9 @@ def main() -> int:
     priors = problem.priors
 
     def _prior_matches(model, expected, label):
+        if hasattr(model, "hp"):                  # SpectralFieldPrior: carries its spec
+            check(f"{label} spectral prior {expected}", model.hp == expected, f"got {model.hp}")
+            return
         try:
             got_sigma = float(model.mg.parameters.sigma.value)
             got_l = float(model.mg.parameters.l.value)
@@ -383,7 +386,15 @@ def main() -> int:
     from glacier_inverse import Schedule
     from glacier_inverse.observations import (SurfaceSpec,
                                               validate_noise_weights)
-    noise = MaternNoise(sigma=10.0, l=1000.0, nu=1)
+    # The registry holds one error model per product: reuse the domain's
+    # own surface model when its spec carries one (a fresh registration
+    # with different hyperparameters would rightly raise).
+    _srf_obs = problem.get_observation("srf")
+    noise = (_srf_obs.noise if getattr(_srf_obs, "noise", None) is not None
+             else MaternNoise(sigma=10.0, l=1000.0, nu=1))
+    # Ad-hoc test models must be resolved by the grid (>= 8 cells per l):
+    # the wrangell-era 1 km lengths are sub-grid on a km-scale ice-sheet grid.
+    l_test = max(1000.0, 8.0 * float(problem.dx))
     try:
         srf_w = SurfaceSpec(noise=noise, weight=1.0).build(problem.build_ctx)
         check("whitened SurfaceSpec builds against problem.build_ctx", True)
@@ -460,9 +471,12 @@ def main() -> int:
               abs(m2 - 1.0) < 0.2, f"mean(z²) = {m2:.3f}")
         # randomized() perturbs by a correlated field with the model's marginal std.
         pert = srf_w.randomized(eps_S=eps).S_obs - srf_w.S_obs
-        check("randomized() perturbation has marginal std ≈ noise.sigma",
-              abs(pert.std().item() / noise.sigma - 1.0) < 0.25,
-              f"std = {pert.std().item():.2f} (sigma = {noise.sigma})")
+        # Marginal std of the Matern + nugget model: sqrt(sigma^2 + nugget^2)
+        # (the domain's own srf model may carry a nugget).
+        _sd = (noise.sigma ** 2 + (getattr(noise, "nugget", 0.0) or 0.0) ** 2) ** 0.5
+        check("randomized() perturbation has marginal std ≈ sqrt(sigma² + nugget²)",
+              abs(pert.std().item() / _sd - 1.0) < 0.25,
+              f"std = {pert.std().item():.2f} (sigma = {noise.sigma}, marginal = {_sd:.2f})")
 
         # Nugget path: the spectral operator reproduces ggapp's stencil at
         # nugget = 0 and is an exact self-inverse pair with a nugget.
@@ -472,12 +486,12 @@ def main() -> int:
         rel = (z_spec - z_back).norm() / (z_back.norm() + 1e-12)
         check("SpectralMaternNoise(nugget=0) matches the ggapp whitening",
               rel.item() < 1e-4, f"relative error = {rel.item():.3e}")
-        noise_n = MaternNoise(sigma=10.0, l=1000.0, nu=1, nugget=3.0)
+        noise_n = MaternNoise(sigma=10.0, l=l_test, nu=1, nugget=3.0)
         spec_n = priors.noise_model("srf_nugget_test", noise_n)
         check("noise_model with a nugget returns a SpectralMaternNoise",
               isinstance(spec_n, SpectralMaternNoise))
         spec_h = priors.noise_model("srf_halfnu_test",
-                                    MaternNoise(sigma=10.0, l=1000.0, nu=0.5))
+                                    MaternNoise(sigma=10.0, l=l_test, nu=0.5))
         z_h = GGaPPWhiten.apply(spec_h, GGaPPMap.apply(spec_h, eps))
         rel = (z_h - eps).norm() / (eps.norm() + 1e-12)
         check("nu = 1/2 (exponential) model: spectral round-trip exact",
@@ -496,7 +510,7 @@ def main() -> int:
               f"mean(z²) = {(white ** 2).mean().item():.3f}")
         srf_n = SurfaceSpec(noise=noise_n, weight=1.0)
         try:
-            SurfaceSpec(noise=MaternNoise(10.0, 1000.0, nugget=1.0), weight=1.0) \
+            SurfaceSpec(noise=MaternNoise(10.0, l_test, nugget=1.0), weight=1.0) \
                 .build(problem.build_ctx)
             check("re-registering srf with a different nugget raises", False)
         except ValueError:
@@ -511,8 +525,8 @@ def main() -> int:
         # prediction level) at ~one observation of error sigma_D, while the
         # fine scales keep their weight; the spectral pair stays exactly
         # inverse; sampling from the summed model whitens to unit variance.
-        hp_base = MaternNoise(10.0, 1000.0, nu=0.5, nugget=5.0)
-        hp_disc = MaternNoise(10.0, 1000.0, nu=0.5, nugget=5.0,
+        hp_base = MaternNoise(10.0, l_test, nu=0.5, nugget=5.0)
+        hp_disc = MaternNoise(10.0, l_test, nu=0.5, nugget=5.0,
                               discrepancy=MaternNoise(20.0, 60000.0, nu=1.0))
         m_base = problem.priors.noise_model("srf_disc_base", hp_base)
         m_disc = problem.priors.noise_model("srf_disc_test", hp_disc)
@@ -521,10 +535,14 @@ def main() -> int:
         const = cp.ones((problem.ny, problem.nx), dtype=cp.float32)
         info_base = float((cp.asarray(m_base.whiten(const)) ** 2).sum())
         info_disc = float((cp.asarray(m_disc.whiten(const)) ** 2).sum())
-        # One observation of a unit offset at sigma_D = 20 -> (1/20)^2.
+        # One observation of a unit offset at sigma_D = 20 per l_D-sized
+        # patch -> n_patch * (1/20)^2, n_patch = max(1, 2A/(pi l_D^2)).
+        import math as _mm
+        _A = problem.ny * problem.nx * float(problem.dx) ** 2
+        _n_patch = max(1.0, 2.0 * _A / (_mm.pi * 60000.0 ** 2))
         check("discrepancy caps the constant-mode information near "
-              "(c/sigma_D)^2",
-              info_disc < 20.0 * (1.0 / 20.0) ** 2
+              "n_patch (c/sigma_D)^2",
+              info_disc < 5.0 * _n_patch * (1.0 / 20.0) ** 2
               and info_base / info_disc > 50.0,
               f"info(const): base={info_base:.4g} disc={info_disc:.4g} "
               f"(1/sigma_D^2 = {(1.0/20.0)**2:.4g}, "
@@ -601,8 +619,11 @@ def main() -> int:
           J_n1.item() <= J_plain.item() * (1 + 1e-4))
     check("warm-started second call does not increase the profile",
           J_n2.item() <= J_n1.item() * (1 + 1e-4))
+    # The legacy Brier scale is weight*dx^2, so "tiny" must shrink with the
+    # cell size for the prior to dominate the profile on a coarse grid.
     ext_tiny = ExtentSpec(weight=2e-4, s_H=10.0,
-                          logit_error=MaternNoise(0.01, 2000.0)) \
+                          logit_error=MaternNoise(0.01 * min(1.0, 90.0 / float(problem.dx)),
+                                                  max(2000.0, 4.0 * float(problem.dx)))) \
         .build(problem.build_ctx)
     J_tiny = ext_tiny.loss(**kw)
     check("sigma_eps -> 0 recovers the plain Brier",
@@ -718,15 +739,17 @@ def main() -> int:
           f"c={float(c[0]):.5f} vs {c_star:.5f}; "
           f"J={F_got:.4f} vs {F_star:.4f} (undowndated {0.5*a**2*900:.1f})")
 
-    # Integration: measure real fingerprints on the wrangell problem (an
+    # Integration: measure real fingerprints on the smoke domain's problem (an
     # ad-hoc whitened surface term; 1 + 2*2 forwards at the coarse level),
     # then check the downdate: J_fp <= J_plain (c = 0 feasible), c-hat
     # finite, envelope gradient reaches z_bed.
     # Same hyperparameters as 7b's registration — the noise-model registry is
     # idempotent per product name and would reject a mismatch.
-    srf_fp = SurfaceSpec(noise=MaternNoise(10.0, 1000.0),
-                         weight=1.0).build(problem.build_ctx)
-    problem.observations.append(srf_fp)
+    srf_fp = SurfaceSpec(noise=noise, weight=1.0).build(problem.build_ctx)
+    # refresh_fingerprints keys its targets by obs.name: replace the domain's
+    # own "srf" (which may carry a noise model) instead of adding a second.
+    _obs_backup = list(problem.observations)
+    problem.observations = [o for o in _obs_backup if o.name != "srf"] + [srf_fp]
     try:
         fpn = FingerprintNuisance(params=("log_H_atm", "logit_cloud"),
                                   s=(1.0, 1.0), n_modes=2, fd_step=0.5)
@@ -750,7 +773,7 @@ def main() -> int:
               and torch.isfinite(params.z_bed.grad).all().item())
         params.z_bed.grad = None
     finally:
-        problem.observations.remove(srf_fp)
+        problem.observations = _obs_backup
     try:
         FingerprintNuisance(params=("log_H_atm",), s=(1.0, 2.0))
         check("FingerprintNuisance rejects mismatched s/params", False)
@@ -1104,11 +1127,18 @@ def main() -> int:
         at_picks = torch.tensor(D_picks > 0).cuda()
         b_full = torch.tensor(cond.data)
         pick_err = (bed_mean_krig - b_full)[at_picks].abs()
+        # Gridded bed data (e.g. BedMachine) enter at their own PER-CELL error
+        # (BedMachine errbed spans 10 m to many hundreds of m), so judge the
+        # kriging mean per cell in units of that cell's sigma.
+        _D = torch.tensor(D_picks).cuda()
+        _sig_cell = torch.where(_D > 0, _D, torch.ones_like(_D)).rsqrt()
+        _sig_cell = torch.maximum(_sig_cell, torch.tensor(float(ccfg.bed_conditioning.sigma_picks)).cuda())
+        pick_err_n = ((bed_mean_krig - b_full).abs() / _sig_cell)[at_picks]
         check("kriging mean honors the picks",
-              pick_err.mean().item() < ccfg.bed_conditioning.sigma_picks
-              and pick_err.max().item() < 5 * ccfg.bed_conditioning.sigma_picks,
-              f"mean/max |bed − b| at picks = {pick_err.mean().item():.2f}"
-              f"/{pick_err.max().item():.2f} m")
+              pick_err_n.mean().item() < 1.0
+              and pick_err_n.max().item() < 5.0,
+              f"mean/max |bed − b|/sigma at picks = {pick_err_n.mean().item():.2f}"
+              f"/{pick_err_n.max().item():.2f} (max |bed − b| {pick_err.max().item():.0f} m)")
 
         # Conditional round-trip via the checkpoint-conversion algebra
         # (S^{-1} = I + C·D): z -> bed -> z -> bed. Measured in BED space —

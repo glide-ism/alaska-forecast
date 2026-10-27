@@ -23,7 +23,7 @@ _HERE = Path(__file__).parent
 CONFIG = GlacierConfig(
     base_dir=str(_HERE),
     vti_base_name="denali",
-    results_subdir="inverse_tempered_re",
+    results_subdir="inverse",
     smb_model = "enthalpy",
     anomaly_integration="mean_anomaly",
     stress_scheme='molho',
@@ -43,7 +43,7 @@ CONFIG = GlacierConfig(
     tbias_prior=PriorHyperparams(sigma=1.0,     l=10000.0, nu=1),
 
     influence_cap={"z_log_H_atm": 0.3, "z_logit_cloud": 0.3,
-                   "z_tbias": 0.3},
+                   "z_tbias": 0.3, "z_pbias": 0.3},
     influence_transfer='log',
     
     observations=(
@@ -55,10 +55,13 @@ CONFIG = GlacierConfig(
                    logit_error=MaternNoise(sigma=0.3, l=1000.0),
                    nuisance_inner_steps=2, eps_max=1.0),
         BedSpec(weight=0.0e-6),
-        SnowlineSpec(weight=1.0,
-                     s_smb=0.5, sigma_p=0.3,
-                     logit_error=MaternNoise(sigma=0.3, l=1000.0),
-                     nuisance_inner_steps=2, eps_max=1.0),
+        #SnowlineSpec(weight=1.0,
+        #             s_smb=0.5, sigma_p=0.3,
+        #             logit_error=MaternNoise(sigma=0.3, l=1000.0),
+        #             nuisance_inner_steps=2, eps_max=1.0),
+        SnowlineSpec(weight=1.0, loss="hinge", s_smb=0.35, margin=0.02,
+                     huber=1.0, window="file", two_sided=False),
+
         DhdtSpec(noise=MaternNoise(sigma=0.5, l=3000.0, nu=0.5, nugget=0.5),
                  weight=1.0),
         BedSlopeSpec(weight=1e-5,s_scale=5.0),
@@ -73,7 +76,7 @@ CONFIG = GlacierConfig(
 
     lr_z_bed=0.0125,
     lr_z_log_beta=0.05*9*9,
-    lr_z_pbias=Schedule(final=0.05, ramp=lambda i,level:0.0 if (i<0 and level==2) else 0.05),
+    lr_z_pbias=Schedule(final=10.0, ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
     lr_z_tbias=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
     lr_z_log_H_atm=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
     lr_z_logit_cloud=Schedule(final=10.0,ramp=lambda i,level:0.0 if (i<0 and level==2) else 10.0),
